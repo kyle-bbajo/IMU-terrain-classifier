@@ -18,16 +18,23 @@ _JOINT_KEYWORDS: tuple[str, ...] = (
     "Ankle Dorsiflexion", "Ankle Abduction", "Ankle Inversion",
 )
 
+# 대소문자 무관 매칭 (Noraxon 버전/내보내기 설정 차이 대응)
+def _ci(keyword: str) -> Callable[[str], bool]:
+    """Case-insensitive substring match."""
+    kw_lower = keyword.lower()
+    return lambda c: kw_lower in c.lower()
+
 GROUP_RULES: list[tuple[str, Callable[[str], bool]]] = [
-    ("Pelvis",     lambda c: "Pelvis" in c),
-    ("Hand",       lambda c: "Hand" in c),
-    ("Thigh",      lambda c: "Thigh" in c),
-    ("Shank",      lambda c: "Shank" in c),
-    ("Foot",       lambda c: "Foot" in c),
-    ("Joints",     lambda c: any(k in c for k in _JOINT_KEYWORDS)),
-    ("Trajectory", lambda c: ("Trajectories" in c
-                              or "Body Orientation" in c
-                              or "Body center" in c)),
+    ("Pelvis",     _ci("Pelvis")),
+    ("Hand",       _ci("Hand")),
+    ("Thigh",      _ci("Thigh")),
+    ("Shank",      _ci("Shank")),
+    ("Foot",       _ci("Foot")),
+    ("Joints",     lambda c: any(k.lower() in c.lower() for k in _JOINT_KEYWORDS)),
+    ("Trajectory", lambda c: any(
+        k.lower() in c.lower()
+        for k in ("Trajectories", "Body Orientation", "Body center")
+    )),
 ]
 
 _MIN_EXPECTED: dict[str, int] = {

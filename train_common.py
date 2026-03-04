@@ -1,12 +1,13 @@
 """
-train_common.py — K-Fold / LOSO 공용 유틸 (v8)
+train_common.py — K-Fold / LOSO 공용 유틸 (v7.4)
 ═══════════════════════════════════════════════════════
-★ RAM 자동 판단 → Preload (≥48GB) / OTF (저RAM) 듀얼 모드
+★ 스마트 Preload: M1(PCA→64ch)은 항상 RAM 적재 (~2.5GB)
+★ M2–M6: RAM 여유 시 Preload, 부족 시 OTF 자동 전환
+★ Preload fp16 저장 + 직접 반환 (AMP autocast 위임)
 ★ IncrementalPCA + chunked StandardScaler
+★ persistent_workers (Preload 모드) / num_workers=0 (OTF 모드)
 ★ 재현성 보장 (seed_everything)
 ★ NaN 손실 감지 + CUDA OOM 자동 복구
-★ 메모리 사용량 모니터링
-★ 타입 힌팅 · Docstring · 방어적 프로그래밍
 ═══════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -303,10 +304,14 @@ def fit_bsc_on_train(h5data: H5Data, tr_idx: np.ndarray) -> StandardScaler:
 # 3. Dataset — 듀얼 모드 (Preload / OTF)
 # ═══════════════════════════════════════════════
 
-# ── 3a. Preload (RAM ≥ 48GB) ──
+# ── 3a. Preload (RAM ≥ 24GB) ──
 
 class FlatDatasetPreload(Dataset):
-    """M1용: 전체 변환 데이터를 RAM에 적재. (빠름)"""
+    """M1용: 전체 PCA 변환 데이터를 RAM에 적재.
+
+    float16으로 저장 + 반환하여 RAM/CPU 오버헤드를 최소화.
+    GPU AMP가 dtype 변환을 처리하므로 별도 fp32 변환 불필요.
+    """
 
     def __init__(
         self, h5data: H5Data, y: np.ndarray, indices: np.ndarray,
@@ -332,23 +337,30 @@ class FlatDatasetPreload(Dataset):
             )
             del X, flat, scaled, pca_out; gc.collect()
 
-        self.data = np.concatenate(parts, axis=0).astype(np.float32)
+        # float16 저장 → RAM 절반 (32GB 서버 대응)
+        self.data = np.concatenate(parts, axis=0).astype(np.float16)
         mb = self.data.nbytes / 1024**2
-        log(f"      FlatDS(Preload): {self.data.shape}"
+        log(f"      FlatDS(Preload/fp16): {self.data.shape}"
             f"  ({mb:.0f}MB)  ({time.time()-t0:.1f}s)")
 
     def __len__(self) -> int:
         return len(self.y_arr)
 
     def __getitem__(self, i: int) -> tuple[torch.Tensor, torch.Tensor]:
+        # fp16 텐서 직접 반환 → CPU astype 오버헤드 제거
+        # GPU AMP autocast가 필요 시 자동 변환
         return (
-            torch.from_numpy(self.data[i]),
+            torch.from_numpy(self.data[i].copy()),
             torch.tensor(int(self.y_arr[i]), dtype=torch.long),
         )
 
 
 class BranchDatasetPreload(Dataset):
-    """M2–M6용: 전체 변환 데이터를 RAM에 적재. (빠름)"""
+    """M2–M6용: 전체 변환 데이터를 RAM에 적재.
+
+    float16으로 저장하여 RAM 사용량을 절반으로 줄인다.
+    32GB RAM에서도 안전하게 동작 (22GB → 11GB).
+    """
 
     def __init__(
         self, h5data: H5Data, y: np.ndarray, indices: np.ndarray,
@@ -377,23 +389,29 @@ class BranchDatasetPreload(Dataset):
                 )
             del X, flat, scaled; gc.collect()
 
+        # float16 저장 → RAM 절반 (32GB 서버 대응)
         self.groups: dict[str, np.ndarray] = {
-            nm: np.concatenate(p, axis=0).astype(np.float32)
+            nm: np.concatenate(p, axis=0).astype(np.float16)
             for nm, p in group_parts.items()
         }
+        del group_parts; gc.collect()
         total_mb = sum(v.nbytes for v in self.groups.values()) / 1024**2
-        log(f"      BranchDS(Preload): n={len(indices)}  {len(branch_idx)}그룹"
+        log(f"      BranchDS(Preload/fp16): n={len(indices)}  {len(branch_idx)}그룹"
             f"  ({total_mb:.0f}MB)  ({time.time()-t0:.1f}s)")
 
     def __len__(self) -> int:
         return len(self.y_arr)
 
     def __getitem__(self, i: int) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-        bi = {nm: torch.from_numpy(arr[i]) for nm, arr in self.groups.items()}
+        # fp16 텐서 직접 반환 → CPU astype 오버헤드 제거
+        bi = {
+            nm: torch.from_numpy(arr[i].copy())
+            for nm, arr in self.groups.items()
+        }
         return bi, torch.tensor(int(self.y_arr[i]), dtype=torch.long)
 
 
-# ── 3b. On-the-fly (RAM < 48GB) ──
+# ── 3b. On-the-fly (RAM < 24GB) ──
 
 class FlatDatasetOTF(Dataset):
     """M1용: 매 ``__getitem__`` 에서 HDF5 → scale → PCA. (RAM ≈ 0)"""
@@ -451,14 +469,18 @@ class BranchDatasetOTF(Dataset):
         return bi, torch.tensor(int(self.y[self.idx[i]]), dtype=torch.long)
 
 
-# ── 3c. 팩토리 함수 ──
+# ── 3c. 팩토리 함수 (스마트 Preload) ──
 
 def make_flat_dataset(
     h5data: H5Data, y: np.ndarray, indices: np.ndarray,
     sc: StandardScaler, pca: IncrementalPCA,
 ) -> Dataset:
-    """``config.USE_PRELOAD`` 에 따라 적절한 FlatDataset을 생성한다."""
-    if config.USE_PRELOAD:
+    """M1용 FlatDataset 생성.
+
+    M1 PCA 결과는 항상 Preload (64ch × 256T × 2B ≈ 2.5GB).
+    OTF 대비 학습 속도 10배+ 향상.
+    """
+    if config.USE_PRELOAD_M1:
         return FlatDatasetPreload(h5data, y, indices, sc, pca)
     return FlatDatasetOTF(h5data, y, indices, sc, pca)
 
@@ -466,10 +488,27 @@ def make_flat_dataset(
 def make_branch_dataset(
     h5data: H5Data, y: np.ndarray, indices: np.ndarray,
     bsc: StandardScaler, branch_idx: dict[str, list[int]],
+    total_samples: int = 0,
 ) -> Dataset:
-    """``config.USE_PRELOAD`` 에 따라 적절한 BranchDataset을 생성한다."""
+    """M2–M6용 BranchDataset 생성.
+
+    RAM 여유가 충분하면 Preload, 부족하면 OTF로 자동 전환.
+
+    Parameters
+    ----------
+    total_samples : int
+        train + test 합산 샘플 수 (Preload 가능 여부 판단용).
+        0이면 indices 길이만으로 추정.
+    """
     if config.USE_PRELOAD:
         return BranchDatasetPreload(h5data, y, indices, bsc, branch_idx)
+
+    # 스마트 판단: 전체 데이터가 RAM에 들어가는지 동적 추정
+    n_total = total_samples if total_samples > 0 else len(indices) * 2
+    if config.can_preload_branch(n_total, h5data.C, h5data.T):
+        log(f"      ★ 스마트 Preload: {n_total}샘플 × {h5data.C}ch → RAM 가능")
+        return BranchDatasetPreload(h5data, y, indices, bsc, branch_idx)
+
     return BranchDatasetOTF(h5data, y, indices, bsc, branch_idx)
 
 
@@ -557,11 +596,16 @@ def _run(
                 bi, yb = batch
                 bi = {k: v.to(DEVICE, non_blocking=True) for k, v in bi.items()}
                 yb = yb.to(DEVICE, non_blocking=True)
+                # AMP 미사용 시 fp16→fp32 변환 (CPU 모드 안전장치)
+                if not config.USE_AMP:
+                    bi = {k: v.float() for k, v in bi.items()}
                 inp = bi
             else:
                 xb, yb = batch
                 xb = xb.to(DEVICE, non_blocking=True)
                 yb = yb.to(DEVICE, non_blocking=True)
+                if not config.USE_AMP:
+                    xb = xb.float()
                 inp = xb
 
             # Mixup
@@ -693,8 +737,10 @@ def train_model(
 
         if vl < best_vl:
             best_vl = vl
+            # DataParallel 래핑 시 .module로 원본 접근
+            _m = _unwrap(model)
             best_state = {
-                k: v.cpu().clone() for k, v in model.state_dict().items()
+                k: v.cpu().clone() for k, v in _m.state_dict().items()
             }
             patience = 0
         else:
@@ -704,7 +750,7 @@ def train_model(
                 break
 
     if best_state:
-        model.load_state_dict(best_state)
+        _unwrap(model).load_state_dict(best_state)
         model.to(DEVICE)
 
     # 최종 평가
@@ -726,15 +772,22 @@ def make_loader(ds: Dataset, shuffle: bool, branch: bool = False) -> DataLoader:
     """Dataset → DataLoader.
 
     OTF 모드: ``num_workers=0`` (h5py 호환).
-    Preload 모드: ``config.LOADER_WORKERS`` 사용.
+    Preload 모드: ``config.LOADER_WORKERS`` + ``persistent_workers``.
     """
+    # OTF 데이터셋은 h5py 핸들을 공유하므로 반드시 num_workers=0
+    is_otf = isinstance(ds, (FlatDatasetOTF, BranchDatasetOTF))
+    workers = 0 if is_otf else config.LOADER_WORKERS
+
     kw: dict = dict(
         batch_size=config.BATCH,
-        num_workers=config.LOADER_WORKERS,
-        pin_memory=config.USE_GPU,
+        num_workers=workers,
+        pin_memory=config.USE_GPU and not is_otf,
         shuffle=shuffle,
         drop_last=False,
     )
+    # Preload + 멀티워커: persistent_workers로 epoch 간 재생성 방지
+    if workers > 0:
+        kw["persistent_workers"] = True
     if branch:
         kw["collate_fn"] = collate_branch
     return DataLoader(ds, **kw)
@@ -751,6 +804,31 @@ def _maybe_compile(model: nn.Module) -> nn.Module:
             return torch.compile(model, mode="reduce-overhead")
         except Exception:
             return model
+    return model
+
+
+def _maybe_parallel(model: nn.Module) -> nn.Module:
+    """Multi-GPU 환경에서 ``DataParallel`` 래핑.
+
+    N_GPU > 1이면 자동 적용.
+    ``model.module`` 로 원본 접근 가능.
+    """
+    if config.N_GPU > 1:
+        model = nn.DataParallel(model)
+        log(f"     ★ DataParallel: {config.N_GPU} GPUs")
+    return model
+
+
+def _unwrap(model: nn.Module) -> nn.Module:
+    """DataParallel 래핑을 제거하고 원본 모델을 반환한다."""
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def _prepare_model(model: nn.Module) -> nn.Module:
+    """모델을 DEVICE 전송 → compile → parallel 순서로 준비한다."""
+    model = model.to(DEVICE)
+    model = _maybe_compile(model)
+    model = _maybe_parallel(model)
     return model
 
 
@@ -772,8 +850,8 @@ def run_M1(
 
     tr_ds = make_flat_dataset(h5data, y, tr_idx, sc, pca)
     te_ds = make_flat_dataset(h5data, y, te_idx, sc, pca)
-    model = _maybe_compile(M1_FlatCNN().to(DEVICE))
-    log(f"     params={count_parameters(model):,}")
+    model = _prepare_model(M1_FlatCNN())
+    log(f"     params={count_parameters(_unwrap(model)):,}")
 
     p, lb, h = train_model(
         model, make_loader(tr_ds, True), make_loader(te_ds, False),
@@ -807,8 +885,8 @@ def run_branch(
 
     tr_ds = make_branch_dataset(h5data, y, tr_idx, bsc, branch_idx)
     te_ds = make_branch_dataset(h5data, y, te_idx, bsc, branch_idx)
-    model = _maybe_compile(model_fn(branch_ch).to(DEVICE))
-    log(f"     params={count_parameters(model):,}")
+    model = _prepare_model(model_fn(branch_ch))
+    log(f"     params={count_parameters(_unwrap(model)):,}")
 
     p, lb, h = train_model(
         model, make_loader(tr_ds, True, True), make_loader(te_ds, False, True),
