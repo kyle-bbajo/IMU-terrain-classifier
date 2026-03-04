@@ -28,6 +28,7 @@ from train_common import (
     fit_pca_on_train, fit_bsc_on_train,
     run_M1, run_branch,
     save_report, save_cm, save_history,
+    clear_fold_cache,
 )
 import matplotlib
 matplotlib.use("Agg")
@@ -164,6 +165,7 @@ def main() -> None:
         ckpt_path.write_text(json.dumps(ckpt_data))
 
         del sc, pca, bsc; gc.collect()
+        clear_fold_cache(f"S{te_subj:03d}")  # v8: 디스크 캐시 정리
 
         elapsed = (time.time() - t_fold) / 60
         fold_times.append(elapsed)

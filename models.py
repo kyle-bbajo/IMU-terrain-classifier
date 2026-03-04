@@ -298,9 +298,14 @@ def augment(x: torch.Tensor, training: bool) -> torch.Tensor:
         x = torch.roll(x, sh, dims=-1)
     if config.AUG_MASK_RATIO > 0:
         n_mask = max(1, int(C * config.AUG_MASK_RATIO))
-        for b in range(B):
-            idx = torch.randperm(C, device=x.device)[:n_mask]
-            x[b, idx, :] = 0
+        # 벡터화: batch 루프 제거 → GPU-friendly 한 번에 처리
+        mask_idx = torch.stack(
+            [torch.randperm(C, device=x.device)[:n_mask] for _ in range(B)]
+        )  # (B, n_mask)
+        # scatter 로 한 번에 0 처리
+        mask = torch.ones(B, C, 1, device=x.device)
+        mask.scatter_(1, mask_idx.unsqueeze(-1), 0.0)
+        x = x * mask
     return x
 
 

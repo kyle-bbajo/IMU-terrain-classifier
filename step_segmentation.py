@@ -1,5 +1,5 @@
 """
-step_segmentation.py — 힐스트라이크 스텝 분할 (v7.4 증분 모드)
+step_segmentation.py — 힐스트라이크 스텝 분할 (v8.0 증분 모드)
 ═══════════════════════════════════════════════════════
 ★ 증분(Incremental) 처리: 기존 HDF5의 피험자는 스킵, 신규만 추가
 ★ N=40 → N=100 확장 시 기존 40명 재처리 불필요
@@ -173,6 +173,9 @@ def load_existing_h5_info(
 ) -> tuple[set[int], Optional[list[str]], int]:
     """기존 HDF5에서 처리 완료된 피험자 ID와 채널 목록을 읽는다.
 
+    v8: Subject-group 형식 (/subjects/S{sid}/X, /subjects/S{sid}/y)
+    v7 호환: 구 형식 (flat X, y, subject_id) 도 자동 감지.
+
     Parameters
     ----------
     h5_path : Path
@@ -189,6 +192,21 @@ def load_existing_h5_info(
 
     try:
         with h5py.File(h5_path, "r") as f:
+            # v8 subject-group 형식
+            if "subjects" in f and "channels" in f:
+                done_sids: set[int] = set()
+                n_existing = 0
+                for skey in f["subjects"]:
+                    sid = int(skey[1:])          # "S0001" → 1
+                    done_sids.add(sid)
+                    n_existing += f[f"subjects/{skey}/X"].shape[0]
+                channels = [
+                    c.decode() if isinstance(c, bytes) else c
+                    for c in f["channels"][:]
+                ]
+                return done_sids, channels, n_existing
+
+            # v7 flat 형식 (하위 호환)
             for key in ("X", "y", "subject_id", "channels"):
                 if key not in f:
                     log(f"  ⚠ 기존 HDF5에 '{key}' 없음, 처음부터 생성")
@@ -525,49 +543,7 @@ def resample_step(
 COPY_CHUNK: int = 2000
 
 
-def copy_existing_to_tmp(
-    src_path: Path, tmp_hf: h5py.File, n_ch: int,
-) -> tuple[h5py.Dataset, h5py.Dataset, h5py.Dataset, int]:
-    """기존 HDF5 데이터를 tmp 파일로 청크 단위로 복사한다.
-
-    Parameters
-    ----------
-    src_path : Path
-        기존 HDF5 파일 경로.
-    tmp_hf : h5py.File
-        쓰기용 임시 HDF5 핸들.
-    n_ch : int
-        채널 수.
-
-    Returns
-    -------
-    tuple[Dataset, Dataset, Dataset, int]
-        (ds_X, ds_y, ds_sid, 복사된 스텝 수).
-    """
-    with h5py.File(src_path, "r") as src:
-        old_n = src["X"].shape[0]
-        log(f"    기존 데이터 복사: {old_n}스텝...")
-
-        ds_X = tmp_hf.create_dataset(
-            "X", shape=(old_n, config.TS, n_ch),
-            maxshape=(None, config.TS, n_ch),
-            dtype="float32", chunks=(64, config.TS, n_ch),
-        )
-        ds_y = tmp_hf.create_dataset(
-            "y", shape=(old_n,), maxshape=(None,), dtype="int64",
-        )
-        ds_sid = tmp_hf.create_dataset(
-            "subject_id", shape=(old_n,), maxshape=(None,), dtype="int64",
-        )
-
-        for s in range(0, old_n, COPY_CHUNK):
-            e = min(s + COPY_CHUNK, old_n)
-            ds_X[s:e]   = src["X"][s:e]
-            ds_y[s:e]   = src["y"][s:e]
-            ds_sid[s:e] = src["subject_id"][s:e]
-
-        log(f"    ✅ {old_n}스텝 복사 완료")
-        return ds_X, ds_y, ds_sid, old_n
+# v8: copy_existing_to_tmp 제거 — Subject-group 형식은 복사 불필요
 
 
 # ─────────────────────────────────────────────
@@ -591,7 +567,7 @@ def main() -> None:
     force = args.force
 
     log(f"{'='*60}")
-    log(f"  step_segmentation.py v7.4 ({'전체 재생성' if force else '증분 모드'})")
+    log(f"  step_segmentation.py v8.0 ({'전체 재생성' if force else '증분 모드'})")
     log(f"  N={config.N_SUBJECTS}  TS={config.TS}pt  {config.SAMPLE_RATE}Hz")
     log(f"{'='*60}\n")
 
@@ -655,126 +631,130 @@ def main() -> None:
     )
     log(f"  지면 파라미터 → {params_path}  ({time.time()-t0:.1f}s)\n")
 
-    # ── Pass 2: 신규 스텝 검출 → HDF5 ──
+
+    # ── Pass 2: 신규 스텝 검출 → HDF5 (Subject-group v8) ──
     log(f"  [Pass 2] 신규 {len(new_records)}개 CSV → 스텝 검출...")
     t1 = time.time()
 
-    tmp_h5 = config.H5_PATH.with_suffix(".tmp.h5")
-    if tmp_h5.exists():
-        tmp_h5.unlink()
+    # v8: 피험자별 버퍼 (전체 복사 없음)
+    subj_bufs: dict[int, dict[str, list]] = defaultdict(
+        lambda: {"X": [], "y": []}
+    )
+    new_steps = 0
+    step_log: list[dict] = []
+    raw_lens: list[int] = []
 
-    with h5py.File(tmp_h5, "w") as hf:
+    for i, rec in enumerate(new_records):
+        try:
+            df = pd.read_csv(rec["path"], skiprows=2, low_memory=False)
+            df = rename_columns(df)
+        except Exception as e:
+            log(f"  ⚠ CSV 읽기 실패: {rec['path'].name} ({e})")
+            continue
 
-        # 기존 데이터 복사 (증분 모드)
-        if existing_channels and existing_n > 0 and not force:
-            ds_X, ds_y, ds_sid, total_steps = copy_existing_to_tmp(
-                config.H5_PATH, hf, n_ch,
-            )
-        else:
-            ds_X = hf.create_dataset(
-                "X", shape=(0, config.TS, n_ch),
-                maxshape=(None, config.TS, n_ch),
-                dtype="float32", chunks=(64, config.TS, n_ch),
-            )
-            ds_y = hf.create_dataset(
-                "y", shape=(0,), maxshape=(None,), dtype="int64",
-            )
-            ds_sid = hf.create_dataset(
-                "subject_id", shape=(0,), maxshape=(None,), dtype="int64",
-            )
-            total_steps = 0
+        sid   = rec["sid"]
+        label = rec["cond"]
+        data_cols = [c for c in channels if c in df.columns]
+        if len(data_cols) < len(channels):
+            missing = set(channels) - set(data_cols)
+            log(f"  ⚠ {rec['path'].name}: {len(missing)}개 채널 누락, 스킵")
+            continue
+        data_np = df[channels].values.astype(np.float32)
 
-        new_steps = 0
-        step_log: list[dict] = []
-        raw_lens: list[int] = []
-
-        buf_X: list[np.ndarray] = []
-        buf_y: list[int] = []
-        buf_sid: list[int] = []
-
-        def flush_buffer() -> None:
-            """버퍼의 스텝들을 HDF5에 기록하고 버퍼를 비운다."""
-            nonlocal total_steps, new_steps
-            if not buf_X:
-                return
-            n_new = len(buf_X)
-            old_n = ds_X.shape[0]
-            new_n = old_n + n_new
-            ds_X.resize(new_n, axis=0)
-            ds_y.resize(new_n, axis=0)
-            ds_sid.resize(new_n, axis=0)
-            ds_X[old_n:new_n]   = np.stack(buf_X, axis=0)
-            ds_y[old_n:new_n]   = np.array(buf_y, dtype=np.int64)
-            ds_sid[old_n:new_n] = np.array(buf_sid, dtype=np.int64)
-            total_steps += n_new
-            new_steps   += n_new
-            buf_X.clear()
-            buf_y.clear()
-            buf_sid.clear()
-
-        for i, rec in enumerate(new_records):
+        file_steps = 0
+        for side in ("LT", "RT"):
             try:
-                df = pd.read_csv(rec["path"], skiprows=2, low_memory=False)
-                df = rename_columns(df)
-            except Exception as e:
-                log(f"  ⚠ CSV 읽기 실패: {rec['path'].name} ({e})")
-                continue
+                acc_cols = config.resolve_foot_acc_cols(df.columns.tolist(), side)
+                contact_col = config.resolve_foot_contact_col(df.columns.tolist(), side)
+                acc_data = df[acc_cols].values.astype(np.float64)
+                contact  = df[contact_col].values.astype(np.float64)
+                norm_acc = np.sqrt((acc_data**2).sum(axis=1))
 
-            sid, cond, label = rec["sid"], rec["cond"], rec["label"]
-
-            # 공통 채널만 추출 (유연 매칭)
-            flex_drop = set(config.resolve_drop_cols(df.columns.tolist()))
-            available = [c for c in df.columns if c not in flex_drop]
-            use_cols = [c for c in channels if c in available]
-            if len(use_cols) != n_ch:
-                log(f"  ⚠ 채널 부족: {rec['path'].name} ({len(use_cols)}/{n_ch})")
-                del df; gc.collect()
-                continue
-
-            data_np = df[use_cols].values.astype(np.float32)
-
-            # NaN 보간
-            if np.isnan(data_np).any():
-                df_tmp = pd.DataFrame(data_np)
-                df_tmp = df_tmp.interpolate(limit_direction="both").fillna(0)
-                data_np = df_tmp.values.astype(np.float32)
-                del df_tmp
-
-            file_steps = 0
-            for side in ["LT", "RT"]:
-                try:
-                    raw_norm = compute_foot_acc_norm(df, side)
-                    norm_f   = bandpass_filter(raw_norm)
-                    steps    = detect_steps(norm_f, terrain_params, cond)
-                    for start, end in steps:
-                        seg_256 = resample_step(data_np[start:end])
-                        buf_X.append(seg_256)
-                        buf_y.append(label)
-                        buf_sid.append(sid)
-                        file_steps += 1
-                        raw_lens.append(end - start)
-
-                        if len(buf_X) >= config.FLUSH_SIZE:
-                            flush_buffer()
-
-                        if len(step_log) < 2000:
-                            step_log.append({
-                                "file": rec["path"].name,
-                                "side": side,
-                                "start": start, "end": end,
-                                "raw_len": end - start,
-                            })
-                except (KeyError, ValueError):
+                tp = terrain_params.get(str(label))
+                if tp is None:
+                    tp = terrain_params.get(label)
+                if tp is None:
                     continue
 
-            del df, data_np; gc.collect()
-            if (i + 1) % 20 == 0 or (i + 1) == len(new_records):
-                log(f"    {i+1}/{len(new_records)} 파일"
-                    f"  이 파일: {file_steps} 스텝"
-                    f"  신규: {new_steps + len(buf_X)}"
-                    f"  총: {total_steps + len(buf_X)}")
+                steps = detect_steps(
+                    norm_acc, contact,
+                    sample_rate=config.SAMPLE_RATE,
+                    terrain_params=tp,
+                )
 
-        flush_buffer()
+                for (start, end) in steps:
+                    raw_len = end - start
+                    if raw_len < config.MIN_STEP_LEN:
+                        continue
+                    seg_256 = resample_step(data_np[start:end])
+                    subj_bufs[sid]["X"].append(seg_256)
+                    subj_bufs[sid]["y"].append(label)
+                    file_steps += 1
+                    new_steps += 1
+                    raw_lens.append(raw_len)
+
+                    if len(step_log) < 2000:
+                        step_log.append({
+                            "file": rec["path"].name,
+                            "side": side,
+                            "start": start, "end": end,
+                            "raw_len": raw_len,
+                        })
+            except (KeyError, ValueError):
+                continue
+
+        del df, data_np; gc.collect()
+        if (i + 1) % 20 == 0 or (i + 1) == len(new_records):
+            log(f"    {i+1}/{len(new_records)} 파일"
+                f"  이 파일: {file_steps} 스텝"
+                f"  신규 누적: {new_steps}")
+
+    log(f"\n  [Pass 2] 스텝 검출 완료: {new_steps}스텝  ({time.time()-t1:.1f}s)")
+
+    # ── Subject-group HDF5 쓰기 (전체 복사 없음!) ──
+    if force and config.H5_PATH.exists():
+        config.H5_PATH.unlink()
+
+    t2 = time.time()
+    with h5py.File(config.H5_PATH, "a") as hf:
+        # subjects 그룹 보장
+        if "subjects" not in hf:
+            hf.create_group("subjects")
+
+        total_steps = existing_n
+        for sid, buf in sorted(subj_bufs.items()):
+            if not buf["X"]:
+                continue
+            grp_name = f"subjects/S{sid:04d}"
+            X_arr = np.stack(buf["X"], axis=0).astype(np.float32)
+            y_arr = np.array(buf["y"], dtype=np.int64)
+            n_new = len(X_arr)
+
+            if grp_name in hf:
+                # 기존 subject 확장 (동일 피험자의 추가 trial)
+                grp = hf[grp_name]
+                old_n = grp["X"].shape[0]
+                new_n = old_n + n_new
+                grp["X"].resize(new_n, axis=0)
+                grp["y"].resize(new_n, axis=0)
+                grp["X"][old_n:new_n] = X_arr
+                grp["y"][old_n:new_n] = y_arr
+                log(f"    S{sid:04d}: 확장 {old_n}→{new_n}스텝")
+            else:
+                # 신규 subject 생성
+                grp = hf.create_group(grp_name)
+                grp.create_dataset(
+                    "X", data=X_arr,
+                    maxshape=(None, config.TS, n_ch),
+                    chunks=(min(64, n_new), config.TS, n_ch),
+                )
+                grp.create_dataset(
+                    "y", data=y_arr, maxshape=(None,),
+                )
+                log(f"    S{sid:04d}: 신규 {n_new}스텝")
+
+            total_steps += n_new
+            del X_arr, y_arr
 
         # 메타데이터 저장
         if "channels" in hf:
@@ -784,11 +764,9 @@ def main() -> None:
         hf.attrs["sample_rate"]  = config.SAMPLE_RATE
         hf.attrs["target_ts"]    = config.TS
         hf.attrs["n_classes"]    = config.NUM_CLASSES
+        hf.attrs["format"]       = "subject_group_v8"
 
-    # 임시 → 최종 (atomic rename)
-    if config.H5_PATH.exists():
-        config.H5_PATH.unlink()
-    tmp_h5.rename(config.H5_PATH)
+    log(f"  HDF5 쓰기: {time.time()-t2:.1f}s  (전체 복사 없음)")
 
     # ── 결과 출력 ──
     size_mb = config.H5_PATH.stat().st_size / 1024**2
@@ -798,11 +776,12 @@ def main() -> None:
 
     if total_steps > 0:
         with h5py.File(config.H5_PATH, "r") as f:
-            log(f"     X shape: {f['X'].shape}")
-            y_arr = f["y"][:]
-            sid_arr = f["subject_id"][:]
-            log(f"     라벨 분포: {dict(zip(*np.unique(y_arr, return_counts=True)))}")
-            all_sids = sorted(np.unique(sid_arr).tolist())
+            all_sids = sorted(int(k[1:]) for k in f["subjects"])
+            label_counts: dict[int, int] = defaultdict(int)
+            for skey in f["subjects"]:
+                for lbl in f[f"subjects/{skey}/y"][:]:
+                    label_counts[int(lbl)] += 1
+            log(f"     라벨 분포: {dict(sorted(label_counts.items()))}")
             log(f"     피험자: {all_sids} ({len(all_sids)}명)")
         if raw_lens:
             log(f"     신규 스텝 길이: min={min(raw_lens)} max={max(raw_lens)}"

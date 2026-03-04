@@ -1,5 +1,5 @@
 """
-train_common.py — K-Fold / LOSO 공용 유틸 (v7.4)
+train_common.py — K-Fold / LOSO 공용 유틸 (v8.0)
 ═══════════════════════════════════════════════════════
 ★ 스마트 Preload: M1(PCA→64ch)은 항상 RAM 적재 (~2.5GB)
 ★ M2–M6: RAM 여유 시 Preload, 부족 시 OTF 자동 전환
@@ -95,29 +95,14 @@ def _gpu_mem_str() -> str:
 # ═══════════════════════════════════════════════
 
 class H5Data:
-    """HDF5 데이터셋 핸들러 (X는 lazy access, y/subj는 즉시 로드).
+    """HDF5 데이터셋 핸들러 — Subject-group v8 + v7 flat 호환.
 
-    컨텍스트 매니저 프로토콜을 지원하여 ``with`` 문에서 사용 가능.
+    v8 형식: /subjects/S{sid}/X, /subjects/S{sid}/y, /channels
+    v7 형식: /X, /y, /subject_id, /channels (자동 감지)
 
-    Parameters
-    ----------
-    h5_path : Path | str
-        HDF5 파일 경로.
-
-    Raises
-    ------
-    FileNotFoundError
-        파일이 존재하지 않을 때.
-    KeyError
-        필수 데이터셋이 없을 때.
-
-    Examples
-    --------
-    >>> with H5Data("dataset.h5") as h5:
-    ...     print(h5.N, h5.T, h5.C)
+    글로벌 인덱스 → (subject_key, local_idx) 매핑을 빌드하여
+    기존 K-Fold/LOSO 코드와 완전 호환.
     """
-
-    REQUIRED_KEYS = ("X", "y", "subject_id", "channels")
 
     def __init__(self, h5_path: Path | str) -> None:
         h5_path = Path(h5_path)
@@ -128,80 +113,124 @@ class H5Data:
         log(f"  HDF5 로드... ({h5_path.name})")
 
         self.h5f = h5py.File(h5_path, "r")
+        self._is_v8 = "subjects" in self.h5f
 
-        missing = [k for k in self.REQUIRED_KEYS if k not in self.h5f]
-        if missing:
-            self.h5f.close()
-            raise KeyError(f"HDF5에 필수 키 없음: {missing}")
+        if self._is_v8:
+            self._init_v8()
+        else:
+            self._init_v7()
 
-        self.X_ds = self.h5f["X"]
-        self.N: int
-        self.T: int
-        self.C: int
-        self.N, self.T, self.C = self.X_ds.shape
+        h5_gb = h5_path.stat().st_size / 1024**3
+        log(f"  ✅ N={self.N}  T={self.T}  C={self.C}  "
+            f"{'v8-subj' if self._is_v8 else 'v7-flat'}  "
+            f"file={h5_gb:.1f}GB  ({time.time()-t0:.1f}s)")
 
-        self.y_raw: np.ndarray   = self.h5f["y"][:].astype(np.int64)
-        self.subj_id: np.ndarray = self.h5f["subject_id"][:].astype(np.int64)
+    def _init_v8(self) -> None:
+        """Subject-group 형식 초기화. 글로벌 인덱스 매핑 빌드."""
         self.channels: list[str] = [
             c.decode() if isinstance(c, bytes) else str(c)
             for c in self.h5f["channels"][:]
         ]
+        subj_grp = self.h5f["subjects"]
+        skeys = sorted(subj_grp.keys())  # S0001, S0002, ...
 
-        # 기본 검증
-        assert len(self.y_raw) == self.N, (
-            f"y 길이({len(self.y_raw)}) ≠ X 행({self.N})"
-        )
-        assert len(self.subj_id) == self.N, (
-            f"subject_id 길이({len(self.subj_id)}) ≠ X 행({self.N})"
-        )
+        # 글로벌 인덱스 → (subject_key, local_idx) 테이블
+        self._idx_map: list[tuple[str, int]] = []
+        y_parts: list[np.ndarray] = []
+        sid_parts: list[np.ndarray] = []
 
-        h5_gb = h5_path.stat().st_size / 1024**3
-        log(f"  ✅ shape={self.X_ds.shape}  file={h5_gb:.1f}GB"
-            f"  ({time.time()-t0:.1f}s)")
+        for skey in skeys:
+            grp = subj_grp[skey]
+            n_s = grp["X"].shape[0]
+            sid = int(skey[1:])
+            for local_i in range(n_s):
+                self._idx_map.append((skey, local_i))
+            y_parts.append(grp["y"][:].astype(np.int64))
+            sid_parts.append(np.full(n_s, sid, dtype=np.int64))
+
+        self.y_raw   = np.concatenate(y_parts)   if y_parts  else np.array([], dtype=np.int64)
+        self.subj_id = np.concatenate(sid_parts)  if sid_parts else np.array([], dtype=np.int64)
+        self.N = len(self._idx_map)
+        if self.N > 0:
+            sample_key = skeys[0]
+            self.T = subj_grp[sample_key]["X"].shape[1]
+            self.C = subj_grp[sample_key]["X"].shape[2]
+        else:
+            self.T, self.C = 0, 0
+
+    def _init_v7(self) -> None:
+        """v7 flat 형식 초기화 (하위 호환)."""
+        for key in ("X", "y", "subject_id", "channels"):
+            if key not in self.h5f:
+                self.h5f.close()
+                raise KeyError(f"HDF5에 필수 키 없음: {key}")
+
+        self.X_ds = self.h5f["X"]
+        self.N, self.T, self.C = self.X_ds.shape
+        self.y_raw   = self.h5f["y"][:].astype(np.int64)
+        self.subj_id = self.h5f["subject_id"][:].astype(np.int64)
+        self.channels = [
+            c.decode() if isinstance(c, bytes) else str(c)
+            for c in self.h5f["channels"][:]
+        ]
 
     def read_X(self, indices: np.ndarray) -> np.ndarray:
-        """여러 인덱스의 X 데이터를 순차 청크로 읽는다.
-
-        HDF5는 순차 접근이 빠르므로 인덱스를 정렬 후 읽고 복원한다.
-
-        Parameters
-        ----------
-        indices : np.ndarray
-            읽을 샘플 인덱스 배열.
-
-        Returns
-        -------
-        np.ndarray
-            ``(len(indices), T, C)`` float32 배열.
-        """
+        """여러 인덱스의 X 데이터를 읽는다. → (len, T, C) float32."""
         indices = np.asarray(indices, dtype=np.int64)
         if len(indices) == 0:
             return np.empty((0, self.T, self.C), dtype=np.float32)
 
-        sort_order = np.argsort(indices)
-        sorted_idx = indices[sort_order]
-        chunk_size = config.H5_READ_CHUNK
+        if not self._is_v8:
+            # v7: 기존 로직
+            sort_order = np.argsort(indices)
+            sorted_idx = indices[sort_order]
+            chunk_size = config.H5_READ_CHUNK
+            parts: list[np.ndarray] = []
+            for s in range(0, len(sorted_idx), chunk_size):
+                chunk_idx = sorted_idx[s : s + chunk_size]
+                parts.append(self.X_ds[chunk_idx.tolist()])
+            data_sorted = np.concatenate(parts, axis=0)
+            return data_sorted[np.argsort(sort_order)].astype(np.float32)
 
-        parts: list[np.ndarray] = []
-        for s in range(0, len(sorted_idx), chunk_size):
-            chunk_idx = sorted_idx[s : s + chunk_size]
-            parts.append(self.X_ds[chunk_idx.tolist()])
+        # v8: subject-group 읽기 (배치 최적화)
+        subj_grp = self.h5f["subjects"]
+        out = np.empty((len(indices), self.T, self.C), dtype=np.float32)
 
-        data_sorted = np.concatenate(parts, axis=0)
-        return data_sorted[np.argsort(sort_order)].astype(np.float32)
+        # subject별로 묶어서 한번에 읽기 (I/O 최적화)
+        from collections import defaultdict as _ddict
+        skey_batches: dict[str, list[tuple[int, int]]] = _ddict(list)
+        for out_i, global_i in enumerate(indices):
+            skey, local_i = self._idx_map[global_i]
+            skey_batches[skey].append((out_i, local_i))
+
+        for skey, pairs in skey_batches.items():
+            ds = subj_grp[f"{skey}/X"]
+            local_indices = [p[1] for p in pairs]
+            out_indices   = [p[0] for p in pairs]
+            # 정렬 후 일괄 읽기
+            order = np.argsort(local_indices)
+            sorted_local = [local_indices[o] for o in order]
+            chunk = ds[sorted_local]
+            for ci, oi in enumerate(order):
+                out[out_indices[oi]] = chunk[ci]
+
+        return out
 
     def read_X_chunk(
         self, indices: np.ndarray, start: int, size: int
     ) -> np.ndarray:
-        """인덱스 배열의 ``[start:start+size]`` 슬라이스를 읽는다."""
+        """인덱스 배열의 [start:start+size] 슬라이스를 읽는다."""
         return self.read_X(indices[start : start + size])
 
     def read_single(self, idx: int) -> np.ndarray:
-        """단일 샘플 1개를 읽는다. ``(T, C)`` float32."""
+        """단일 샘플 1개를 읽는다. (T, C) float32."""
         idx = int(idx)
         if idx < 0 or idx >= self.N:
             raise IndexError(f"인덱스 {idx} 범위 초과 (N={self.N})")
-        return self.X_ds[idx].astype(np.float32)
+        if not self._is_v8:
+            return self.X_ds[idx].astype(np.float32)
+        skey, local_i = self._idx_map[idx]
+        return self.h5f[f"subjects/{skey}/X"][local_i].astype(np.float32)
 
     def close(self) -> None:
         """HDF5 파일 핸들을 닫는다."""
@@ -301,10 +330,203 @@ def fit_bsc_on_train(h5data: H5Data, tr_idx: np.ndarray) -> StandardScaler:
 
 
 # ═══════════════════════════════════════════════
-# 3. Dataset — 듀얼 모드 (Preload / OTF)
+# 2b. PCA/BSC 디스크 캐시 (v8: fold별 변환 결과 재사용)
 # ═══════════════════════════════════════════════
 
-# ── 3a. Preload (RAM ≥ 24GB) ──
+CACHE_DIR = Path(os.environ.get("CACHE_DIR", "cache"))
+
+
+def _cache_path(fold_tag: str | int, split: str, kind: str) -> Path:
+    """캐시 파일 경로 생성. ex: cache/F1_train_flat.npy"""
+    return CACHE_DIR / f"F{fold_tag}_{split}_{kind}.npy"
+
+
+def _cache_y_path(fold_tag: str | int, split: str) -> Path:
+    return CACHE_DIR / f"F{fold_tag}_{split}_y.npy"
+
+
+def cache_flat_transform(
+    h5data: H5Data, y: np.ndarray, indices: np.ndarray,
+    sc: StandardScaler, pca: IncrementalPCA,
+    fold_tag: str | int, split: str,
+) -> Path:
+    """PCA 변환 결과를 디스크 캐시로 저장한다. fp16.
+
+    Returns
+    -------
+    Path
+        캐시 파일 경로 (.npy, shape=(N, PCA_CH, T), fp16).
+    """
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_f = _cache_path(fold_tag, split, "flat")
+    y_f     = _cache_y_path(fold_tag, split)
+
+    if cache_f.exists() and y_f.exists():
+        log(f"      ★ 캐시 히트: {cache_f.name}")
+        return cache_f
+
+    t0 = time.time()
+    indices = np.asarray(indices, dtype=np.int64)
+    T = h5data.T
+    chunk = config.DS_CHUNK
+    n = len(indices)
+
+    # memmap 생성
+    out = np.lib.format.open_memmap(
+        str(cache_f), mode="w+",
+        dtype=np.float16, shape=(n, config.PCA_CH, T),
+    )
+
+    pos = 0
+    for s in range(0, n, chunk):
+        X = h5data.read_X_chunk(indices, s, chunk)
+        n_c = X.shape[0]
+        flat = X.reshape(n_c * T, h5data.C)
+        scaled = sc.transform(flat)
+        if np.isnan(scaled).any():
+            np.nan_to_num(scaled, copy=False, nan=0.0)
+        pca_out = pca.transform(scaled).reshape(n_c, T, config.PCA_CH)
+        out[pos:pos+n_c] = pca_out.transpose(0, 2, 1).astype(np.float16)
+        pos += n_c
+        del X, flat, scaled, pca_out; gc.collect()
+
+    out.flush()
+    np.save(str(y_f), y[indices].astype(np.int64))
+    mb = cache_f.stat().st_size / 1024**2
+    log(f"      캐시 저장: {cache_f.name}  ({mb:.0f}MB)  ({time.time()-t0:.1f}s)")
+    return cache_f
+
+
+def cache_branch_transform(
+    h5data: H5Data, y: np.ndarray, indices: np.ndarray,
+    bsc: StandardScaler, branch_idx: dict[str, list[int]],
+    fold_tag: str | int, split: str,
+) -> dict[str, Path]:
+    """Branch 변환 결과를 그룹별 디스크 캐시로 저장한다. fp16.
+
+    Returns
+    -------
+    dict[str, Path]
+        그룹명 → 캐시 파일 경로.
+    """
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    y_f = _cache_y_path(fold_tag, split)
+    cache_paths: dict[str, Path] = {}
+    all_hit = True
+
+    for nm in branch_idx:
+        p = _cache_path(fold_tag, split, f"br_{nm}")
+        cache_paths[nm] = p
+        if not p.exists():
+            all_hit = False
+
+    if all_hit and y_f.exists():
+        log(f"      ★ Branch 캐시 히트: F{fold_tag}_{split}")
+        return cache_paths
+
+    t0 = time.time()
+    indices = np.asarray(indices, dtype=np.int64)
+    T = h5data.T
+    chunk = config.DS_CHUNK
+    n = len(indices)
+
+    # 그룹별 memmap 생성
+    mms: dict[str, np.ndarray] = {}
+    for nm, il in branch_idx.items():
+        mms[nm] = np.lib.format.open_memmap(
+            str(cache_paths[nm]), mode="w+",
+            dtype=np.float16, shape=(n, len(il), T),
+        )
+
+    pos = 0
+    for s in range(0, n, chunk):
+        X = h5data.read_X_chunk(indices, s, chunk)
+        n_c = X.shape[0]
+        flat = X.reshape(n_c * T, h5data.C)
+        scaled = bsc.transform(flat)
+        if np.isnan(scaled).any():
+            np.nan_to_num(scaled, copy=False, nan=0.0)
+        scaled = scaled.reshape(n_c, T, h5data.C)
+        for nm, il in branch_idx.items():
+            mms[nm][pos:pos+n_c] = scaled[:, :, il].transpose(0, 2, 1).astype(np.float16)
+        pos += n_c
+        del X, flat, scaled; gc.collect()
+
+    for mm in mms.values():
+        mm.flush()
+    np.save(str(y_f), y[indices].astype(np.int64))
+
+    total_mb = sum(p.stat().st_size for p in cache_paths.values()) / 1024**2
+    log(f"      Branch 캐시 저장: {len(branch_idx)}그룹  ({total_mb:.0f}MB)"
+        f"  ({time.time()-t0:.1f}s)")
+    return cache_paths
+
+
+def clear_fold_cache(fold_tag: str | int) -> None:
+    """특정 fold의 캐시를 삭제한다."""
+    if not CACHE_DIR.exists():
+        return
+    for f in CACHE_DIR.glob(f"F{fold_tag}_*"):
+        f.unlink()
+
+
+# ═══════════════════════════════════════════════
+# 3. Dataset — 캐시 우선 + Preload/OTF 폴백
+# ═══════════════════════════════════════════════
+
+# ── 3a. 캐시 Dataset (v8 기본) ──
+
+class CachedFlatDataset(Dataset):
+    """M1용: 디스크 캐시(memmap)에서 직접 읽는 Dataset.
+
+    PCA 변환이 이미 완료된 상태라 __getitem__ 비용 ≈ 0.
+    """
+
+    def __init__(self, cache_path: Path, y_path: Path) -> None:
+        self.data = np.load(str(cache_path), mmap_mode="r")  # (N, PCA_CH, T) fp16
+        self.y_arr = np.load(str(y_path))                     # (N,) int64
+        mb = cache_path.stat().st_size / 1024**2
+        log(f"      FlatDS(Cache): {self.data.shape}  ({mb:.0f}MB)")
+
+    def __len__(self) -> int:
+        return len(self.y_arr)
+
+    def __getitem__(self, i: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            torch.from_numpy(self.data[i].copy()),
+            torch.tensor(int(self.y_arr[i]), dtype=torch.long),
+        )
+
+
+class CachedBranchDataset(Dataset):
+    """M2–M6용: 그룹별 디스크 캐시에서 직접 읽는 Dataset."""
+
+    def __init__(
+        self, cache_paths: dict[str, Path], y_path: Path,
+    ) -> None:
+        self.groups: dict[str, np.ndarray] = {
+            nm: np.load(str(p), mmap_mode="r")
+            for nm, p in cache_paths.items()
+        }
+        self.y_arr = np.load(str(y_path))
+        total_mb = sum(
+            p.stat().st_size for p in cache_paths.values()
+        ) / 1024**2
+        log(f"      BranchDS(Cache): n={len(self.y_arr)}  "
+            f"{len(cache_paths)}그룹  ({total_mb:.0f}MB)")
+
+    def __len__(self) -> int:
+        return len(self.y_arr)
+
+    def __getitem__(self, i: int) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        bi = {
+            nm: torch.from_numpy(arr[i].copy())
+            for nm, arr in self.groups.items()
+        }
+        return bi, torch.tensor(int(self.y_arr[i]), dtype=torch.long)
+
+
+# ── 3b. Preload (RAM ≥ 24GB, 캐시 없을 때 폴백) ──
 
 class FlatDatasetPreload(Dataset):
     """M1용: 전체 PCA 변환 데이터를 RAM에 적재.
@@ -474,12 +696,21 @@ class BranchDatasetOTF(Dataset):
 def make_flat_dataset(
     h5data: H5Data, y: np.ndarray, indices: np.ndarray,
     sc: StandardScaler, pca: IncrementalPCA,
+    fold_tag: str | int = "", split: str = "",
 ) -> Dataset:
     """M1용 FlatDataset 생성.
 
-    M1 PCA 결과는 항상 Preload (64ch × 256T × 2B ≈ 2.5GB).
-    OTF 대비 학습 속도 10배+ 향상.
+    v8: 캐시 우선 → Preload 폴백 → OTF 폴백.
+    fold_tag/split 지정 시 디스크 캐시 사용.
     """
+    # 캐시 모드 (fold_tag 있으면)
+    if fold_tag:
+        cache_f = cache_flat_transform(
+            h5data, y, indices, sc, pca, fold_tag, split)
+        y_f = _cache_y_path(fold_tag, split)
+        return CachedFlatDataset(cache_f, y_f)
+
+    # 폴백: 기존 Preload/OTF
     if config.USE_PRELOAD_M1:
         return FlatDatasetPreload(h5data, y, indices, sc, pca)
     return FlatDatasetOTF(h5data, y, indices, sc, pca)
@@ -489,21 +720,24 @@ def make_branch_dataset(
     h5data: H5Data, y: np.ndarray, indices: np.ndarray,
     bsc: StandardScaler, branch_idx: dict[str, list[int]],
     total_samples: int = 0,
+    fold_tag: str | int = "", split: str = "",
 ) -> Dataset:
     """M2–M6용 BranchDataset 생성.
 
-    RAM 여유가 충분하면 Preload, 부족하면 OTF로 자동 전환.
-
-    Parameters
-    ----------
-    total_samples : int
-        train + test 합산 샘플 수 (Preload 가능 여부 판단용).
-        0이면 indices 길이만으로 추정.
+    v8: 캐시 우선 → Preload 폴백 → OTF 폴백.
+    fold_tag/split 지정 시 디스크 캐시 사용.
     """
+    # 캐시 모드 (fold_tag 있으면)
+    if fold_tag:
+        cache_paths = cache_branch_transform(
+            h5data, y, indices, bsc, branch_idx, fold_tag, split)
+        y_f = _cache_y_path(fold_tag, split)
+        return CachedBranchDataset(cache_paths, y_f)
+
+    # 폴백: 기존 Preload/OTF
     if config.USE_PRELOAD:
         return BranchDatasetPreload(h5data, y, indices, bsc, branch_idx)
 
-    # 스마트 판단: 전체 데이터가 RAM에 들어가는지 동적 추정
     n_total = total_samples if total_samples > 0 else len(indices) * 2
     if config.can_preload_branch(n_total, h5data.C, h5data.T):
         log(f"      ★ 스마트 Preload: {n_total}샘플 × {h5data.C}ch → RAM 가능")
@@ -848,8 +1082,10 @@ def run_M1(
     from models import M1_FlatCNN, count_parameters
     log(f"── M1  tr={len(tr_idx)}  te={len(te_idx)}")
 
-    tr_ds = make_flat_dataset(h5data, y, tr_idx, sc, pca)
-    te_ds = make_flat_dataset(h5data, y, te_idx, sc, pca)
+    tr_ds = make_flat_dataset(h5data, y, tr_idx, sc, pca,
+                              fold_tag=fold_tag, split="train")
+    te_ds = make_flat_dataset(h5data, y, te_idx, sc, pca,
+                              fold_tag=fold_tag, split="test")
     model = _prepare_model(M1_FlatCNN())
     log(f"     params={count_parameters(_unwrap(model)):,}")
 
@@ -883,8 +1119,10 @@ def run_branch(
     from models import count_parameters
     log(f"── {mname}  tr={len(tr_idx)}  te={len(te_idx)}")
 
-    tr_ds = make_branch_dataset(h5data, y, tr_idx, bsc, branch_idx)
-    te_ds = make_branch_dataset(h5data, y, te_idx, bsc, branch_idx)
+    tr_ds = make_branch_dataset(h5data, y, tr_idx, bsc, branch_idx,
+                                fold_tag=fold_tag, split="train")
+    te_ds = make_branch_dataset(h5data, y, te_idx, bsc, branch_idx,
+                                fold_tag=fold_tag, split="test")
     model = _prepare_model(model_fn(branch_ch))
     log(f"     params={count_parameters(_unwrap(model)):,}")
 

@@ -1,5 +1,5 @@
 """
-train_kfold.py — M1–M6 K-Fold 교차검증 (v7.3 Final)
+train_kfold.py — M1–M6 K-Fold 교차검증 (v8.0)
 ═══════════════════════════════════════════════════════
 ★ argparse로 N/seed/batch/epochs 런타임 변경
 ★ config 스냅샷 자동 저장 (재현성)
@@ -27,6 +27,7 @@ from train_common import (
     fit_pca_on_train, fit_bsc_on_train,
     run_M1, run_branch,
     save_report, save_cm, save_history,
+    clear_fold_cache,
 )
 
 MODELS: list[tuple[str, type]] = [
@@ -125,6 +126,7 @@ def main() -> None:
                 all_hist.setdefault(t, []).append(h)
 
         del sc, pca, bsc; gc.collect()
+        clear_fold_cache(fi)  # v8: 디스크 캐시 정리
 
     labels_arr = np.array(all_labels)
     results: dict[str, tuple[float, float]] = {}
