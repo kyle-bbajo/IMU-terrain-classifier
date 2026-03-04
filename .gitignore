@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+nohup.out
+batches/
+out_*/
+*.npz
+*.h5
+*.pt
+*.pth
