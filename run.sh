@@ -33,7 +33,7 @@ import torch, os, sys
 print(f'  Python {sys.version.split()[0]}  PyTorch {torch.__version__}')
 if torch.cuda.is_available():
     n = torch.cuda.get_device_name(0)
-    m = torch.cuda.get_device_properties(0).total_mem / 1024**3
+    m = torch.cuda.get_device_properties(0).total_memory / 1024**3
     print(f'  GPU: {n}  ({m:.0f}GB)')
 else:
     print(f'  CPU: {os.cpu_count()} vCPU')
