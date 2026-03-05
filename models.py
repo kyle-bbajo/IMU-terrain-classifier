@@ -18,6 +18,7 @@ models.py — M1–M6 CNN 모델 정의 (v8.0)
 from __future__ import annotations
 
 import sys
+import random
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config
@@ -214,8 +215,32 @@ class M1_FlatCNN(nn.Module):
 # M2–M6: 멀티 브랜치 CNN
 # ─────────────────────────────────────────────
 
+class FreqBranch(nn.Module):
+    """주파수 도메인 Branch: FFT → magnitude → CNN.
+
+    발 가속도의 주파수 성분에서 표면 질감 차이를 포착한다.
+    시간 도메인에서 비슷한 미끄러운/정상/흙/잔디를
+    주파수 패턴으로 구분.
+    """
+
+    def __init__(self, in_ch: int, out_dim: int = FEAT) -> None:
+        super().__init__()
+        # FFT 출력: T//2+1 = 129 bins (256pt 입력 기준)
+        self.c1 = ConvBNReLU(in_ch, 64, 7, 3)
+        self.p1 = nn.MaxPool1d(2)
+        self.c2 = ConvBNReLU(64, out_dim, 5, 2)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, T) 시간 도메인
+        freq = torch.fft.rfft(x, dim=-1).abs()  # (B, C, T//2+1) 주파수 magnitude
+        out = self.p1(self.c1(freq))
+        out = self.c2(out)
+        return self.pool(out).squeeze(-1)  # (B, out_dim)
+
+
 class _BranchBase(nn.Module):
-    """M2–M6 공통 기반 클래스."""
+    """M2–M6 공통 기반 클래스. FFT branch 옵션 포함."""
 
     def __init__(
         self,
@@ -231,9 +256,20 @@ class _BranchBase(nn.Module):
         self.branches = nn.ModuleDict(
             {nm: Branch(ch, FEAT, mode) for nm, ch in branch_channels.items()}
         )
+
+        # FFT branch (표면 질감 구분용)
+        self.use_fft = config.USE_FFT_BRANCH and config.FFT_SOURCE_GROUP in branch_channels
+        if self.use_fft:
+            fft_ch = branch_channels[config.FFT_SOURCE_GROUP]
+            self.freq_branch = FreqBranch(fft_ch, FEAT)
+            self.fft_source = config.FFT_SOURCE_GROUP
+
+        n_feats = self.n + (1 if self.use_fft else 0)
+
         if cross:
             self.cross_attn = CrossGroupAttn(FEAT)
-        total = FEAT * self.n
+
+        total = FEAT * n_feats
         self.clf = nn.Sequential(
             nn.Linear(total, 256), nn.ReLU(), nn.Dropout(config.DROPOUT_CLF),
             nn.Linear(256, 128),   nn.ReLU(), nn.Dropout(config.DROPOUT_CLF),
@@ -247,6 +283,9 @@ class _BranchBase(nn.Module):
             x = torch.stack(feats, dim=1)
             x = self.cross_attn(x)
             feats = [x[:, i, :] for i in range(self.n)]
+        # FFT branch: 같은 Foot 데이터를 주파수 변환하여 추가
+        if self.use_fft:
+            feats.append(self.freq_branch(bi[self.fft_source]))
         return torch.cat(feats, dim=1)
 
     def forward(self, bi: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -294,7 +333,7 @@ def augment(x: torch.Tensor, training: bool) -> torch.Tensor:
     s = 1.0 + (torch.rand(B, 1, 1, device=x.device) - 0.5) * config.AUG_SCALE
     x = x * s
     if config.AUG_SHIFT > 0:
-        sh = torch.randint(-config.AUG_SHIFT, config.AUG_SHIFT + 1, (1,)).item()
+        sh = random.randint(-config.AUG_SHIFT, config.AUG_SHIFT)
         x = torch.roll(x, sh, dims=-1)
     if config.AUG_MASK_RATIO > 0:
         n_mask = max(1, int(C * config.AUG_MASK_RATIO))

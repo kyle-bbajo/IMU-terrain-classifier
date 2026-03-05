@@ -311,6 +311,14 @@ DROPOUT_CLF: float     = 0.5
 DROPOUT_FEAT: float    = 0.3
 LABEL_SMOOTH: float    = 0.1
 MIXUP_ALPHA: float     = 0.2
+
+# Focal Loss: 어려운 샘플(미끄러운↔정상 등)에 집중
+USE_FOCAL_LOSS: bool   = True
+FOCAL_GAMMA: float     = 2.0     # 높을수록 어려운 샘플에 집중 (0이면 CE와 동일)
+
+# 주파수 Branch: 표면 질감 차이 포착 (Foot FFT)
+USE_FFT_BRANCH: bool   = True
+FFT_SOURCE_GROUP: str  = "Foot"  # FFT를 적용할 소스 그룹
 GRAD_CLIP_NORM: float  = 1.0
 GRAD_ACCUM_STEPS: int  = 1
 # PyTorch 2.x: torch.compile로 커널 퓨전 → 10~30% 속도 향상
@@ -410,6 +418,8 @@ def snapshot(out_dir: Path | None = None) -> dict:
         "weight_decay": _cfg.WEIGHT_DECAY, "label_smooth": _cfg.LABEL_SMOOTH,
         "mixup_alpha": _cfg.MIXUP_ALPHA, "grad_clip_norm": _cfg.GRAD_CLIP_NORM,
         "grad_accum_steps": _cfg.GRAD_ACCUM_STEPS, "use_compile": _cfg.USE_COMPILE,
+        "use_focal_loss": _cfg.USE_FOCAL_LOSS, "focal_gamma": _cfg.FOCAL_GAMMA,
+        "use_fft_branch": _cfg.USE_FFT_BRANCH,
         # 정규화
         "dropout_clf": _cfg.DROPOUT_CLF, "dropout_feat": _cfg.DROPOUT_FEAT,
         # 증강
@@ -460,4 +470,6 @@ def print_config() -> None:
     print(f"  Dropout: clf={DROPOUT_CLF}  feat={DROPOUT_FEAT}")
     print(f"  Aug: noise={AUG_NOISE}  scale={AUG_SCALE}  shift={AUG_SHIFT}")
     print(f"  Compile={USE_COMPILE}")
+    print(f"  FocalLoss={'ON γ='+str(FOCAL_GAMMA) if USE_FOCAL_LOSS else 'OFF'}")
+    print(f"  FFT Branch={'ON ('+FFT_SOURCE_GROUP+')' if USE_FFT_BRANCH else 'OFF'}")
     print(f"{'='*60}\n")

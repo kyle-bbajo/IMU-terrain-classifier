@@ -920,6 +920,45 @@ def _run(
     return avg_loss, acc, preds_all, labels_all
 
 
+# ═══════════════════════════════════════════════
+# 5b. Focal Loss — 어려운 샘플에 집중
+# ═══════════════════════════════════════════════
+
+class FocalLoss(nn.Module):
+    """Focal Loss: 쉬운 샘플의 가중치를 줄여 어려운 샘플에 집중.
+
+    gamma=0이면 CrossEntropyLoss와 동일.
+    gamma=2가 기본값 (Lin et al., 2017).
+    label_smoothing도 지원.
+    """
+
+    def __init__(
+        self, gamma: float = 2.0, label_smoothing: float = 0.0,
+        weight: Optional[torch.Tensor] = None,
+    ) -> None:
+        super().__init__()
+        self.gamma = gamma
+        self.ce = nn.CrossEntropyLoss(
+            weight=weight, label_smoothing=label_smoothing, reduction="none")
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce_loss = self.ce(logits, targets)
+        pt = torch.exp(-ce_loss)  # 정답 확률
+        focal_weight = (1 - pt) ** self.gamma
+        return (focal_weight * ce_loss).mean()
+
+
+def _make_criterion() -> nn.Module:
+    """config에 따라 Focal Loss 또는 CrossEntropy를 생성한다."""
+    if config.USE_FOCAL_LOSS:
+        log(f"    Loss: FocalLoss(gamma={config.FOCAL_GAMMA}, smooth={config.LABEL_SMOOTH})")
+        return FocalLoss(
+            gamma=config.FOCAL_GAMMA,
+            label_smoothing=config.LABEL_SMOOTH,
+        )
+    return nn.CrossEntropyLoss(label_smoothing=config.LABEL_SMOOTH)
+
+
 def train_model(
     model: nn.Module, tr_dl: DataLoader, te_dl: DataLoader,
     branch: bool = False, tag: str = "", use_mixup: bool = True,
@@ -934,7 +973,7 @@ def train_model(
         ``(test_predictions, test_labels, training_history)``.
         history에 meta 키로 fold별 상세 메타데이터 포함.
     """
-    crit = nn.CrossEntropyLoss(label_smoothing=config.LABEL_SMOOTH)
+    crit = _make_criterion()
     opt  = torch.optim.AdamW(
         model.parameters(), lr=config.LR, weight_decay=config.WEIGHT_DECAY)
     sch  = torch.optim.lr_scheduler.CosineAnnealingLR(
