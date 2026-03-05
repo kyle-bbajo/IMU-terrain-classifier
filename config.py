@@ -319,6 +319,13 @@ FOCAL_GAMMA: float     = 2.0     # 높을수록 어려운 샘플에 집중 (0이
 # 주파수 Branch: 표면 질감 차이 포착 (Foot FFT)
 USE_FFT_BRANCH: bool   = True
 FFT_SOURCE_GROUP: str  = "Foot"  # FFT를 적용할 소스 그룹
+
+# 클래스 균형 샘플링: 소수 클래스(C0/C5) 오버샘플링
+USE_BALANCED_SAMPLER: bool = True
+
+# TTA (Test Time Augmentation): 평가 시 여러 변형으로 예측 후 평균
+USE_TTA: bool     = True
+TTA_ROUNDS: int   = 5       # TTA 횟수 (1이면 TTA 없음과 동일)
 GRAD_CLIP_NORM: float  = 1.0
 GRAD_ACCUM_STEPS: int  = 1
 # PyTorch 2.x: torch.compile로 커널 퓨전 → 10~30% 속도 향상
@@ -354,8 +361,24 @@ def apply_overrides(
     seed: int | None = None,
     batch: int | None = None,
     epochs: int | None = None,
+    focal: bool | None = None,
+    fft: bool | None = None,
+    balanced: bool | None = None,
+    tta: bool | None = None,
 ) -> None:
-    """CLI 인자로 전역 설정을 런타임에 변경한다."""
+    """CLI 인자로 전역 설정을 런타임에 변경한다.
+
+    Parameters
+    ----------
+    focal : bool, optional
+        Focal Loss ON/OFF. None이면 기존 값 유지.
+    fft : bool, optional
+        FFT Branch ON/OFF.
+    balanced : bool, optional
+        클래스 균형 샘플링 ON/OFF.
+    tta : bool, optional
+        Test Time Augmentation ON/OFF.
+    """
     import config as _cfg
     if n_subjects is not None:
         _cfg.N_SUBJECTS = n_subjects
@@ -370,6 +393,14 @@ def apply_overrides(
         _cfg.BATCH = batch
     if epochs is not None:
         _cfg.EPOCHS = epochs
+    if focal is not None:
+        _cfg.USE_FOCAL_LOSS = focal
+    if fft is not None:
+        _cfg.USE_FFT_BRANCH = fft
+    if balanced is not None:
+        _cfg.USE_BALANCED_SAMPLER = balanced
+    if tta is not None:
+        _cfg.USE_TTA = tta
 
 
 # ─────────────────────────────────────────────
@@ -420,6 +451,8 @@ def snapshot(out_dir: Path | None = None) -> dict:
         "grad_accum_steps": _cfg.GRAD_ACCUM_STEPS, "use_compile": _cfg.USE_COMPILE,
         "use_focal_loss": _cfg.USE_FOCAL_LOSS, "focal_gamma": _cfg.FOCAL_GAMMA,
         "use_fft_branch": _cfg.USE_FFT_BRANCH,
+        "use_balanced_sampler": _cfg.USE_BALANCED_SAMPLER,
+        "use_tta": _cfg.USE_TTA, "tta_rounds": _cfg.TTA_ROUNDS,
         # 정규화
         "dropout_clf": _cfg.DROPOUT_CLF, "dropout_feat": _cfg.DROPOUT_FEAT,
         # 증강
@@ -472,4 +505,6 @@ def print_config() -> None:
     print(f"  Compile={USE_COMPILE}")
     print(f"  FocalLoss={'ON γ='+str(FOCAL_GAMMA) if USE_FOCAL_LOSS else 'OFF'}")
     print(f"  FFT Branch={'ON ('+FFT_SOURCE_GROUP+')' if USE_FFT_BRANCH else 'OFF'}")
+    print(f"  BalancedSampler={'ON' if USE_BALANCED_SAMPLER else 'OFF'}")
+    print(f"  TTA={'ON ×'+str(TTA_ROUNDS) if USE_TTA else 'OFF'}")
     print(f"{'='*60}\n")

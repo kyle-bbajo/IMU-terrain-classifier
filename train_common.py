@@ -1062,9 +1062,15 @@ def train_model(
         _unwrap(model).load_state_dict(best_state)
         model.to(DEVICE)
 
-    # 최종 평가
+    # 최종 평가 (TTA 지원)
     try:
-        _, _, preds, labels = _run(model, te_dl, crit, branch=branch)
+        if config.USE_TTA and config.TTA_ROUNDS > 1:
+            _, _, preds, labels = _run_tta(
+                model, te_dl, crit, branch=branch,
+                n_rounds=config.TTA_ROUNDS)
+            meta["tta_rounds"] = config.TTA_ROUNDS
+        else:
+            _, _, preds, labels = _run(model, te_dl, crit, branch=branch)
     except RuntimeError as e:
         meta["oom_events"] += 1
         meta["errors"].append(f"OOM during final eval: {str(e)[:100]}")
@@ -1086,23 +1092,113 @@ def make_loader(ds: Dataset, shuffle: bool, branch: bool = False) -> DataLoader:
     OTF 모드: ``num_workers=0`` (h5py 호환).
     Preload/Cache 모드: ``config.LOADER_WORKERS`` + ``persistent_workers``.
     Train 모드: ``drop_last=True`` (BatchNorm 안정성 + GPU 활용률).
+    클래스 균형 샘플링: shuffle=True + USE_BALANCED_SAMPLER 시 자동 적용.
     """
+    from torch.utils.data import WeightedRandomSampler
+
     is_otf = isinstance(ds, (FlatDatasetOTF, BranchDatasetOTF))
     workers = 0 if is_otf else config.LOADER_WORKERS
+
+    # 클래스 균형 샘플링 (train만)
+    sampler = None
+    use_shuffle = shuffle
+    if shuffle and config.USE_BALANCED_SAMPLER:
+        y_arr = _get_dataset_labels(ds)
+        if y_arr is not None and len(y_arr) > 0:
+            classes, counts = np.unique(y_arr, return_counts=True)
+            class_weights = 1.0 / counts.astype(np.float64)
+            sample_weights = class_weights[y_arr]
+            sampler = WeightedRandomSampler(
+                weights=sample_weights, num_samples=len(y_arr), replacement=True)
+            use_shuffle = False  # sampler와 shuffle 동시 불가
+            log(f"      ★ 균형 샘플링: {dict(zip(classes.tolist(), counts.tolist()))}")
 
     kw: dict = dict(
         batch_size=config.BATCH,
         num_workers=workers,
         pin_memory=config.USE_GPU and not is_otf,
-        shuffle=shuffle,
-        drop_last=shuffle and len(ds) > config.BATCH,  # train만 + 데이터 충분할 때
+        shuffle=use_shuffle,
+        drop_last=shuffle and len(ds) > config.BATCH,
     )
+    if sampler is not None:
+        kw["sampler"] = sampler
+        kw["shuffle"] = False
     if workers > 0:
         kw["persistent_workers"] = True
-        kw["prefetch_factor"] = 2  # 다음 배치 미리 준비
+        kw["prefetch_factor"] = 2
     if branch:
         kw["collate_fn"] = collate_branch
     return DataLoader(ds, **kw)
+
+
+def _get_dataset_labels(ds: Dataset) -> Optional[np.ndarray]:
+    """Dataset에서 y 라벨 배열을 추출한다."""
+    if hasattr(ds, "y_arr"):
+        return np.asarray(ds.y_arr)
+    if hasattr(ds, "y") and hasattr(ds, "idx"):
+        return np.asarray(ds.y[ds.idx])
+    return None
+
+
+# ═══════════════════════════════════════════════
+# 6b. TTA (Test Time Augmentation)
+# ═══════════════════════════════════════════════
+
+def _run_tta(
+    model: nn.Module, loader: DataLoader, crit: nn.Module,
+    branch: bool = False, n_rounds: int = 5,
+) -> tuple[float, float, np.ndarray, np.ndarray]:
+    """TTA: 원본 1회 + augmented (n_rounds-1)회 → logits 평균 → argmax.
+
+    test loader는 shuffle=False, drop_last=False 전제.
+    """
+    from models import augment
+
+    model.eval()
+
+    def _forward_pass(use_aug: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        """1회 forward pass → (logits, labels) concat."""
+        logit_parts: list[torch.Tensor] = []
+        label_parts: list[torch.Tensor] = []
+        with torch.inference_mode():
+            for batch in loader:
+                if branch:
+                    bi, yb = batch
+                    bi = {k: v.to(DEVICE, non_blocking=True) for k, v in bi.items()}
+                    yb = yb.to(DEVICE, non_blocking=True)
+                    if not config.USE_AMP:
+                        bi = {k: v.float() for k, v in bi.items()}
+                    inp = {k: augment(v, True) for k, v in bi.items()} if use_aug else bi
+                else:
+                    xb, yb = batch
+                    xb = xb.to(DEVICE, non_blocking=True)
+                    yb = yb.to(DEVICE, non_blocking=True)
+                    if not config.USE_AMP:
+                        xb = xb.float()
+                    inp = augment(xb, True) if use_aug else xb
+
+                with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
+                    logits = model(inp)
+                logit_parts.append(logits.detach())
+                label_parts.append(yb.detach())
+
+        return torch.cat(logit_parts, dim=0), torch.cat(label_parts, dim=0)
+
+    # Round 0: 원본
+    all_logits_sum, labels = _forward_pass(use_aug=False)
+
+    # Round 1~N-1: augmented
+    for _ in range(1, n_rounds):
+        round_logits, _ = _forward_pass(use_aug=True)
+        all_logits_sum = all_logits_sum + round_logits
+
+    # 평균 → 예측
+    avg_logits = all_logits_sum / n_rounds
+    preds = avg_logits.argmax(dim=1)
+    loss = crit(avg_logits, labels).item()
+    acc = (preds == labels).float().mean().item()
+
+    return loss, acc, preds.cpu().numpy(), labels.cpu().numpy()
 
 
 # ═══════════════════════════════════════════════

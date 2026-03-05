@@ -50,6 +50,11 @@ def parse_args() -> argparse.Namespace:
                    help="배치 크기 (기본: 자동)")
     p.add_argument("--epochs", type=int, default=None,
                    help="에포크 수 (기본: 50)")
+    # 기능 토글 (--no-xxx 로 OFF)
+    p.add_argument("--no-focal", action="store_true", help="Focal Loss OFF")
+    p.add_argument("--no-fft", action="store_true", help="FFT Branch OFF")
+    p.add_argument("--no-balanced", action="store_true", help="균형 샘플링 OFF")
+    p.add_argument("--no-tta", action="store_true", help="TTA OFF")
     return p.parse_args()
 
 
@@ -61,6 +66,10 @@ def main() -> None:
         seed=args.seed,
         batch=args.batch,
         epochs=args.epochs,
+        focal=False if args.no_focal else None,
+        fft=False if args.no_fft else None,
+        balanced=False if args.no_balanced else None,
+        tta=False if args.no_tta else None,
     )
     config.print_config()
     log(f"  ★ K-Fold {config.KFOLD}-Fold (Subject-wise)\n")
@@ -168,6 +177,24 @@ def main() -> None:
         results[tag] = save_report(pa, labels_arr, le,
                                    f"KF{config.KFOLD}_{tag}", out)
         save_cm(pa, labels_arr, le, f"KF{config.KFOLD}_{tag}", out)
+
+    # ── 앙상블 투표 (M2~M6 다수결) ──
+    ensemble_tags = [t for t in all_preds if t != "M1_CNN"]
+    if len(ensemble_tags) >= 3:
+        pred_stack = np.stack([np.array(all_preds[t]) for t in ensemble_tags], axis=0)
+        # 하드 투표: 각 샘플에서 가장 많이 선택된 클래스
+        from scipy.stats import mode as _mode
+        ensemble_pred = _mode(pred_stack, axis=0, keepdims=False).mode
+        ensemble_tag = "Ensemble_M2M6"
+        results[ensemble_tag] = save_report(
+            ensemble_pred, labels_arr, le,
+            f"KF{config.KFOLD}_{ensemble_tag}", out)
+        save_cm(ensemble_pred, labels_arr, le,
+                f"KF{config.KFOLD}_{ensemble_tag}", out)
+        log(f"  ★ 앙상블 ({', '.join(ensemble_tags)})"
+            f"  Acc={results[ensemble_tag][0]:.4f}"
+            f"  F1={results[ensemble_tag][1]:.4f}")
+
     save_history(all_hist, out)
 
     total_min = (time.time() - t_total) / 60
