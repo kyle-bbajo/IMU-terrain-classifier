@@ -1,5 +1,5 @@
 """
-channel_groups.py — Noraxon MyoMotion 채널 그룹핑 (v8 Final)
+channel_groups.py — Noraxon MyoMotion 채널 그룹핑 (v8.0)
 ═══════════════════════════════════════════════════════
 v7→v8: 중복 할당 방지, 그룹별 최소 채널 경고, 정렬 순서 보장
 

@@ -1,5 +1,5 @@
 """
-config.py — 전역 설정 (v7.4)
+config.py — 전역 설정 (v8.0)
 ═══════════════════════════════════════════════════════
 ★ 모든 하드코딩 값 중앙 관리
 ★ 스마트 듀얼 Preload: M1(항상) / M2–M6(RAM 여유 시)
@@ -116,7 +116,7 @@ else:
 # 6. 실험 파라미터
 # ─────────────────────────────────────────────
 N_SUBJECTS: int  = 40
-NUM_CLASSES: int = 6
+NUM_CLASSES: int = 6    # ★ C1~C6만 사용. C7/C8 있으면 여기 수정 필요 (모델 출력층도 변경됨)
 TS: int          = 256
 PCA_CH: int      = 64
 SAMPLE_RATE: int = 200
@@ -132,6 +132,7 @@ HS_MAX_STRIDE_SAM: int     = int(HS_MAX_STRIDE_MS / 1000 * SAMPLE_RATE)
 HS_NAN_THRESHOLD: float    = 0.1
 HS_PROMINENCE_COEFF: float = 0.3
 HS_PEAK_QUALITY_RATIO: float = 0.6
+MIN_STEP_LEN: int = HS_MIN_STRIDE_SAM  # 최소 스텝 길이 (80 samples = 400ms)
 
 FOOT_ACC_COLS: dict[str, dict[str, str]] = {
     "LT": {"x": "Foot Accel Sensor X LT (mG)",
@@ -157,21 +158,21 @@ import re as _re
 # 발 가속도 컬럼 패턴 (x/y/z × LT/RT = 6개)
 _FOOT_ACC_PATTERNS: dict[str, dict[str, _re.Pattern]] = {
     "LT": {
-        "x": _re.compile(r"(?i)foot.*accel.*[_\s]?x.*lt", _re.IGNORECASE),
-        "y": _re.compile(r"(?i)foot.*accel.*[_\s]?y.*lt", _re.IGNORECASE),
-        "z": _re.compile(r"(?i)foot.*accel.*[_\s]?z.*lt", _re.IGNORECASE),
+        "x": _re.compile(r"(?i)foot.*accel.*[_\s]?x.*lt"),
+        "y": _re.compile(r"(?i)foot.*accel.*[_\s]?y.*lt"),
+        "z": _re.compile(r"(?i)foot.*accel.*[_\s]?z.*lt"),
     },
     "RT": {
-        "x": _re.compile(r"(?i)foot.*accel.*[_\s]?x.*rt", _re.IGNORECASE),
-        "y": _re.compile(r"(?i)foot.*accel.*[_\s]?y.*rt", _re.IGNORECASE),
-        "z": _re.compile(r"(?i)foot.*accel.*[_\s]?z.*rt", _re.IGNORECASE),
+        "x": _re.compile(r"(?i)foot.*accel.*[_\s]?x.*rt"),
+        "y": _re.compile(r"(?i)foot.*accel.*[_\s]?y.*rt"),
+        "z": _re.compile(r"(?i)foot.*accel.*[_\s]?z.*rt"),
     },
 }
 
 # 발 접지 컬럼 패턴 (LT/RT = 2개)
 _FOOT_CONTACT_PATTERNS: dict[str, _re.Pattern] = {
-    "LT": _re.compile(r"(?i)(foot|ft).*lt.*contact|contact.*lt.*(foot|ft)", _re.IGNORECASE),
-    "RT": _re.compile(r"(?i)(foot|ft).*rt.*contact|contact.*rt.*(foot|ft)", _re.IGNORECASE),
+    "LT": _re.compile(r"(?i)(foot|ft).*lt.*contact|contact.*lt.*(foot|ft)"),
+    "RT": _re.compile(r"(?i)(foot|ft).*rt.*contact|contact.*rt.*(foot|ft)"),
 }
 
 # 드롭 컬럼 패턴
@@ -312,7 +313,8 @@ LABEL_SMOOTH: float    = 0.1
 MIXUP_ALPHA: float     = 0.2
 GRAD_CLIP_NORM: float  = 1.0
 GRAD_ACCUM_STEPS: int  = 1
-USE_COMPILE: bool      = False
+# PyTorch 2.x: torch.compile로 커널 퓨전 → 10~30% 속도 향상
+USE_COMPILE: bool      = hasattr(torch, "compile") and USE_GPU
 
 AUG_NOISE: float      = 0.03
 AUG_SCALE: float      = 0.15
@@ -401,6 +403,7 @@ def snapshot(out_dir: Path | None = None) -> dict:
         "n_subjects": _cfg.N_SUBJECTS, "num_classes": _cfg.NUM_CLASSES,
         "ts": _cfg.TS, "pca_ch": _cfg.PCA_CH,
         "sample_rate": _cfg.SAMPLE_RATE, "seed": _cfg.SEED,
+        "min_step_len": _cfg.MIN_STEP_LEN,
         # 학습
         "kfold": _cfg.KFOLD, "epochs": _cfg.EPOCHS, "early_stop": _cfg.EARLY_STOP,
         "batch": _cfg.BATCH, "lr": _cfg.LR, "min_lr": _cfg.MIN_LR,
@@ -437,7 +440,7 @@ def print_config() -> None:
     strategy_m1 = "Preload (항상)" if USE_PRELOAD_M1 else "OTF"
     strategy_br = "Preload" if USE_PRELOAD else "OTF (auto)"
     print(f"{'='*60}")
-    print(f"  Config v7.4 — {'GPU' if USE_GPU else 'CPU'} 모드")
+    print(f"  Config v8.0 — {'GPU' if USE_GPU else 'CPU'} 모드")
     print(f"  Git: {_get_git_hash()}")
     print(f"{'='*60}")
     print(f"  Device:    {DEVICE}  ({DEVICE_NAME})")

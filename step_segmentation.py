@@ -463,10 +463,13 @@ def detect_steps(
     min_dist       = params["min_dist"]
     min_peak_ratio = params["min_peak_ratio"]
 
-    # 유효 샘플 수 체크 (시간축 유지)
+    # 유효성 체크: 시간축 길이 기반 (v8: NaN 비율은 QC에서 처리)
     nan_mask = np.isnan(norm_signal)
-    n_valid = int(np.sum(~nan_mask))
-    if n_valid < min_dist * 3:
+    total_len = len(norm_signal)
+    nan_ratio_global = float(np.sum(nan_mask)) / total_len if total_len > 0 else 1.0
+    if total_len < min_dist * 3:
+        return []
+    if nan_ratio_global > config.HS_NAN_THRESHOLD:
         return []
 
     # NaN 보간: 시간축 유지한 채 선형 보간 → 연속 신호 복원
@@ -670,16 +673,8 @@ def main() -> None:
                 contact  = df[contact_col].values.astype(np.float64)
                 norm_acc = np.sqrt((acc_data**2).sum(axis=1))
 
-                tp = terrain_params.get(str(label))
-                if tp is None:
-                    tp = terrain_params.get(label)
-                if tp is None:
-                    continue
-
                 steps = detect_steps(
-                    norm_acc, contact,
-                    sample_rate=config.SAMPLE_RATE,
-                    terrain_params=tp,
+                    norm_acc, terrain_params, label,
                 )
 
                 for (start, end) in steps:

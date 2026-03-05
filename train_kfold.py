@@ -86,11 +86,13 @@ def main() -> None:
     all_preds: dict[str, list] = {}
     all_labels: list[int] = []
     all_hist: dict[str, list[dict]] = {}
+    fold_meta: list[dict] = []  # v8: fold별 메타데이터
     t_total = time.time()
 
     for fi, (tr_idx, te_idx) in enumerate(
         sgkf.split(np.zeros(len(y)), y, groups=groups), 1
     ):
+        t_fold = time.time()
         tr_s = sorted(set(groups[tr_idx].tolist()))
         te_s = sorted(set(groups[te_idx].tolist()))
 
@@ -98,21 +100,33 @@ def main() -> None:
         if overlap:
             raise ValueError(f"Fold {fi}: 피험자 누수 발견! {overlap}")
 
+        # v8: fold별 클래스 분포 기록
+        tr_dist = dict(zip(*np.unique(y[tr_idx], return_counts=True)))
+        te_dist = dict(zip(*np.unique(y[te_idx], return_counts=True)))
+
         log(f"\n{'='*55}")
         log(f"  Fold {fi}/{config.KFOLD}"
             f"  tr={len(tr_idx)}({len(tr_s)}명)"
             f"  te={len(te_idx)}({len(te_s)}명)")
         log(f"  Test 피험자: {te_s}")
+        log(f"  Train 분포: {tr_dist}")
+        log(f"  Test  분포: {te_dist}")
         log(f"{'='*55}")
 
         sc, pca = fit_pca_on_train(h5data, tr_idx)
         bsc     = fit_bsc_on_train(h5data, tr_idx)
+
+        fold_errors: list[str] = []
+        fold_models_meta: dict[str, dict] = {}
 
         res, labels, hist = run_M1(h5data, y, tr_idx, te_idx, sc, pca, fi)
         for t, p in res.items():
             all_preds.setdefault(t, []).extend(p)
         for t, h in hist.items():
             all_hist.setdefault(t, []).append(h)
+            if "meta" in h:
+                fold_models_meta[t] = h["meta"]
+                fold_errors.extend(h["meta"].get("errors", []))
         all_labels.extend(labels.tolist())
 
         for mname, mfn in MODELS:
@@ -124,6 +138,25 @@ def main() -> None:
                 all_preds.setdefault(t, []).extend(p)
             for t, h in h2.items():
                 all_hist.setdefault(t, []).append(h)
+                if "meta" in h:
+                    fold_models_meta[t] = h["meta"]
+                    fold_errors.extend(h["meta"].get("errors", []))
+
+        fold_time = round((time.time() - t_fold) / 60, 1)
+        fold_meta.append({
+            "fold": fi,
+            "train_subjects": tr_s,
+            "test_subjects": te_s,
+            "train_samples": int(len(tr_idx)),
+            "test_samples": int(len(te_idx)),
+            "train_class_dist": {int(k): int(v) for k, v in tr_dist.items()},
+            "test_class_dist": {int(k): int(v) for k, v in te_dist.items()},
+            "fold_time_min": fold_time,
+            "errors": fold_errors,
+            "models": fold_models_meta,
+        })
+        if fold_errors:
+            log(f"  ⚠ Fold {fi} 오류 {len(fold_errors)}건: {fold_errors}")
 
         del sc, pca, bsc; gc.collect()
         clear_fold_cache(fi)  # v8: 디스크 캐시 정리
@@ -138,21 +171,35 @@ def main() -> None:
     save_history(all_hist, out)
 
     total_min = (time.time() - t_total) / 60
+
+    # v8: 전체 오류 집계
+    total_errors = sum(len(fm["errors"]) for fm in fold_meta)
+    total_ooms = sum(
+        m.get("oom_events", 0)
+        for fm in fold_meta for m in fm["models"].values()
+    )
+
     print(f"\n{'='*60}")
     print(f"  ★ {config.KFOLD}-Fold  {config.DEVICE_NAME}")
     print(f"  총 소요: {total_min:.1f}분")
+    if total_errors > 0:
+        print(f"  ⚠ 총 오류: {total_errors}건 (OOM: {total_ooms}건)")
     print(f"{'='*60}")
     for tag, (acc, f1) in results.items():
         print(f"  {tag:<20} Acc={acc:.4f}  F1={f1:.4f}")
 
     summary = {
         "experiment": "kfold",
+        "version": "v8.0",
         "config": config.snapshot(),
         "total_minutes": round(total_min, 1),
+        "total_errors": total_errors,
+        "total_oom_events": total_ooms,
         "results": {
             t: {"acc": round(a, 4), "f1": round(f, 4)}
             for t, (a, f) in results.items()
         },
+        "fold_meta": fold_meta,
     }
     (out / "summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False))

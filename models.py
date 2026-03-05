@@ -1,5 +1,5 @@
 """
-models.py — M1–M6 CNN 모델 정의 (v7.3 Final)
+models.py — M1–M6 CNN 모델 정의 (v8.0)
 ═══════════════════════════════════════════════════════
 ★ augment(): self.training 기반 (eval 모드 버그 수정)
 ★ count_parameters() 유틸 함수 포함

@@ -1,5 +1,5 @@
 """
-train_loso.py — M1–M6 LOSO 교차검증 (v7.3 Final)
+train_loso.py — M1–M6 LOSO 교차검증 (v8.0)
 ═══════════════════════════════════════════════════════
 ★ argparse로 N/seed/batch/epochs 런타임 변경
 ★ config 스냅샷 자동 저장 (재현성)
@@ -108,8 +108,17 @@ def main() -> None:
 
     all_hist: dict[str, list[dict]] = {}
     per_subj: dict[int, dict[str, float]] = {}
+    fold_meta: list[dict] = []  # v8: fold별 메타데이터
     t_total = time.time()
     fold_times: list[float] = []
+
+    # v8: skip-aware 진행률 추적
+    n_done_prev = len(done_subjects)             # 체크포인트에서 복원된 수
+    n_remaining = n_folds - n_done_prev           # 이번 실행에서 처리할 수
+    done_this_run = 0                             # 이번 실행에서 완료한 수
+
+    if n_done_prev > 0:
+        log(f"  ★ {n_done_prev}명 이미 완료 → 남은 {n_remaining}명 처리")
 
     for fi, (tr_idx, te_idx) in enumerate(
         logo.split(np.zeros(len(y)), y, groups), 1
@@ -118,10 +127,20 @@ def main() -> None:
         if te_subj in done_subjects:
             continue
 
+        done_this_run += 1
+        total_done = n_done_prev + done_this_run  # 전체 누적 완료 수
         t_fold = time.time()
+
+        # v8: fold별 클래스 분포 기록
+        tr_dist = dict(zip(*np.unique(y[tr_idx], return_counts=True)))
+        te_dist = dict(zip(*np.unique(y[te_idx], return_counts=True)))
+
         log(f"\n{'='*55}")
-        log(f"  LOSO {fi}/{n_folds}  Test=S{te_subj:03d}"
+        log(f"  LOSO  Test=S{te_subj:03d}"
+            f"  [{total_done}/{n_folds}]"
             f"  ({len(te_idx)}샘플)  Train={len(tr_idx)}")
+        log(f"  Train 분포: {tr_dist}")
+        log(f"  Test  분포: {te_dist}")
         log(f"{'='*55}")
 
         sc, pca = fit_pca_on_train(h5data, tr_idx)
@@ -129,6 +148,8 @@ def main() -> None:
 
         fold_preds: dict[str, np.ndarray] = {}
         fold_labels: np.ndarray = np.array([])
+        fold_errors: list[str] = []
+        fold_models_meta: dict[str, dict] = {}
 
         res, labels, hist = run_M1(
             h5data, y, tr_idx, te_idx, sc, pca, f"S{te_subj:03d}")
@@ -137,6 +158,9 @@ def main() -> None:
             fold_preds[t] = p
         for t, h in hist.items():
             all_hist.setdefault(t, []).append(h)
+            if "meta" in h:
+                fold_models_meta[t] = h["meta"]
+                fold_errors.extend(h["meta"].get("errors", []))
         all_labels.extend(labels.tolist())
         fold_labels = labels
 
@@ -150,6 +174,9 @@ def main() -> None:
                 fold_preds[t] = p
             for t, h in h2.items():
                 all_hist.setdefault(t, []).append(h)
+                if "meta" in h:
+                    fold_models_meta[t] = h["meta"]
+                    fold_errors.extend(h["meta"].get("errors", []))
 
         per_subj[te_subj] = {
             t: round(accuracy_score(fold_labels, p), 4)
@@ -169,8 +196,26 @@ def main() -> None:
 
         elapsed = (time.time() - t_fold) / 60
         fold_times.append(elapsed)
-        remain = np.mean(fold_times) * (n_folds - fi)
-        log(f"  S{te_subj:03d} 완료 ({elapsed:.1f}분)  남은: {remain:.0f}분")
+        n_left = n_remaining - done_this_run
+        remain = np.mean(fold_times) * n_left if n_left > 0 else 0
+
+        # v8: fold 메타 기록
+        fold_meta.append({
+            "fold": total_done,
+            "test_subject": te_subj,
+            "train_samples": int(len(tr_idx)),
+            "test_samples": int(len(te_idx)),
+            "train_class_dist": {int(k): int(v) for k, v in tr_dist.items()},
+            "test_class_dist": {int(k): int(v) for k, v in te_dist.items()},
+            "fold_time_min": round(elapsed, 1),
+            "errors": fold_errors,
+            "models": fold_models_meta,
+        })
+
+        if fold_errors:
+            log(f"  ⚠ S{te_subj:03d} 오류 {len(fold_errors)}건: {fold_errors}")
+        log(f"  S{te_subj:03d} 완료 ({elapsed:.1f}분)"
+            f"  [{total_done}/{n_folds}]  남은: {n_left}명 ~{remain:.0f}분")
 
     labels_arr = np.array(all_labels)
     results: dict[str, tuple[float, float]] = {}
@@ -184,22 +229,36 @@ def main() -> None:
         _save_per_subject(per_subj, results, out)
 
     total_min = (time.time() - t_total) / 60
+
+    # v8: 전체 오류 집계
+    total_errors = sum(len(fm["errors"]) for fm in fold_meta)
+    total_ooms = sum(
+        m.get("oom_events", 0)
+        for fm in fold_meta for m in fm["models"].values()
+    )
+
     print(f"\n{'='*60}")
     print(f"  ★ LOSO  N={config.N_SUBJECTS}  {config.DEVICE_NAME}")
     print(f"  총 소요: {total_min:.1f}분")
+    if total_errors > 0:
+        print(f"  ⚠ 총 오류: {total_errors}건 (OOM: {total_ooms}건)")
     print(f"{'='*60}")
     for tag, (acc, f1) in results.items():
         print(f"  {tag:<20} Acc={acc:.4f}  F1={f1:.4f}")
 
     summary = {
         "experiment": "loso",
+        "version": "v8.0",
         "config": config.snapshot(),
         "total_minutes": round(total_min, 1),
+        "total_errors": total_errors,
+        "total_oom_events": total_ooms,
         "results": {
             t: {"acc": round(a, 4), "f1": round(f, 4)}
             for t, (a, f) in results.items()
         },
         "per_subject": {str(k): v for k, v in per_subj.items()},
+        "fold_meta": fold_meta,
     }
     (out / "summary_loso.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False))

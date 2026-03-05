@@ -205,14 +205,12 @@ class H5Data:
 
         for skey, pairs in skey_batches.items():
             ds = subj_grp[f"{skey}/X"]
-            local_indices = [p[1] for p in pairs]
-            out_indices   = [p[0] for p in pairs]
-            # 정렬 후 일괄 읽기
-            order = np.argsort(local_indices)
-            sorted_local = [local_indices[o] for o in order]
-            chunk = ds[sorted_local]
-            for ci, oi in enumerate(order):
-                out[out_indices[oi]] = chunk[ci]
+            out_idx  = np.array([p[0] for p in pairs])
+            loc_idx  = np.array([p[1] for p in pairs])
+            # 정렬 후 일괄 읽기 → 벡터화 할당
+            order = np.argsort(loc_idx)
+            chunk = ds[loc_idx[order].tolist()]
+            out[out_idx[order]] = chunk
 
         return out
 
@@ -816,11 +814,13 @@ def _run(
     total_loss: float = 0.0
     correct = total = 0
     nan_batches = 0
-    preds_all: list[int] = []
-    labels_all: list[int] = []
 
-    ctx = torch.enable_grad() if train else torch.no_grad()
+    ctx = torch.enable_grad() if train else torch.inference_mode()
     step_idx = 0
+    # v8: GPU에서 예측 누적 후 한 번에 전송
+    preds_gpu: list[torch.Tensor] = []
+    labels_gpu: list[torch.Tensor] = []
+
     with ctx:
         if train:
             opt.zero_grad(set_to_none=True)
@@ -886,14 +886,14 @@ def _run(
                         opt.step()
                     opt.zero_grad(set_to_none=True)
 
-            # 통계
+            # 통계 — GPU에서 누적, CPU 전송 최소화
             bs = len(yb)
             total_loss += loss.item() * bs
             pred = logits.argmax(1)
             correct += (pred == yb).sum().item()
             total   += bs
-            preds_all.extend(pred.cpu().numpy().tolist())
-            labels_all.extend(yb.cpu().numpy().tolist())
+            preds_gpu.append(pred.detach())
+            labels_gpu.append(yb.detach())
 
     if nan_batches > 0:
         log(f"  ⚠ NaN/Inf 배치: {nan_batches}개 스킵됨")
@@ -914,7 +914,10 @@ def _run(
 
     avg_loss = total_loss / max(total, 1)
     acc = correct / max(total, 1)
-    return avg_loss, acc, np.array(preds_all), np.array(labels_all)
+    # GPU → CPU 한 번에 전송
+    preds_all = torch.cat(preds_gpu).cpu().numpy() if preds_gpu else np.array([], dtype=np.int64)
+    labels_all = torch.cat(labels_gpu).cpu().numpy() if labels_gpu else np.array([], dtype=np.int64)
+    return avg_loss, acc, preds_all, labels_all
 
 
 def train_model(
@@ -929,19 +932,38 @@ def train_model(
     -------
     tuple[np.ndarray, np.ndarray, dict]
         ``(test_predictions, test_labels, training_history)``.
+        history에 meta 키로 fold별 상세 메타데이터 포함.
     """
     crit = nn.CrossEntropyLoss(label_smoothing=config.LABEL_SMOOTH)
     opt  = torch.optim.AdamW(
         model.parameters(), lr=config.LR, weight_decay=config.WEIGHT_DECAY)
     sch  = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=config.EPOCHS, eta_min=config.MIN_LR)
-    scaler = GradScaler(enabled=config.USE_AMP)
+    # bfloat16은 FP32와 같은 exponent range → GradScaler 불필요
+    use_scaler = config.USE_AMP and config.AMP_DTYPE == torch.float16
+    scaler = GradScaler(enabled=use_scaler)
 
     hist: dict[str, list[float]] = {"tl": [], "ta": [], "vl": [], "va": []}
     best_vl = float("inf")
     best_state: Optional[dict] = None
     patience = 0
     t0 = time.time()
+
+    # v8: fold별 메타데이터 추적
+    meta: dict = {
+        "tag": tag,
+        "train_samples": len(tr_dl.dataset),
+        "test_samples": len(te_dl.dataset),
+        "batch_size": config.BATCH,
+        "oom_events": 0,
+        "nan_events": 0,
+        "early_stopped": False,
+        "early_stop_epoch": 0,
+        "total_epochs": 0,
+        "best_val_loss": float("inf"),
+        "train_time_sec": 0.0,
+        "errors": [],
+    }
 
     for ep in range(1, config.EPOCHS + 1):
         try:
@@ -950,17 +972,26 @@ def train_model(
             vl, va, _, _ = _run(model, te_dl, crit, branch=branch)
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
+                meta["oom_events"] += 1
+                meta["errors"].append(f"CUDA OOM at ep{ep}")
                 log(f"  ✗ CUDA OOM at ep{ep}! 배치 크기를 줄이세요."
                     f" (현재 BATCH={config.BATCH})")
                 if config.USE_GPU:
                     torch.cuda.empty_cache()
                 break
+            meta["errors"].append(f"RuntimeError at ep{ep}: {str(e)[:100]}")
             raise
+
+        # NaN/Inf 감지 로깅
+        if np.isnan(tl) or np.isinf(tl):
+            meta["nan_events"] += 1
+            meta["errors"].append(f"NaN/Inf loss at ep{ep}")
 
         sch.step()
 
         hist["tl"].append(tl); hist["ta"].append(ta)
         hist["vl"].append(vl); hist["va"].append(va)
+        meta["total_epochs"] = ep
 
         log(f"  {tag} ep{ep:02d}/{config.EPOCHS}"
             f"  loss={tl:.4f}/{ta:.4f}"
@@ -980,8 +1011,13 @@ def train_model(
         else:
             patience += 1
             if patience >= config.EARLY_STOP:
+                meta["early_stopped"] = True
+                meta["early_stop_epoch"] = ep
                 log(f"  {tag} ★ EarlyStop ep{ep}")
                 break
+
+    meta["best_val_loss"] = round(best_vl, 6) if best_vl != float("inf") else None
+    meta["train_time_sec"] = round(time.time() - t0, 1)
 
     if best_state:
         _unwrap(model).load_state_dict(best_state)
@@ -990,11 +1026,14 @@ def train_model(
     # 최종 평가
     try:
         _, _, preds, labels = _run(model, te_dl, crit, branch=branch)
-    except RuntimeError:
+    except RuntimeError as e:
+        meta["oom_events"] += 1
+        meta["errors"].append(f"OOM during final eval: {str(e)[:100]}")
         log("  ✗ 최종 평가 중 OOM")
         preds = np.array([], dtype=np.int64)
         labels = np.array([], dtype=np.int64)
 
+    hist["meta"] = meta
     return preds, labels, hist
 
 
@@ -1006,9 +1045,9 @@ def make_loader(ds: Dataset, shuffle: bool, branch: bool = False) -> DataLoader:
     """Dataset → DataLoader.
 
     OTF 모드: ``num_workers=0`` (h5py 호환).
-    Preload 모드: ``config.LOADER_WORKERS`` + ``persistent_workers``.
+    Preload/Cache 모드: ``config.LOADER_WORKERS`` + ``persistent_workers``.
+    Train 모드: ``drop_last=True`` (BatchNorm 안정성 + GPU 활용률).
     """
-    # OTF 데이터셋은 h5py 핸들을 공유하므로 반드시 num_workers=0
     is_otf = isinstance(ds, (FlatDatasetOTF, BranchDatasetOTF))
     workers = 0 if is_otf else config.LOADER_WORKERS
 
@@ -1017,11 +1056,11 @@ def make_loader(ds: Dataset, shuffle: bool, branch: bool = False) -> DataLoader:
         num_workers=workers,
         pin_memory=config.USE_GPU and not is_otf,
         shuffle=shuffle,
-        drop_last=False,
+        drop_last=shuffle and len(ds) > config.BATCH,  # train만 + 데이터 충분할 때
     )
-    # Preload + 멀티워커: persistent_workers로 epoch 간 재생성 방지
     if workers > 0:
         kw["persistent_workers"] = True
+        kw["prefetch_factor"] = 2  # 다음 배치 미리 준비
     if branch:
         kw["collate_fn"] = collate_branch
     return DataLoader(ds, **kw)
@@ -1032,10 +1071,14 @@ def make_loader(ds: Dataset, shuffle: bool, branch: bool = False) -> DataLoader:
 # ═══════════════════════════════════════════════
 
 def _maybe_compile(model: nn.Module) -> nn.Module:
-    """``config.USE_COMPILE`` 이 True이면 ``torch.compile`` 을 시도한다."""
+    """``config.USE_COMPILE`` 이 True이면 ``torch.compile`` 을 시도한다.
+
+    mode="default": 커널 퓨전 최적화 (안전). reduce-overhead는 eval 시
+    dynamic batch size에서 CUDA graph 문제 가능.
+    """
     if config.USE_COMPILE and hasattr(torch, "compile"):
         try:
-            return torch.compile(model, mode="reduce-overhead")
+            return torch.compile(model, mode="default")
         except Exception:
             return model
     return model
