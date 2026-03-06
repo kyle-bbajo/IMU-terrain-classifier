@@ -1,0 +1,51 @@
+nohup: ignoring input
+============================================================
+  Config v8.2 — GPU 모드  Git:ae400d6
+============================================================
+  Device : cuda (NVIDIA L4)
+  GPU    : 22GB×1  AMP=BF16  cc=8.9
+  vCPU=8  RAM=30GiB  HDF5=2.6GB
+  N=40  Classes=6  TS=256  Rate=200Hz
+  Batch=192  Epochs=200  ES=20  LR=0.0003→1e-06
+  HS [Niswander2021]: Foot-Accelx(mean+1.8σ) + Foot-Gyroy(>0.5σ) window=±125ms
+  Focal=ON γ=2.0  FFT=ON(Foot)  TTA=ON×5
+============================================================
+
+[09:21:25]   ★ K-Fold 5-Fold (Subject-wise)
+
+[09:21:25]   HDF5 로드... (dataset.h5)
+[09:21:25]   ✅ N=49893  T=256  C=54  v8-subj  file=2.6GB  (0.0s)
+  Channel Groups (54 total -> 54 assigned):
+    Pelvis      :   6ch
+    Hand        :  12ch
+    Thigh       :  12ch
+    Shank       :  12ch
+    Foot        :  12ch
+[09:21:25]   클래스: [1, 2, 3, 4, 5, 6] (6개)
+[09:21:25]   피험자: 39명  샘플: 49893
+[09:21:25] 
+=======================================================
+[09:21:25]   Fold 1/5  tr=39693(30명)  te=10200(9명)
+[09:21:25]   Test 피험자: [8, 9, 18, 21, 28, 32, 37, 38, 39]
+[09:21:25]   Train 분포: {np.int64(0): np.int64(4406), np.int64(1): np.int64(8766), np.int64(2): np.int64(8087), np.int64(3): np.int64(7190), np.int64(4): np.int64(7126), np.int64(5): np.int64(4118)}
+[09:21:25]   Test  분포: {np.int64(0): np.int64(1205), np.int64(1): np.int64(2337), np.int64(2): np.int64(1898), np.int64(3): np.int64(1879), np.int64(4): np.int64(1810), np.int64(5): np.int64(1071)}
+[09:21:25] =======================================================
+[09:22:08]     PCA fit: 54→32  n=39693  EVR=0.849  (43.1s)
+[09:22:17]     BSC fit: n=39693  (8.8s)
+[09:22:17] ── M1  tr=39693  te=10200
+Traceback (most recent call last):
+  File "/home/ubuntu/project/repo/train_kfold.py", line 238, in <module>
+    main()
+  File "/home/ubuntu/project/repo/train_kfold.py", line 131, in main
+    res, labels, hist = run_M1(h5data, y, tr_idx, te_idx, sc, pca, fi)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/project/repo/train_common.py", line 1264, in run_M1
+    tr_ds = make_flat_dataset(h5data, y, tr_idx, sc, pca,
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/project/repo/train_common.py", line 705, in make_flat_dataset
+    cache_f = cache_flat_transform(
+              ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/project/repo/train_common.py", line 368, in cache_flat_transform
+    chunk = config.DS_CHUNK
+            ^^^^^^^^^^^^^^^
+AttributeError: module 'config' has no attribute 'DS_CHUNK'
