@@ -1,16 +1,17 @@
 """
-models.py — M1–M6 CNN 모델 정의 (v8.0)
+models.py — M1–M6 CNN 모델 정의 (v8.1)
 ═══════════════════════════════════════════════════════
+v8.1: 54ch Raw IMU (9센서 Accel+Gyro) / 5그룹 Branch
 ★ augment(): self.training 기반 (eval 모드 버그 수정)
 ★ count_parameters() 유틸 함수 포함
 ★ 모든 매직넘버 config.py에서 참조
 ★ 타입 힌팅 · Docstring 완비
 
 모델 구조:
-    M1 : PCA→Flat CNN (baseline)
-    M2 : 7-Branch CNN (plain)
-    M3 : 7-Branch CNN + SE Attention
-    M4 : 7-Branch CNN + CBAM Attention
+    M1 : PCA→Flat CNN (baseline, 54→32ch)
+    M2 : 5-Branch CNN (plain)
+    M3 : 5-Branch CNN + SE Attention
+    M4 : 5-Branch CNN + CBAM Attention
     M5 : M4 + Cross-Group Attention
     M6 : M5 + Online Data Augmentation
 ═══════════════════════════════════════════════════════
@@ -296,19 +297,19 @@ class _BranchBase(nn.Module):
 
 
 def M2_BranchCNN(bc: dict[str, int]) -> _BranchBase:
-    """M2: 7-Branch CNN (plain, no attention)."""
+    """M2: 5-Branch CNN (plain, no attention)."""
     return _BranchBase(bc, "plain", False)
 
 def M3_BranchSE(bc: dict[str, int]) -> _BranchBase:
-    """M3: 7-Branch CNN + SE Attention."""
+    """M3: 5-Branch CNN + SE Attention."""
     return _BranchBase(bc, "se", False)
 
 def M4_BranchCBAM(bc: dict[str, int]) -> _BranchBase:
-    """M4: 7-Branch CNN + CBAM Attention."""
+    """M4: 5-Branch CNN + CBAM Attention."""
     return _BranchBase(bc, "cbam", False)
 
 def M5_BranchCBAMCross(bc: dict[str, int]) -> _BranchBase:
-    """M5: 7-Branch CNN + CBAM + Cross-Group Attention."""
+    """M5: 5-Branch CNN + CBAM + Cross-Group Attention."""
     return _BranchBase(bc, "cbam", True)
 
 

@@ -1,115 +1,126 @@
 """
-channel_groups.py — Noraxon MyoMotion 채널 그룹핑 (v8.0)
+channel_groups.py — 9센서 Raw IMU 채널 그룹핑 (v8.1)
 ═══════════════════════════════════════════════════════
-v7→v8: 중복 할당 방지, 그룹별 최소 채널 경고, 정렬 순서 보장
+v8.0→v8.1: 305ch 전체 → 54ch Raw (Accel+Gyro) 전환
+            7그룹 → 5그룹 (해부학적 영역)
+            9센서: 골반, 양손, 양허벅지, 양정강이, 양발
 
-그룹 (7개):
-    Pelvis, Hand, Thigh, Shank, Foot, Joints, Trajectory
+센서 데이터:
+    Accelerometer X/Y/Z (mG)  — 3축 가속도
+    Gyroscope X/Y/Z (deg/s)   — 3축 각속도
+    = 6ch/센서 × 9센서 = 54ch
+
+그룹:
+    Pelvis : 골반 (6ch)
+    Hand   : 양손 (12ch = LT 6 + RT 6)
+    Thigh  : 양허벅지 (12ch)
+    Shank  : 양정강이 (12ch)
+    Foot   : 양발 (12ch)
 ═══════════════════════════════════════════════════════
 """
 from __future__ import annotations
 
-import warnings
-from typing import Callable
 
-_JOINT_KEYWORDS: tuple[str, ...] = (
-    "Hip Flexion", "Hip Abduction", "Hip Rotation",
-    "Knee Flexion", "Knee Abduction", "Knee Rotation",
-    "Ankle Dorsiflexion", "Ankle Abduction", "Ankle Inversion",
-)
+# ─────────────────────────────────────────────
+# 센서-그룹 정의
+# ─────────────────────────────────────────────
 
-# 대소문자 무관 매칭 (Noraxon 버전/내보내기 설정 차이 대응)
-def _ci(keyword: str) -> Callable[[str], bool]:
-    """Case-insensitive substring match."""
-    kw_lower = keyword.lower()
-    return lambda c: kw_lower in c.lower()
-
-GROUP_RULES: list[tuple[str, Callable[[str], bool]]] = [
-    ("Pelvis",     _ci("Pelvis")),
-    ("Hand",       _ci("Hand")),
-    ("Thigh",      _ci("Thigh")),
-    ("Shank",      _ci("Shank")),
-    ("Foot",       _ci("Foot")),
-    ("Joints",     lambda c: any(k.lower() in c.lower() for k in _JOINT_KEYWORDS)),
-    ("Trajectory", lambda c: any(
-        k.lower() in c.lower()
-        for k in ("Trajectories", "Body Orientation", "Body center")
-    )),
-]
-
-_MIN_EXPECTED: dict[str, int] = {
-    "Pelvis": 5, "Hand": 5, "Thigh": 10, "Shank": 10,
-    "Foot": 10, "Joints": 5, "Trajectory": 10,
+GROUPS: dict[str, list[str]] = {
+    "Pelvis": ["pelvis"],
+    "Hand":   ["hand lt", "hand rt"],
+    "Thigh":  ["thigh lt", "thigh rt"],
+    "Shank":  ["shank lt", "shank rt"],
+    "Foot":   ["foot lt", "foot rt"],
 }
+
+# 채널 타입 키워드 (이 키워드를 포함하는 채널만 사용)
+# "Accel Sensor" = 짧은 이름, "Acceleration" = Noraxon 긴 이름
+RAW_CHANNEL_KEYWORDS: list[str] = ["accel sensor", "acceleration", "gyroscope"]
+
+
+def is_raw_imu_channel(col: str) -> bool:
+    """채널명이 Raw IMU (Accel/Gyro) 채널인지 판단한다."""
+    cl = col.lower()
+    return any(kw in cl for kw in RAW_CHANNEL_KEYWORDS)
+
+
+def get_sensor_part(col: str) -> str | None:
+    """채널명에서 센서 부위를 추출한다.
+
+    "Hand Accel Sensor X LT (mG)" 처럼 부위명과 좌우가 떨어져 있어도 매칭.
+    """
+    cl = col.lower()
+
+    # 부위 키워드
+    body_parts = ["hand", "thigh", "shank", "foot"]
+    sides = ["lt", "rt"]
+
+    for part in body_parts:
+        if part in cl:
+            for side in sides:
+                # "hand ... lt" 또는 "hand-lt" 모두 매칭
+                if side in cl:
+                    return f"{part} {side}"
+            # 좌우 구분 없이 부위만 있으면 (예외 케이스)
+            return None
+
+    if "pelvis" in cl:
+        return "pelvis"
+    return None
+
+
+def filter_raw_channels(all_channels: list[str]) -> list[str]:
+    """전체 채널 목록에서 Raw IMU 채널만 필터링한다.
+
+    중복 제거 및 순서 보존. 같은 센서의 Accel Sensor / Acceleration
+    형태가 모두 있을 경우 먼저 나오는 것만 유지.
+    """
+    raw_channels: list[str] = []
+    seen_parts: set[str] = set()  # "pelvis_accel_x" 형태로 중복 체크
+
+    for c in all_channels:
+        if not is_raw_imu_channel(c):
+            continue
+        part = get_sensor_part(c)
+        if part is None:
+            continue
+
+        # 축(x/y/z) + 타입(accel/gyro) 키 생성
+        cl = c.lower()
+        axis = "x" if "x" in cl.split("(")[0].split("-")[-1] else (
+               "y" if "y" in cl.split("(")[0].split("-")[-1] else "z")
+        ch_type = "accel" if ("accel" in cl or "acceleration" in cl) else "gyro"
+        dedup_key = f"{part}_{ch_type}_{axis}"
+
+        if dedup_key not in seen_parts:
+            seen_parts.add(dedup_key)
+            raw_channels.append(c)
+
+    return raw_channels
 
 
 def build_branch_idx(
     channels: list[str],
 ) -> tuple[dict[str, list[int]], dict[str, int]]:
-    """채널 리스트를 신체 부위 그룹별 인덱스로 분류한다.
+    """채널 목록에서 5개 그룹의 인덱스 매핑을 생성한다."""
+    branch_idx: dict[str, list[int]] = {nm: [] for nm in GROUPS}
 
-    각 채널은 GROUP_RULES 순서대로 **첫 매칭 그룹에만** 할당된다.
-
-    Parameters
-    ----------
-    channels : list[str]
-        CSV 컬럼명 리스트 (time/Activity/Marker 제외 상태).
-
-    Returns
-    -------
-    branch_idx : dict[str, list[int]]
-        그룹명 -> 채널 인덱스 리스트.
-    branch_ch : dict[str, int]
-        그룹명 -> 채널 수.
-
-    Raises
-    ------
-    ValueError
-        channels가 비어 있거나 모든 채널이 미분류일 때.
-    """
-    if not channels:
-        raise ValueError("channels 리스트가 비어 있습니다.")
-
-    groups: dict[str, list[int]] = {name: [] for name, _ in GROUP_RULES}
-    unassigned: list[tuple[int, str]] = []
-
-    for i, ch in enumerate(channels):
-        matched = False
-        for gname, rule in GROUP_RULES:
-            if rule(ch):
-                groups[gname].append(i)
-                matched = True
+    for i, col in enumerate(channels):
+        part = get_sensor_part(col)
+        if part is None:
+            continue
+        for grp_name, keywords in GROUPS.items():
+            if part in keywords:
+                branch_idx[grp_name].append(i)
                 break
-        if not matched:
-            unassigned.append((i, ch))
 
-    # 빈 그룹 제거 (GROUP_RULES 순서 보존)
-    branch_idx: dict[str, list[int]] = {}
-    branch_ch: dict[str, int] = {}
-    for name, _ in GROUP_RULES:
-        if groups[name]:
-            branch_idx[name] = groups[name]
-            branch_ch[name]  = len(groups[name])
+    branch_idx = {k: sorted(v) for k, v in branch_idx.items() if v}
+    branch_ch  = {k: len(v) for k, v in branch_idx.items()}
 
-    if not branch_idx:
-        raise ValueError(
-            f"분류된 채널이 없습니다. 전체 {len(channels)}개 모두 미분류.\n"
-            f"첫 5개: {channels[:5]}"
-        )
-
-    for gname, min_ch in _MIN_EXPECTED.items():
-        actual = branch_ch.get(gname, 0)
-        if 0 < actual < min_ch:
-            warnings.warn(
-                f"채널 그룹 '{gname}': {actual}ch (최소 {min_ch}ch 예상)",
-                stacklevel=2,
-            )
-
-    total_assigned = sum(branch_ch.values())
-    print(f"  Channel Groups ({len(channels)} total -> {total_assigned} assigned):")
-    for nm in branch_idx:
-        print(f"    {nm:<12}: {branch_ch[nm]:>3}ch")
-    if unassigned:
-        print(f"    (미분류     : {len(unassigned):>3}ch)")
+    total = sum(branch_ch.values())
+    print(f"  Channel Groups ({len(channels)} total -> {total} assigned):")
+    for nm in GROUPS:
+        if nm in branch_ch:
+            print(f"    {nm:<12}: {branch_ch[nm]:3d}ch")
 
     return branch_idx, branch_ch

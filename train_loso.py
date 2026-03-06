@@ -1,5 +1,5 @@
 """
-train_loso.py — M1–M6 LOSO 교차검증 (v8.0)
+train_loso.py — M1–M6 LOSO 교차검증 (v8.1)
 ═══════════════════════════════════════════════════════
 ★ argparse로 N/seed/batch/epochs 런타임 변경
 ★ config 스냅샷 자동 저장 (재현성)
@@ -272,7 +272,7 @@ def main() -> None:
 
     summary = {
         "experiment": "loso",
-        "version": "v8.0",
+        "version": "v8.1",
         "config": config.snapshot(),
         "total_minutes": round(total_min, 1),
         "total_errors": total_errors,

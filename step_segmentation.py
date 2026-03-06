@@ -1,5 +1,5 @@
 """
-step_segmentation.py — 힐스트라이크 스텝 분할 (v8.0 증분 모드)
+step_segmentation.py — 힐스트라이크 스텝 분할 (v8.1 증분 모드)
 ═══════════════════════════════════════════════════════
 ★ 증분(Incremental) 처리: 기존 HDF5의 피험자는 스킵, 신규만 추가
 ★ N=40 → N=100 확장 시 기존 40명 재처리 불필요
@@ -306,19 +306,86 @@ def verify_channels(
 
 
 # ─────────────────────────────────────────────
-# 4. Foot Acc norm + 대역통과 필터
+# 4. 신호 추출 + 대역통과 필터
 # ─────────────────────────────────────────────
 
 def compute_foot_acc_norm(df: pd.DataFrame, side: str = "LT") -> np.ndarray:
-    """발 가속도 센서의 3축 norm을 계산한다.
-
-    컬럼명이 정확히 일치하지 않아도 패턴 매칭으로 자동 탐색.
-    """
+    """발 가속도 센서의 3축 norm을 계산한다 (폴백용)."""
     cols = config.resolve_foot_acc_cols(df.columns.tolist(), side)
     ax = df[cols["x"]].values.astype(np.float64)
     ay = df[cols["y"]].values.astype(np.float64)
     az = df[cols["z"]].values.astype(np.float64)
     return np.sqrt(ax**2 + ay**2 + az**2)
+
+
+def _resolve_sensor_axis(
+    columns: list[str], sensor: str, axis: str, side: str,
+    signal_type: str = "gyroscope",
+) -> str | None:
+    """특정 센서의 특정 축 채널명을 찾는다.
+
+    Parameters
+    ----------
+    sensor : str
+        센서 부위 (예: "Shank", "Foot")
+    axis : str
+        축 (예: "x", "y", "z")
+    side : str
+        좌우 ("LT", "RT")
+    signal_type : str
+        "gyroscope" 또는 "accel"
+    """
+    sensor_l = sensor.lower()
+    axis_l   = axis.lower()
+    side_l   = side.lower()
+    type_l   = signal_type.lower()
+
+    for c in columns:
+        cl = c.lower()
+        # 센서 + 좌우 + 타입 + 축 모두 포함
+        has_sensor = sensor_l in cl
+        has_side   = side_l in cl or sensor_l == "pelvis"
+        has_type   = type_l in cl or ("accel" in type_l and "accel" in cl)
+        # 축: 마지막 단어 또는 -x, _x 형태
+        has_axis   = (cl.endswith(f"-{axis_l}") or
+                     cl.endswith(f"_{axis_l}") or
+                     f" {axis_l} " in cl or
+                     f"-{axis_l} " in cl or
+                     f" {axis_l} {side_l}" in cl)
+
+        if has_sensor and has_side and has_type and has_axis:
+            return c
+    return None
+
+
+def extract_ml_gyro(df: pd.DataFrame, side: str) -> np.ndarray | None:
+    """ML(Mediolateral) Gyroscope 신호를 추출한다.
+
+    config.HS_GYRO_SENSOR + config.HS_GYRO_AXIS 기반.
+    """
+    col = _resolve_sensor_axis(
+        df.columns.tolist(),
+        config.HS_GYRO_SENSOR, config.HS_GYRO_AXIS, side,
+        "gyroscope",
+    )
+    if col is None:
+        return None
+    return df[col].values.astype(np.float64)
+
+
+def extract_ap_accel(df: pd.DataFrame, side: str) -> np.ndarray | None:
+    """AP(Anteroposterior) Accelerometer 신호를 추출한다.
+
+    config.HS_ACCEL_SENSOR + config.HS_ACCEL_AXIS 기반.
+    """
+    col = _resolve_sensor_axis(
+        df.columns.tolist(),
+        config.HS_ACCEL_SENSOR, config.HS_ACCEL_AXIS, side,
+        "accel",
+    )
+    if col is None:
+        return None
+    return df[col].values.astype(np.float64)
 
 
 def bandpass_filter(
@@ -358,7 +425,7 @@ def collect_terrain_stats(records: list[dict]) -> dict[int, dict]:
     """
     log("  [Pass 1] 지면별 통계 수집...")
     terrain_stats: dict[int, dict[str, list]] = defaultdict(
-        lambda: {"means": [], "stds": [], "peak_heights": []}
+        lambda: {"means": [], "stds": [], "peak_heights": [], "stride_intervals": []}
     )
 
     for i, rec in enumerate(records):
@@ -371,36 +438,59 @@ def collect_terrain_stats(records: list[dict]) -> dict[int, dict]:
         cond = rec["cond"]
         for side in ["LT", "RT"]:
             try:
-                norm = compute_foot_acc_norm(df, side)
-                norm_f = bandpass_filter(norm)
+                # v8.1: Type 4 기반 통계 수집 (ML Gyro + Foot Accel)
+                ml_gyro  = extract_ml_gyro(df, side)
+                ap_accel = extract_ap_accel(df, side)
 
-                # NaN 보간: 시간축 유지한 채 선형 보간 → 연속 신호 복원
-                nan_mask = np.isnan(norm_f)
+                if ml_gyro is None or ap_accel is None:
+                    # 폴백: Foot Acc Norm
+                    norm = compute_foot_acc_norm(df, side)
+                    sig = bandpass_filter(norm)
+                else:
+                    sig = bandpass_filter(ml_gyro)
+
+                # NaN 보간
+                nan_mask = np.isnan(sig)
                 n_valid = int(np.sum(~nan_mask))
                 if n_valid < config.HS_MIN_STRIDE_SAM * 2:
                     continue
 
                 if nan_mask.any():
-                    x = np.arange(len(norm_f))
-                    norm_f = norm_f.copy()
-                    norm_f[nan_mask] = np.interp(
-                        x[nan_mask], x[~nan_mask], norm_f[~nan_mask]
+                    x = np.arange(len(sig))
+                    sig = sig.copy()
+                    sig[nan_mask] = np.interp(
+                        x[nan_mask], x[~nan_mask], sig[~nan_mask]
                     )
 
-                mu  = float(np.mean(norm_f))
-                std = float(np.std(norm_f))
+                mu  = float(np.mean(sig))
+                std = float(np.std(sig))
                 terrain_stats[cond]["means"].append(mu)
                 terrain_stats[cond]["stds"].append(std)
 
-                # 보간된 연속 신호에서 피크 검출 → 간격 통계 정확
-                peaks, props = find_peaks(
-                    norm_f, height=mu + 0.5 * std,
-                    distance=config.HS_MIN_STRIDE_SAM,
-                )
-                if len(peaks) > 0:
+                # ML Gyro min으로 피크 검출 (Type 4)
+                if ml_gyro is not None:
+                    peaks, props = find_peaks(
+                        -sig, prominence=0.4 * std,
+                        distance=config.HS_MIN_STRIDE_SAM,
+                    )
+                else:
+                    peaks, props = find_peaks(
+                        sig, height=mu + 0.5 * std,
+                        distance=config.HS_MIN_STRIDE_SAM,
+                    )
+
+                if len(peaks) > 0 and "peak_heights" in props:
                     terrain_stats[cond]["peak_heights"].extend(
                         props["peak_heights"].tolist()
                     )
+                elif len(peaks) > 0 and "prominences" in props:
+                    terrain_stats[cond]["peak_heights"].extend(
+                        props["prominences"].tolist()
+                    )
+                # 피크 간 간격 수집 (보폭 분포)
+                if len(peaks) > 1:
+                    intervals = np.diff(peaks).tolist()
+                    terrain_stats[cond]["stride_intervals"].extend(intervals)
             except (KeyError, ValueError):
                 continue
 
@@ -416,6 +506,8 @@ def collect_terrain_stats(records: list[dict]) -> dict[int, dict]:
                 "alpha": 1.0,
                 "min_dist": config.HS_MIN_STRIDE_SAM,
                 "min_peak_ratio": config.HS_PEAK_QUALITY_RATIO,
+                "stride_min_sam": config.HS_MIN_STRIDE_SAM,
+                "stride_max_sam": config.HS_MAX_STRIDE_SAM,
             }
             continue
         avg_mean = float(np.mean(s["means"]))
@@ -424,16 +516,41 @@ def collect_terrain_stats(records: list[dict]) -> dict[int, dict]:
                     if s["peak_heights"] else avg_mean + avg_std)
         snr = (avg_peak - avg_mean) / avg_std if avg_std > 0 else 0
         alpha = max(0.5, min(2.0, snr * 0.5))
+
+        # 보폭 범위: 데이터 기반 percentile (하드코딩 폴백)
+        if len(s["stride_intervals"]) >= 20:
+            si = np.array(s["stride_intervals"])
+            stride_min = int(np.percentile(si, 2))   # 2nd percentile
+            stride_max = int(np.percentile(si, 98))   # 98th percentile
+            # 안전 마진 10%
+            stride_min = max(40, int(stride_min * 0.9))   # 최소 40샘플(200ms)
+            stride_max = int(stride_max * 1.1)
+            stride_mean = float(np.mean(si))
+            stride_std  = float(np.std(si))
+        else:
+            stride_min  = config.HS_MIN_STRIDE_SAM
+            stride_max  = config.HS_MAX_STRIDE_SAM
+            stride_mean = 0.0
+            stride_std  = 0.0
+
         terrain_params[cond] = {
             "alpha": round(alpha, 3),
-            "min_dist": config.HS_MIN_STRIDE_SAM,
+            "min_dist": stride_min,
             "min_peak_ratio": config.HS_PEAK_QUALITY_RATIO,
+            "stride_min_sam": stride_min,
+            "stride_max_sam": stride_max,
+            "stride_mean_ms": round(stride_mean / config.SAMPLE_RATE * 1000, 1),
+            "stride_std_ms": round(stride_std / config.SAMPLE_RATE * 1000, 1),
+            "stride_n_samples": len(s["stride_intervals"]),
             "avg_mean": round(avg_mean, 1),
             "avg_std": round(avg_std, 1),
             "avg_peak": round(avg_peak, 1),
         }
         log(f"    C{cond}: α={alpha:.2f}  μ={avg_mean:.0f}"
-            f"  σ={avg_std:.0f}  peak={avg_peak:.0f}")
+            f"  σ={avg_std:.0f}  peak={avg_peak:.0f}"
+            f"  stride={stride_min}~{stride_max}sam"
+            f" ({stride_min/config.SAMPLE_RATE*1000:.0f}~{stride_max/config.SAMPLE_RATE*1000:.0f}ms)"
+            f"  n={len(s['stride_intervals'])}")
 
     return terrain_params
 
@@ -443,72 +560,136 @@ def collect_terrain_stats(records: list[dict]) -> dict[int, dict]:
 # ─────────────────────────────────────────────
 
 def detect_steps(
-    norm_signal: np.ndarray,
-    terrain_params: dict[int, dict],
+    ml_gyro: np.ndarray,
+    ap_accel: np.ndarray,
+    terrain_params: dict,
     cond: int,
+    fs: int = config.SAMPLE_RATE,
 ) -> list[tuple[int, int]]:
-    """3단계 힐스트라이크 스텝을 검출한다.
+    """ML Gyro + AP Accel 융합 힐스트라이크 검출.
 
-    NaN은 시간축을 유지한 채 선형 보간 후 피크를 검출하고,
-    원본 신호의 NaN 비율로 최종 QC를 수행한다.
-    좌·우 발 이벤트는 독립적으로 검출되며, 동일 시도 내에서도
-    시간 구간이 달라 중복 샘플로 간주하지 않는다.
+    알고리즘:
+        1. 입력: Shank ML Gyroscope + Foot AP Accelerometer
+        2. 필터: Butterworth bandpass 1-20Hz
+        3. HS 후보: ML gyro local min (prominence=0.4σ, dist=0.35s)
+        4. 융합 검증: 후보 ±125ms 내 AP accel min < mean - 0.8σ
+        5. 보폭 제약: 조건별 stride_min ~ stride_max
+
+    Parameters
+    ----------
+    ml_gyro : np.ndarray
+        Mediolateral gyroscope 원 신호.
+    ap_accel : np.ndarray
+        Anteroposterior accelerometer 원 신호.
+    terrain_params : dict
+        조건별 파라미터 (stride_min_sam, stride_max_sam 등).
+    cond : int
+        지면 조건 번호.
+    fs : int
+        샘플링 주파수.
+
+    Returns
+    -------
+    list[tuple[int, int]]
+        유효 스텝 구간 리스트 ``[(start, end), ...]``.
     """
-    params = terrain_params.get(cond, {
-        "alpha": 1.0,
-        "min_dist": config.HS_MIN_STRIDE_SAM,
-        "min_peak_ratio": config.HS_PEAK_QUALITY_RATIO,
-    })
-    alpha          = params["alpha"]
-    min_dist       = params["min_dist"]
-    min_peak_ratio = params["min_peak_ratio"]
-
-    # 유효성 체크: 시간축 길이 기반 (v8: NaN 비율은 QC에서 처리)
-    nan_mask = np.isnan(norm_signal)
-    total_len = len(norm_signal)
-    nan_ratio_global = float(np.sum(nan_mask)) / total_len if total_len > 0 else 1.0
-    if total_len < min_dist * 3:
-        return []
-    if nan_ratio_global > config.HS_NAN_THRESHOLD:
+    n = len(ml_gyro)
+    if n < fs:  # 최소 1초
         return []
 
-    # NaN 보간: 시간축 유지한 채 선형 보간 → 연속 신호 복원
-    sig = norm_signal.copy()
-    if nan_mask.any():
-        x = np.arange(len(sig))
-        sig[nan_mask] = np.interp(x[nan_mask], x[~nan_mask], sig[~nan_mask])
-
-    file_mean = float(np.mean(sig))
-    file_std  = float(np.std(sig))
-    if file_std == 0:
+    # NaN 체크
+    nan_ratio = (np.isnan(ml_gyro).sum() + np.isnan(ap_accel).sum()) / (2 * n)
+    if nan_ratio > config.HS_NAN_THRESHOLD:
         return []
-    threshold = file_mean + alpha * file_std
 
-    peaks, props = find_peaks(
-        sig,
-        height=threshold,
-        distance=min_dist,
-        prominence=file_std * config.HS_PROMINENCE_COEFF,
+    # NaN 보간
+    for sig in [ml_gyro, ap_accel]:
+        mask = np.isnan(sig)
+        if mask.any() and not mask.all():
+            x = np.arange(n)
+            sig[mask] = np.interp(x[mask], x[~mask], sig[~mask])
+
+    # 1. 대역통과 필터 (1-20Hz: 중력/고주파 노이즈 제거)
+    ml_f = bandpass_filter(ml_gyro, fs, low=1.0, high=20.0)
+    ap_f = bandpass_filter(ap_accel, fs, low=1.0, high=20.0)
+
+    # 2. ML gyro local minimum → HS 후보
+    sigma_ml = float(np.std(ml_f))
+    if sigma_ml == 0:
+        return []
+
+    min_dist_sam = int(fs * 0.35)  # 최소 350ms 간격
+
+    # Mid-swing peaks (양의 방향 = 스윙 중간)
+    mid_swings, _ = find_peaks(ml_f, prominence=0.3 * sigma_ml, distance=min_dist_sam)
+
+    # Trusted swing threshold (Niswander: 20% of max mid-swing)
+    trusted_thresh = config.HS_TRUSTED_SWING * (np.max(ml_f) if len(mid_swings) > 0 else sigma_ml)
+
+    # -ml_f의 피크 = ml_f의 minimum
+    hs_cand, _ = find_peaks(
+        -ml_f,
+        prominence=config.HS_GYRO_PROMINENCE * sigma_ml,
+        distance=min_dist_sam,
     )
-    if len(peaks) < 2:
+    if len(hs_cand) < 2:
         return []
 
-    avg_peak_h = float(np.mean(props["peak_heights"]))
-    quality_threshold = avg_peak_h * min_peak_ratio
+    # Trusted swing 필터: HS 후보 근처에 충분한 스윙이 있어야 유효
+    hs_trusted: list[int] = []
+    for cand in hs_cand:
+        # 후보 전후 0.5초 내 mid-swing peak 존재 확인
+        nearby_swings = [p for p in mid_swings if abs(p - cand) < fs // 2]
+        if len(nearby_swings) > 0:
+            # 가장 가까운 mid-swing의 크기가 trusted threshold 이상
+            nearest = min(nearby_swings, key=lambda p: abs(p - cand))
+            if ml_f[nearest] > trusted_thresh:
+                hs_trusted.append(cand)
+        else:
+            # mid-swing 없으면 주변 ml_f 최대값으로 폴백
+            w_start = max(0, cand - fs // 2)
+            w_end   = min(n, cand + fs // 2)
+            if np.max(ml_f[w_start:w_end]) > trusted_thresh:
+                hs_trusted.append(cand)
+
+    if len(hs_trusted) < 2:
+        return []
+
+    # 3. AP accel 융합 검증
+    mean_ap  = float(np.mean(ap_f))
+    sigma_ap = float(np.std(ap_f))
+    window   = config.HS_FUSION_WINDOW_SAM  # ±25 samples (±125ms)
+
+    hs_final: list[int] = []
+    for cand in hs_trusted:
+        w_start = max(0, cand - window)
+        w_end   = min(n, cand + window)
+        # AP accel이 평균보다 충분히 낮은지 (감속 확인)
+        if np.min(ap_f[w_start:w_end]) < mean_ap - config.HS_ACCEL_THRESHOLD * sigma_ap:
+            hs_final.append(cand)
+
+    if len(hs_final) < 2:
+        return []
+
+    # 4. 보폭 제약으로 스텝 구간 생성
+    _default_params = {
+        "stride_min_sam": config.HS_MIN_STRIDE_SAM,
+        "stride_max_sam": config.HS_MAX_STRIDE_SAM,
+    }
+    params = terrain_params.get(cond) or terrain_params.get(str(cond)) or _default_params
+    stride_min = params.get("stride_min_sam", config.HS_MIN_STRIDE_SAM)
+    stride_max = params.get("stride_max_sam", config.HS_MAX_STRIDE_SAM)
 
     valid_steps: list[tuple[int, int]] = []
-    for i in range(len(peaks) - 1):
-        start, end = int(peaks[i]), int(peaks[i + 1])
+    for i in range(len(hs_final) - 1):
+        start = hs_final[i]
+        end   = hs_final[i + 1]
         length = end - start
-        if length < config.HS_MIN_STRIDE_SAM or length > config.HS_MAX_STRIDE_SAM:
+        if length < stride_min or length > stride_max:
             continue
-        segment_max = float(np.max(sig[start:end]))
-        if segment_max < quality_threshold:
-            continue
-        # QC: 원본 신호의 NaN 비율로 데이터 품질 검증
-        orig_segment = norm_signal[start:end]
-        nan_ratio = np.sum(np.isnan(orig_segment)) / len(orig_segment)
-        if nan_ratio > config.HS_NAN_THRESHOLD:
+        # QC: 원본 신호 NaN 비율
+        seg_nan = np.isnan(ml_gyro[start:end]).sum() / length
+        if seg_nan > config.HS_NAN_THRESHOLD:
             continue
         valid_steps.append((start, end))
 
@@ -570,7 +751,7 @@ def main() -> None:
     force = args.force
 
     log(f"{'='*60}")
-    log(f"  step_segmentation.py v8.0 ({'전체 재생성' if force else '증분 모드'})")
+    log(f"  step_segmentation.py v8.1 ({'전체 재생성' if force else '증분 모드'})")
     log(f"  N={config.N_SUBJECTS}  TS={config.TS}pt  {config.SAMPLE_RATE}Hz")
     log(f"{'='*60}\n")
 
@@ -623,7 +804,13 @@ def main() -> None:
         log(f"  [Pass 0] 기존 채널 재사용: {len(channels)}개 (일관성 유지)")
         verify_channels(new_records, channels)
     else:
-        channels = find_common_channels(all_records)
+        all_common = find_common_channels(all_records)
+        # v8.1: Raw IMU 54ch만 필터 (Accel + Gyro)
+        from channel_groups import filter_raw_channels
+        channels = filter_raw_channels(all_common)
+        log(f"  [Pass 0] Raw IMU 필터: {len(all_common)}ch → {len(channels)}ch")
+        if len(channels) == 0:
+            raise ValueError("Raw IMU 채널(Accel/Gyro)을 찾을 수 없습니다")
     n_ch = len(channels)
 
     # ── Pass 1: 지면별 통계 (전체 레코드 사용) ──
@@ -667,15 +854,26 @@ def main() -> None:
         file_steps = 0
         for side in ("LT", "RT"):
             try:
-                acc_cols = config.resolve_foot_acc_cols(df.columns.tolist(), side)
-                contact_col = config.resolve_foot_contact_col(df.columns.tolist(), side)
-                acc_data = df[acc_cols].values.astype(np.float64)
-                contact  = df[contact_col].values.astype(np.float64)
-                norm_acc = np.sqrt((acc_data**2).sum(axis=1))
+                # v8.1 Type 4: Shank ML Gyro + Foot AP Accel
+                ml_gyro  = extract_ml_gyro(df, side)
+                ap_accel = extract_ap_accel(df, side)
 
-                steps = detect_steps(
-                    norm_acc, terrain_params, label,
-                )
+                if ml_gyro is None or ap_accel is None:
+                    # 폴백: Foot Acc Norm (Type 4 채널 없을 때)
+                    norm = compute_foot_acc_norm(df, side)
+                    norm_f = bandpass_filter(norm)
+                    # 구버전 피크 검출
+                    sigma = float(np.std(norm_f[~np.isnan(norm_f)])) if np.any(~np.isnan(norm_f)) else 1.0
+                    peaks, _ = find_peaks(norm_f, height=np.nanmean(norm_f) + 0.5 * sigma,
+                                          distance=config.HS_MIN_STRIDE_SAM)
+                    steps = [(int(peaks[j]), int(peaks[j+1]))
+                             for j in range(len(peaks)-1)
+                             if config.HS_MIN_STRIDE_SAM <= peaks[j+1]-peaks[j] <= config.HS_MAX_STRIDE_SAM]
+                else:
+                    steps = detect_steps(
+                        ml_gyro.copy(), ap_accel.copy(),
+                        terrain_params, label,
+                    )
 
                 for (start, end) in steps:
                     raw_len = end - start

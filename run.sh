@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════
-# run.sh v8.0 — 힐스트라이크 파이프라인 (SSH 분리 지원)
+# run.sh v8.1 — 힐스트라이크 파이프라인 (SSH 분리 지원)
 #
 # 사용법:
 #   bash run.sh              # N=40, 전체 (포그라운드)
@@ -65,7 +65,7 @@ source /home/ubuntu/project/venv/bin/activate
 cd "${PROJECT}"
 
 echo "====================================================="
-echo "  v8.0 파이프라인  N=${N}  MODE=${MODE}  $(date)"
+echo "  v8.1 파이프라인  N=${N}  MODE=${MODE}  $(date)"
 echo "  ★ argparse 기반 (sed 없음)"
 echo "====================================================="
 

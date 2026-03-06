@@ -16,7 +16,7 @@ raw_csv/  →  step_segmentation.py  →  dataset.h5  →  train_kfold.py / trai
 | 모델 | 구조 | 핵심 | 논문 의의 |
 |------|------|------|-----------|
 | M1 | PCA(64ch) → 1D-CNN | 차원축소 baseline | 전통적 접근법 비교 기준 |
-| M2 | 7-Branch CNN | 신체 부위별 독립 인코딩 | 해부학적 사전지식 반영 |
+| M2 | 5-Branch CNN | 신체 부위별 독립 인코딩 | 해부학적 사전지식 반영 |
 | M3 | M2 + SE block | 채널 중요도 가중치 | Squeeze-and-Excitation |
 | M4 | M2 + CBAM | 채널 + 시간축 동시 어텐션 | 힐스트라이크 시점 학습 |
 | M5 | M4 + Cross-Attention | 부위 간 상호작용 학습 | 발-무릎-골반 연쇄 반응 |
@@ -59,7 +59,7 @@ data/raw_csv/
 ├── 20230101_S01C1T1.csv    # S{피험자}C{지형}T{시행}
 └── ...
 ```
-- 포맷: Noraxon MyoMotion CSV (skiprows=2), ~320채널, 200Hz
+- 포맷: Noraxon MyoMotion CSV (skiprows=2), ~320채널 중 Accel+Gyro 54채널 사용, 200Hz
 - 지형 조건: C1~C8 (최대 8종)
 - 유연한 컬럼 매칭: 3-tier (exact → regex → normalized) 자동 정규화
 
@@ -67,12 +67,12 @@ data/raw_csv/
 ```
 subjects/
 ├── S0001/
-│   ├── X    : (n_steps, 256, 305)  float32
+│   ├── X    : (n_steps, 256, 54)  float32
 │   └── y    : (n_steps,)           int64
 ├── S0002/
 │   ├── X, y
 │   └── ...
-channels  : (305,)  bytes
+channels  : (54,)  bytes
 attrs: format="subject_group_v8", sample_rate, target_ts, n_classes
 ```
 
@@ -149,7 +149,7 @@ out_N40/
 | 파일 | 역할 |
 |------|------|
 | `config.py` | 전역 설정. 하드웨어 자동감지(GPU/RAM/vCPU), 배치/워커 자동 스케일링, argparse 오버라이드, config 스냅샷 |
-| `channel_groups.py` | 305채널 → 7그룹(Pelvis/Hand/Thigh/Shank/Foot/Joint/Trajectory) 매핑 |
+| `channel_groups.py` | 54채널 Raw IMU → 5그룹(Pelvis/Hand/Thigh/Shank/Foot) 매핑 |
 | `models.py` | M1~M6 CNN 아키텍처. SE/CBAM/Cross-Attention, 벡터화 augmentation |
 | `step_segmentation.py` | 3-pass 힐스트라이크 분할. Subject-group HDF5, 유연한 컬럼 매칭, 증분 처리 |
 | `train_common.py` | 공용 엔진. H5Data(v7/v8 호환), PCA 디스크 캐시, Preload/OTF/Cache 3모드 Dataset, 학습루프, 메타 로깅 |

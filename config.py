@@ -1,5 +1,5 @@
 """
-config.py — 전역 설정 (v8.0)
+config.py — 전역 설정 (v8.1)
 ═══════════════════════════════════════════════════════
 ★ 모든 하드코딩 값 중앙 관리
 ★ 스마트 듀얼 Preload: M1(항상) / M2–M6(RAM 여유 시)
@@ -50,12 +50,13 @@ except (ValueError, OSError):
 
 # ─────────────────────────────────────────────
 # 3. 데이터 로딩 전략 (스마트 듀얼 모드)
-#    M1(PCA→64ch): ~2.5GB → 항상 Preload 가능
-#    M2–M6(305ch): fp16 기준 ~11GB → RAM ≥ 24GB 시 Preload
+#    v8.1: 54ch Raw IMU → 데이터 5.6배 축소
+#    M1(PCA→32ch): ~0.8GB → 항상 Preload 가능
+#    M2–M6(54ch): fp16 기준 ~2GB → 항상 Preload 가능
 #    can_preload_branch()로 동적 메모리 추정
 # ─────────────────────────────────────────────
-USE_PRELOAD: bool    = RAM_GIB >= 24       # M2–M6 Branch 전용
-USE_PRELOAD_M1: bool = True                # M1 PCA 결과는 항상 RAM 적재 (~2.5GB)
+USE_PRELOAD: bool    = True                # 54ch면 항상 RAM에 들어감
+USE_PRELOAD_M1: bool = True                # M1 PCA 결과 항상 RAM 적재
 
 
 def can_preload_branch(
@@ -70,7 +71,7 @@ def can_preload_branch(
     n_samples : int
         train + test 합산 샘플 수.
     n_channels : int
-        채널 수 (보통 305).
+        채널 수 (54ch Raw IMU).
     ts : int
         타임스텝 수 (기본 256).
     """
@@ -118,21 +119,38 @@ else:
 N_SUBJECTS: int  = 40
 NUM_CLASSES: int = 6    # ★ C1~C6만 사용. C7/C8 있으면 여기 수정 필요 (모델 출력층도 변경됨)
 TS: int          = 256
-PCA_CH: int      = 64
+PCA_CH: int      = 32      # 54ch → 32ch PCA (v8.1: 305→54로 축소되어 PCA도 조정)
 SAMPLE_RATE: int = 200
 SEED: int        = 42
 
 # ─────────────────────────────────────────────
 # 7. 힐스트라이크 검출 파라미터
 # ─────────────────────────────────────────────
-HS_MIN_STRIDE_MS: int      = 400
-HS_MAX_STRIDE_MS: int      = 1800
-HS_MIN_STRIDE_SAM: int     = int(HS_MIN_STRIDE_MS / 1000 * SAMPLE_RATE)
-HS_MAX_STRIDE_SAM: int     = int(HS_MAX_STRIDE_MS / 1000 * SAMPLE_RATE)
+HS_MIN_STRIDE_MS: int      = 400    # 폴백 최소 보폭 (데이터 부족 시)
+HS_MAX_STRIDE_MS: int      = 1800   # 폴백 최대 보폭 (데이터 부족 시)
+HS_MIN_STRIDE_SAM: int     = int(HS_MIN_STRIDE_MS / 1000 * SAMPLE_RATE)  # Pass 1에서 데이터 기반 재설정
+HS_MAX_STRIDE_SAM: int     = int(HS_MAX_STRIDE_MS / 1000 * SAMPLE_RATE)  # Pass 1에서 데이터 기반 재설정
 HS_NAN_THRESHOLD: float    = 0.1
 HS_PROMINENCE_COEFF: float = 0.3
 HS_PEAK_QUALITY_RATIO: float = 0.6
-MIN_STEP_LEN: int = HS_MIN_STRIDE_SAM  # 최소 스텝 길이 (80 samples = 400ms)
+MIN_STEP_LEN: int = HS_MIN_STRIDE_SAM  # 최소 스텝 길이
+
+# v8.1: Type 4 MLvel/APacc 융합 HS 검출 (Niswander et al., 2021)
+# Shank ML Gyroscope → 발이 지면에 닿을 때 각속도 최소 (heel rotation stop)
+# Foot AP Accelerometer → 힐스트라이크 시 감속 충격
+# ★ 축 매핑: Noraxon MyoMotion 실측 기반
+#   Shank Gyro Y = sagittal plane rotation (ML축 중심 회전) → std 69.0, 가장 강한 보행 신호
+#   Foot Accel X = 충격축 (가장 큰 범위 -1626~4370mG)
+#   센서 부착 방향에 따라 조정 필요: 데이터에서 swing peak가 가장 명확한 축 선택
+HS_GYRO_SENSOR: str     = "Shank"      # Gyro 소스 센서 (MLS가 RMSE 18ms로 최적)
+HS_GYRO_AXIS: str       = "y"          # ML축 회전 (sagittal plane, 실측 std=69.0)
+HS_ACCEL_SENSOR: str    = "Foot"       # Accel 소스 센서
+HS_ACCEL_AXIS: str      = "x"          # 충격축 (실측 범위 최대, std=717)
+HS_FUSION_WINDOW_MS: int = 125         # 융합 검증 윈도우 (±ms)
+HS_FUSION_WINDOW_SAM: int = int(HS_FUSION_WINDOW_MS / 1000 * SAMPLE_RATE)
+HS_GYRO_PROMINENCE: float  = 0.4       # ML gyro min 검출 prominence (σ 배수)
+HS_ACCEL_THRESHOLD: float  = 0.8       # AP accel 검증 임계값 (σ 배수)
+HS_TRUSTED_SWING: float    = 0.2       # Trusted swing threshold (mid-swing max의 20%)
 
 FOOT_ACC_COLS: dict[str, dict[str, str]] = {
     "LT": {"x": "Foot Accel Sensor X LT (mG)",
@@ -300,11 +318,11 @@ LR: float       = 1e-3
 MIN_LR: float   = 1e-6
 
 if USE_GPU:
-    # 단일 GPU 기준 배치 → N_GPU 배수로 스케일링
-    _base_batch: int = 1024 if GPU_MEM_GB >= 40 else (256 if GPU_MEM_GB >= 20 else 64)
+    # v8.1: 54ch → 모델이 작아져서 배치 크기 증가 가능
+    _base_batch: int = 2048 if GPU_MEM_GB >= 40 else (512 if GPU_MEM_GB >= 20 else 128)
     BATCH: int = _base_batch * max(1, N_GPU)
 else:
-    BATCH = 64
+    BATCH = 128
 
 WEIGHT_DECAY: float    = 1e-3
 DROPOUT_CLF: float     = 0.5
@@ -443,6 +461,11 @@ def snapshot(out_dir: Path | None = None) -> dict:
         "ts": _cfg.TS, "pca_ch": _cfg.PCA_CH,
         "sample_rate": _cfg.SAMPLE_RATE, "seed": _cfg.SEED,
         "min_step_len": _cfg.MIN_STEP_LEN,
+        # HS 검출 (Type 4)
+        "hs_gyro_sensor": _cfg.HS_GYRO_SENSOR, "hs_gyro_axis": _cfg.HS_GYRO_AXIS,
+        "hs_accel_sensor": _cfg.HS_ACCEL_SENSOR, "hs_accel_axis": _cfg.HS_ACCEL_AXIS,
+        "hs_fusion_window_ms": _cfg.HS_FUSION_WINDOW_MS,
+        "hs_gyro_prominence": _cfg.HS_GYRO_PROMINENCE,
         # 학습
         "kfold": _cfg.KFOLD, "epochs": _cfg.EPOCHS, "early_stop": _cfg.EARLY_STOP,
         "batch": _cfg.BATCH, "lr": _cfg.LR, "min_lr": _cfg.MIN_LR,
@@ -483,7 +506,7 @@ def print_config() -> None:
     strategy_m1 = "Preload (항상)" if USE_PRELOAD_M1 else "OTF"
     strategy_br = "Preload" if USE_PRELOAD else "OTF (auto)"
     print(f"{'='*60}")
-    print(f"  Config v8.0 — {'GPU' if USE_GPU else 'CPU'} 모드")
+    print(f"  Config v8.1 — {'GPU' if USE_GPU else 'CPU'} 모드")
     print(f"  Git: {_get_git_hash()}")
     print(f"{'='*60}")
     print(f"  Device:    {DEVICE}  ({DEVICE_NAME})")
@@ -502,6 +525,8 @@ def print_config() -> None:
     print(f"  LabelSmooth={LABEL_SMOOTH}  Mixup={MIXUP_ALPHA}")
     print(f"  Dropout: clf={DROPOUT_CLF}  feat={DROPOUT_FEAT}")
     print(f"  Aug: noise={AUG_NOISE}  scale={AUG_SCALE}  shift={AUG_SHIFT}")
+    print(f"  HS: Type4 {HS_GYRO_SENSOR}-Gyro{HS_GYRO_AXIS} + {HS_ACCEL_SENSOR}-Accel{HS_ACCEL_AXIS}"
+          f"  fusion={HS_FUSION_WINDOW_MS}ms  prom={HS_GYRO_PROMINENCE}σ")
     print(f"  Compile={USE_COMPILE}")
     print(f"  FocalLoss={'ON γ='+str(FOCAL_GAMMA) if USE_FOCAL_LOSS else 'OFF'}")
     print(f"  FFT Branch={'ON ('+FFT_SOURCE_GROUP+')' if USE_FFT_BRANCH else 'OFF'}")

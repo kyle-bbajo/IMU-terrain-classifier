@@ -1,11 +1,10 @@
 """
-train_common.py — K-Fold / LOSO 공용 유틸 (v8.0)
+train_common.py — K-Fold / LOSO 공용 유틸 (v8.1)
 ═══════════════════════════════════════════════════════
-★ 스마트 Preload: M1(PCA→64ch)은 항상 RAM 적재 (~2.5GB)
-★ M2–M6: RAM 여유 시 Preload, 부족 시 OTF 자동 전환
+v8.1: 54ch Raw IMU (9센서 Accel+Gyro) / 5그룹 Branch
+★ 스마트 Preload: M1(PCA→32ch) / M2–M6(54ch) 항상 RAM 적재
 ★ Preload fp16 저장 + 직접 반환 (AMP autocast 위임)
 ★ IncrementalPCA + chunked StandardScaler
-★ persistent_workers (Preload 모드) / num_workers=0 (OTF 모드)
 ★ 재현성 보장 (seed_everything)
 ★ NaN 손실 감지 + CUDA OOM 자동 복구
 ═══════════════════════════════════════════════════════
@@ -1097,7 +1096,9 @@ def make_loader(ds: Dataset, shuffle: bool, branch: bool = False) -> DataLoader:
     from torch.utils.data import WeightedRandomSampler
 
     is_otf = isinstance(ds, (FlatDatasetOTF, BranchDatasetOTF))
-    workers = 0 if is_otf else config.LOADER_WORKERS
+    is_cached = isinstance(ds, (CachedFlatDataset, CachedBranchDataset))
+    # OTF: h5py 호환 필수 0, Cached: memmap이라 워커 불필요
+    workers = 0 if (is_otf or is_cached) else config.LOADER_WORKERS
 
     # 클래스 균형 샘플링 (train만)
     sampler = None
@@ -1116,7 +1117,7 @@ def make_loader(ds: Dataset, shuffle: bool, branch: bool = False) -> DataLoader:
     kw: dict = dict(
         batch_size=config.BATCH,
         num_workers=workers,
-        pin_memory=config.USE_GPU and not is_otf,
+        pin_memory=config.USE_GPU and not is_otf and not is_cached,
         shuffle=use_shuffle,
         drop_last=shuffle and len(ds) > config.BATCH,
     )
