@@ -1,0 +1,51 @@
+============================================================
+  Config v8.2 — CPU 모드
+  Git: 003e63a
+============================================================
+  Device:    cpu  (CPU)
+  vCPU=8  RAM=30GiB  HDF5=3.2GB
+  Strategy:  M1=Preload (항상)  Branch=Preload  Workers=2
+  Subjects:  N=40  Classes=6  Seed=42
+  Rate=200Hz  TS=256pt  PCA=32ch
+  Batch=128  Epochs=200  ES=20
+  LR=0.0003→1e-06  WD=0.001
+  LabelSmooth=0.1  Mixup=0.2
+  Dropout: clf=0.5  feat=0.3
+  Aug: noise=0.03  scale=0.15  shift=15
+  HS [Niswander2021]: Foot-Accelx(>1.8σ) + Foot-Gyroy(>0.5σ)  window=±125ms
+  Compile=False
+  FocalLoss=ON γ=2.0
+  FFT Branch=ON (Foot)
+  BalancedSampler=ON
+  TTA=ON ×5
+============================================================
+
+[07:01:28]   ★ K-Fold 5-Fold (Subject-wise)
+
+[07:01:28]   HDF5 로드... (dataset.h5)
+[07:01:28]   ✅ N=60678  T=256  C=54  v8-subj  file=3.2GB  (0.0s)
+  Channel Groups (54 total -> 54 assigned):
+    Pelvis      :   6ch
+    Hand        :  12ch
+    Thigh       :  12ch
+    Shank       :  12ch
+    Foot        :  12ch
+[07:01:28]   클래스: [1, 2, 3, 4, 5, 6] (6개)
+[07:01:28]   피험자: 39명  샘플: 60678
+[07:01:28] 
+=======================================================
+[07:01:28]   Fold 1/5  tr=48759(32명)  te=11919(7명)
+[07:01:28]   Test 피험자: [2, 5, 9, 11, 18, 23, 26]
+[07:01:28]   Train 분포: {np.int64(0): np.int64(6390), np.int64(1): np.int64(11047), np.int64(2): np.int64(6888), np.int64(3): np.int64(9302), np.int64(4): np.int64(9338), np.int64(5): np.int64(5794)}
+[07:01:28]   Test  분포: {np.int64(0): np.int64(1299), np.int64(1): np.int64(2973), np.int64(2): np.int64(1725), np.int64(3): np.int64(2264), np.int64(4): np.int64(2394), np.int64(5): np.int64(1264)}
+[07:01:28] =======================================================
+Traceback (most recent call last):
+  File "/home/ubuntu/project/repo/train_kfold.py", line 238, in <module>
+    main()
+  File "/home/ubuntu/project/repo/train_kfold.py", line 125, in main
+    sc, pca = fit_pca_on_train(h5data, tr_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/project/repo/train_common.py", line 272, in fit_pca_on_train
+    chunk = config.IPCA_CHUNK
+            ^^^^^^^^^^^^^^^^^
+AttributeError: module 'config' has no attribute 'IPCA_CHUNK'
