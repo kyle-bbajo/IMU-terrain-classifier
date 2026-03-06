@@ -11,3 +11,10 @@ cache/
 batches/
 *.npy
 *.h5
+cache/
+batches/
+*.npy
+*.h5
+*.pt
+*.pth
+out_*/
