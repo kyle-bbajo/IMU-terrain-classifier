@@ -18,3 +18,5 @@ batches/
 *.pt
 *.pth
 out_*/
+logs/
+logs/
