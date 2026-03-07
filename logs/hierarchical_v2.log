@@ -1,0 +1,52 @@
+nohup: ignoring input
+============================================================
+  Config v8.3 — GPU 모드  Git:a3be6b1 [95% 목표]
+============================================================
+  Device : cuda (NVIDIA L4)
+  GPU    : 22GB×1  AMP=BF16  cc=8.9
+  vCPU=8  RAM=30GiB  HDF5=2.4GB
+  N=40  Classes=6  TS=256  Rate=200Hz
+  Batch=192  Epochs=300  ES=50  LR=8e-05→1e-07
+  HS [Niswander2021]: Foot-Accely(mean+1.8σ) + Foot-Gyroy(>0.5σ) window=±125ms
+  Focal=ON γ=3.0  FFT=ON(Foot)  TTA=ON×8
+============================================================
+
+[07:28:21]   ★ Hierarchical SupCon K-Fold 5-Fold
+  Stage1=80ep  Stage2 SupCon=150ep + Finetune=150ep
+  BioMech 피처: 충격피크, Foot/Shank비, 고주파에너지
+
+[07:28:21]   HDF5 로드... (dataset.h5)
+[07:28:21]   ✅ N=45073  T=256  C=54  v8-subj  file=2.4GB  (0.0s)
+  Channel Groups (54 total -> 54 assigned):
+    Pelvis      :   6ch
+    Hand        :  12ch
+    Thigh       :  12ch
+    Shank       :  12ch
+    Foot        :  12ch
+[07:28:21]   클래스: [1, 2, 3, 4, 5, 6]  피험자: 40명  샘플: 45073
+[07:28:21] 
+=======================================================
+[07:28:21]   Fold 1/5  tr=35971  te=9102
+[07:28:21]   Test 피험자: [5, 15, 16, 17, 18, 34, 38, 40]
+[07:28:21] =======================================================
+[07:28:25]     BSC fit: n=35971  (3.9s)
+[07:28:38]       Branch 캐시 저장: 5그룹  (948MB)  (13.0s)
+[07:28:38]       BranchDS(Cache): n=35971  5그룹  (948MB)
+[07:28:40]       Branch 캐시 저장: 5그룹  (240MB)  (2.6s)
+[07:28:40]       BranchDS(Cache): n=9102  5그룹  (240MB)
+[07:28:40]       ★ 균형 샘플링: {0: 4140, 1: 7552, 2: 7620, 3: 6376, 4: 6472, 5: 3811}
+[07:28:42]   [F1][Hier] Stage1 3cls (80ep)
+[07:32:43]   [F1][Hier] S1 ep020/80  val_acc=0.9652  best=0.9788  (241s)
+[07:36:42]   [F1][Hier] S1 ep040/80  val_acc=0.9603  best=0.9788  (480s)
+[07:39:41]   [F1][Hier] S1 EarlyStop ep55
+[07:39:42]   [F1][Hier] S1 완료  best_acc=0.9788
+[07:39:42]   [F1][Hier] Stage1 Acc=0.9788
+[07:39:42]   [F1][Hier] Stage2 train=20799  test=5473
+[07:39:42]   [F1][Hier] S2 Step1 CE Warmup (50ep)
+[07:41:44]   [F1][Hier] S2W ep010/50  loss=0.2784/0.9644  val=0.6660  (121s)
+[07:43:43]   [F1][Hier] S2W ep020/50  loss=0.2155/0.9918  val=0.6846  (240s)
+[07:45:42]   [F1][Hier] S2W ep030/50  loss=0.1991/0.9976  val=0.6854  (360s)
+[07:47:41]   [F1][Hier] S2W ep040/50  loss=0.1933/0.9989  val=0.6695  (479s)
+[07:47:53]   [F1][Hier] S2 Warmup EarlyStop ep41
+[07:47:53]   [F1][Hier] S2 Warmup 완료  best_val=0.6930
+[07:47:53]   [F1][Hier] S2 Step2 SupCon (150ep, T=0.1)

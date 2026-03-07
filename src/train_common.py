@@ -1,5 +1,5 @@
 """
-train_common.py — K-Fold / LOSO 공용 유틸 (v8.1)
+train_common.py — K-Fold / LOSO 공용 유틸 (v8.7)
 ═══════════════════════════════════════════════════════
 v8.1: 54ch Raw IMU (9센서 Accel+Gyro) / 5그룹 Branch
 ★ 스마트 Preload: M1(PCA→32ch) / M2–M6(54ch) 항상 RAM 적재

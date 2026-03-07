@@ -1,0 +1,70 @@
+nohup: ignoring input
+============================================================
+  Config v8.1 — GPU 모드
+  Git: a3be6b1
+============================================================
+  Device:    cuda  (NVIDIA L4)
+  GPU:       22GB  |  AMP=BF16  cc=8.9
+  vCPU=8  RAM=30GiB  HDF5=2.4GB
+  Strategy:  M1=Preload (항상)  Branch=Preload  Workers=4
+  Subjects:  N=40  Classes=6  Seed=42
+  Rate=200Hz  TS=256pt  PCA=32ch
+  Batch=512  Epochs=50  ES=7
+  LR=0.001→1e-06  WD=0.001
+  LabelSmooth=0.1  Mixup=0.2
+  Dropout: clf=0.5  feat=0.3
+  Aug: noise=0.03  scale=0.15  shift=15
+  HS: Type4 Shank-Gyroy + Foot-Accelx  fusion=125ms  prom=0.4σ
+  Compile=True
+  FocalLoss=ON γ=2.0
+  FFT Branch=ON (Foot)
+  BalancedSampler=ON
+  TTA=ON ×5
+============================================================
+
+[10:35:57]   ★ Hierarchical SupCon K-Fold v8.7
+  [Review1] inner val / full state_dict / balanced sampler
+  [Review2] FocalLoss + 4단계 학습
+  S1=60ep(LR=5e-05)  S2: Warmup=30+SupCon=100+Focal=100+CE=50ep
+  T=0.12  S2_WEIGHTS=[2.0, 2.5, 4.0, 1.5]  gamma=2.0
+  BioMech N_BIO=16
+  클래스: C1=미끄러운, C2=오르막, C3=내리막, C4=흙길, C5=잔디, C6=평지
+
+[10:35:57]   HDF5 로드... (dataset.h5)
+[10:35:57]   ✅ N=45073  T=256  C=54  v8-subj  file=2.4GB  (0.0s)
+  Channel Groups (54 total -> 54 assigned):
+    Pelvis      :   6ch
+    Hand        :  12ch
+    Thigh       :  12ch
+    Shank       :  12ch
+    Foot        :  12ch
+[10:35:57]   클래스: [1, 2, 3, 4, 5, 6]  피험자: 40명  샘플: 45073
+[10:35:58] 
+=======================================================
+[10:35:58]   Fold 1/5  tr=35971  te=9102
+[10:35:58]   Test 피험자: [5, 15, 16, 17, 18, 34, 38, 40]
+[10:35:58] =======================================================
+[10:35:58]     inner split: tr=31502  val=4469  val_sbj=[3, 20, 26, 29]
+[10:36:01]     BSC fit: n=31502  (3.7s)
+[10:36:01]       ★ Branch 캐시 히트: FHC1_train
+[10:36:01]       BranchDS(Cache): n=31502  5그룹  (831MB)
+[10:36:01]       ★ Branch 캐시 히트: FHC1v_val
+[10:36:01]       BranchDS(Cache): n=4469  5그룹  (118MB)
+[10:36:01]       ★ Branch 캐시 히트: FHC1_test
+[10:36:01]       BranchDS(Cache): n=9102  5그룹  (240MB)
+[10:36:01]       ★ 균형 샘플링: {0: 3579, 1: 6640, 2: 6673, 3: 5614, 4: 5646, 5: 3350}
+[10:36:02]   [F1][Hier] Stage1 3cls (60ep)  [val=inner split]
+[10:37:02]   [F1][Hier] S1 ep020/60  val_acc=0.9904  best=0.9904  (60s)
+[10:37:58]   [F1][Hier] S1 ep040/60  val_acc=0.9957  best=0.9962  (116s)
+[10:38:06]   [F1][Hier] S1 EarlyStop ep43
+[10:38:07]   [F1][Hier] S1 완료  best_val=0.9962
+[10:38:07]   [F1][Hier] Stage1 Acc=0.9663
+[10:38:07]       ★ S2 균형 샘플링: {0: 3579, 1: 5614, 2: 5646, 3: 3350}
+[10:38:07]   [F1][Hier] Stage2 tr_flat=18189  va_flat=2610  te_pipeline=5607  te_oracle=5302
+[10:38:07]   [F1][Hier] Stage2 backbone ← Stage1 weight 이식 (S2_INIT_FROM_S1=True)
+[10:38:07]   [F1][Hier] S2 Step1 CE Warmup (30ep)  [val=inner split]
+[10:39:54]   [F1][Hier] S2W ep010/30  val=0.5019  best=0.5272  (107s)
+[10:41:41]   [F1][Hier] S2W ep020/30  val=0.5544  best=0.5544  (214s)
+[10:43:28]   [F1][Hier] S2W ep030/30  val=0.5659  best=0.5663  (321s)
+[10:43:28]   [F1][Hier] S2 Warmup 완료  best_val=0.5663
+[10:43:28]   [F1][Hier] S2 Step2 SupCon (100ep, T=0.12)  [balanced sampler]
