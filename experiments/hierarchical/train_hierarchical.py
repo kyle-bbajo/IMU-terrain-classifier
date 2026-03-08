@@ -1860,9 +1860,10 @@ def train_tcn_refiner(sf_model, tr_all_ds, va_all_ds, te_all_ds,
             out = tcn(xb)[:, half, :]
             preds_list.append(out.argmax(1).cpu())
     tcn_preds = torch.cat(preds_list).numpy()
-    tcn_acc   = accuracy_score(te_tgt.numpy(), tcn_preds)
+    tcn_labels = te_tgt.numpy()   # sliding window로 줄어든 실제 labels
+    tcn_acc   = accuracy_score(tcn_labels, tcn_preds)
     log(f"  {tag} TCN test Acc={tcn_acc:.4f}")
-    return tcn_preds
+    return tcn_preds, tcn_labels
 
 
 # ═══════════════════════════════════════════════
@@ -2053,7 +2054,7 @@ def main() -> None:
 
         # ── TCN Sequence Refiner (subject-aware) ──
         log(f"  {tag} ★ TCN Refiner 시작 (subject-aware)")
-        tcn_preds = train_tcn_refiner(
+        tcn_preds, tcn_labels = train_tcn_refiner(
             sf_model,
             tr_all_ds, va_all_ds, te_all_ds,
             tr_groups=tr_groups_local,
@@ -2070,20 +2071,28 @@ def main() -> None:
             tcn_preds_vote = majority_vote_smooth(
                 tcn_preds, window=args.vote_window)
 
-        acc_sf  = accuracy_score(sf_labels, sf_preds_vote)
-        f1_sf   = f1_score(sf_labels, sf_preds_vote, average="macro", zero_division=0)
-        acc_tcn = accuracy_score(sf_labels, tcn_preds_vote)
-        f1_tcn  = f1_score(sf_labels, tcn_preds_vote, average="macro", zero_division=0)
+        # SF는 전체 샘플 기준, TCN은 sliding window로 줄어든 샘플 기준
+        # → 각각 자신의 labels로 평가
+        acc_sf  = accuracy_score(sf_labels,  sf_preds_vote)
+        f1_sf   = f1_score(sf_labels,  sf_preds_vote,  average="macro", zero_division=0)
+        acc_tcn = accuracy_score(tcn_labels, tcn_preds_vote)
+        f1_tcn  = f1_score(tcn_labels, tcn_preds_vote, average="macro", zero_division=0)
         log(f"  {tag} ★ SF+Vote   Acc={acc_sf:.4f}  F1={f1_sf:.4f}")
         log(f"  {tag} ★ TCN+Vote  Acc={acc_tcn:.4f}  F1={f1_tcn:.4f}")
 
-        # TCN이 SF보다 나으면 TCN 사용
-        final_preds  = tcn_preds_vote if acc_tcn >= acc_sf else sf_preds_vote
-        final_labels = sf_labels
-        acc = max(acc_tcn, acc_sf)
-        f1  = f1_tcn if acc_tcn >= acc_sf else f1_sf
+        # 최종: TCN이 더 좋으면 TCN 사용 (각자 labels 기준)
+        if acc_tcn >= acc_sf:
+            final_preds  = tcn_preds_vote
+            final_labels = tcn_labels
+            acc, f1      = acc_tcn, f1_tcn
+            used_tcn     = True
+        else:
+            final_preds  = sf_preds_vote
+            final_labels = sf_labels
+            acc, f1      = acc_sf, f1_sf
+            used_tcn     = False
         log(f"  {tag} ★ 최종  Acc={acc:.4f}  F1={f1:.4f}"
-            f"  ({'TCN' if acc_tcn >= acc_sf else 'SF'})")
+            f"  ({'TCN' if used_tcn else 'SF'})")
 
         all_preds.append(final_preds)
         all_labels.append(final_labels)
@@ -2097,7 +2106,7 @@ def main() -> None:
             "tcn_f1":        round(f1_tcn, 4),
             "final_acc":     round(acc, 4),
             "final_f1":      round(f1, 4),
-            "used_tcn":      acc_tcn >= acc_sf,
+            "used_tcn":      used_tcn,
             "fold_time_min": round((time.time() - t_fold) / 60, 1),
         })
 
