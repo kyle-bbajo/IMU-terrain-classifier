@@ -1,57 +1,54 @@
+# -*- coding: utf-8 -*-
 """
-train_hierarchical.py — Hierarchical v9.0 (3-Stage + ArcFace + C5Fix)
+train_hierarchical.py — v11.0 (SuperFusion + TCN Refiner)
 ═══════════════════════════════════════════════════════
-v8.9 → v9.0 변경:
-  [A] Bug Fix: S3_CE_FT_EP 40→20 (주석과 값 불일치 수정)
-  [B] FOCAL_GAMMA 2.0→1.5 (S2 수렴 안정화)
-  [C] S3_PATIENCE 20→25 (C5 충분히 학습)
-  [D] S2_FOCAL_PAT 25→30 (Focal finetune 조기종료 완화)
-  [E] Stage3 CE 마무리: plain CE → Focal(γ=1.0, C4=0.8, C5=1.4)
-  [F] Stage3 ArcFace val: plain acc → balanced acc (C4/C5 편향 방지)
-  [G] 결합: Hard Routing (Score Fusion 제거 — 확률 미보정 역효과 확인)
-논문 베이스:
-  [1] Ordóñez & Roggen (2016) IEEE TNNLS — Hierarchical HAR
-  [2] Khosla et al. (2020) NeurIPS — Supervised Contrastive
-  [3] Niswander et al. (2021) — 발 IMU 충격 생체역학
-  [4] Lin et al. (2017) ICCV — Focal Loss
-  [5] Deng et al. (2019) CVPR — ArcFace
-  [6] Zheng et al. (2021) — IMU terrain FFT classification
-  [7] Zhang et al. (2018) ICLR — mixup (미적용 — ArcFace와 충돌)
+v10.1 → v11.0 변경 (리뷰어 피드백 전면 반영):
 
-학습 파이프라인:
-  Stage1: 3cls CE (평탄/오르막/내리막)
-          Soft Routing: flat 확률 ≥ 0.35 → Stage2 라우팅 (hard argmax 대비 flat recall↑)
-  Stage2: 3cls [C1 / C6 / C4C5_merged]
-          Step1 CE-warmup  (60ep)   — random init backbone 기본 표현 학습
-          Step2 SupCon     (120ep)  — Khosla 2020, balanced sampler
-          Step3 FocalLoss  (100ep)  — gamma=2.0, 소수 클래스 집중
-          Step4 CE-마무리  (50ep)
-  Stage3: binary [C4 vs C5], S2 backbone 전이학습 → ArcFace + FFT Branch
-          ArcFace (120ep, s=32, m=0.5) — angular margin, Mixup 미사용
-          CE 마무리 (20ep)
-  결합: Hard Routing (Soft Stage1 → Stage2 → Stage3)
-  후처리: Majority Vote (window=5)
+[A] SuperFusionModel (E2EHierModel 대체)
+    · Hard routing 완전 제거, single model 직접 6cls 예측
+    · 4 heads: 6cls (main) + 3cls + flat3cls + binary (보조)
+    · Gradient interference 방지: GELU + 256차원 shared layer
+    · head_flat: C1/C4C5/C6 flat 세분화 → C1 vs C6 식별 강화
 
-v8.8 → v8.9 변경:
-  [A] 3-Stage 구조: Stage2 4cls → 3cls(C1/C6/C4C5) + Stage3 binary(C4/C5)
-  [B] ArcFace + FFT Branch (Stage3 전용)
-  [C] BioMech N_BIO 16→20 (Spectral Centroid, Impact Duration 추가)
-  [D] S1 Soft Routing (threshold=0.35)
-  [E] grad accum 마지막 step 누락 수정 (Stage1/공통 _run_epoch)
-  [F] ArcFace cosine clamp(-1+1e-7, 1-1e-7) — NaN 방지
-  [G] BioMech ratio/var_ratio log1p — 값 폭발 방지
-  [H] Stage3 S2 backbone 전이 — random init 과적합 방지
-  [I] Stage3 Mixup 제거 — ArcFace 구면 기하와 충돌
-  [J] Stage3 oracle 평가 구현 (model 반환)
-  [K] CE Warmup 유지 — random init → SupCon 직행 시 oracle 39% 확인
-═══════════════════════════════════════════════════════
-"""
+[B] BioMech N_BIO 24→38 (전 센서 자이로 추가)
+    · Shank LT/RT 자이로 분산+피크 (4개)
+    · Thigh LT/RT 자이로 분산+피크 (4개)
+    · LT/RT 가속도 비대칭 (2개): C1 미끄러움 → 좌우 비대칭↑
+    · LT/RT 자이로 비대칭 (2개): C5 잔디 → 발목 비대칭↑
+    · Foot-Shank 위상차 LT/RT (2개): C4 흙길 → 진동 전달 비정상
+    · BioMech forward 시그니처: (bi: dict) 통합 인터페이스
+
+[C] Consistency KL Loss
+    · 6cls→3cls 파생 분포 vs 3cls head → KL divergence
+    · 계층 구조를 hard routing 없이 regularization으로 활용
+
+[D] SuperFusion 학습 안정화
+    · Focal(γ=1.5) + auto_class_weights (E2E 61% 실패 재발 방지)
+    · LR=1e-4, phase2 LR=5e-5 (phase1 LR 절반)
+    · 로그 15ep마다
+
+[E] TCN Sequence Refiner (리뷰어 2 공통: sequence modeling 필요)
+    · window 독립 예측 한계 극복
+    · Subject 단위 연속 window→TCN→정제 예측
+    · 학습: 주모델 완료 후 embedding 추출 → TCN fine-tune
+    · seq_len=9 (중심 window 예측)
+
+목표: 90%+ (기존 3-Stage 80% 상한 돌파)
+═══════════════════════════════════════════════════════"""
 from __future__ import annotations
 
 import sys, time, json, gc, warnings, math, argparse
 warnings.filterwarnings("ignore")
 from pathlib import Path
 from dataclasses import dataclass, field
+
+# W&B (선택적 — 설치 안 돼 있어도 동작)
+try:
+    import wandb
+    _WANDB_OK = True
+except ImportError:
+    wandb = None
+    _WANDB_OK = False
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 import config
@@ -101,41 +98,46 @@ CLASS_NAMES_ALL  = {0: "C1-미끄러운", 1: "C2-오르막", 2: "C3-내리막",
                     3: "C4-흙길",     4: "C5-잔디",   5: "C6-평지"}
 
 # ═══════════════════════════════════════════════
-# 하이퍼파라미터
+# 하이퍼파라미터 (3-Stage 보조 — 하위 호환용)
 # ═══════════════════════════════════════════════
 
-S1_EPOCHS      = 60     # Stage1 에포크
-S1_LR          = 5e-5   # Stage1 학습률
+S1_EPOCHS      = 60
+S1_LR          = 5e-5
+S1_PATIENCE    = 15
+S1_SOFT_THRESHOLD = 0.50
 
-S2_WARMUP_EP   = 80     # Step1 CE 워밍업
-                        # S1 backbone 전이 → random init 아님 → 40ep 충분
-S2_PRETRAIN_EP = 100    # Step2 SupCon (미사용 — oracle 40% 실험 확인)
-S2_FOCAL_EP    = 100    # Step3 FocalLoss finetune (전체 파라미터)
-S2_FINETUNE_EP = 50     # Step4 CE 마무리 (backbone partial unfreeze)
+S3_FFT_BINS    = 64
+S3_FFT_DIM     = 128
+FOCAL_GAMMA    = 1.5
 
-S2_LR          = 1e-4   # Stage2 기본 학습률
-S2_FOCAL_LR    = 3e-5   # Step3 Focal LR — 3e-5에서 낮춤 (repr drift 방지)
-S2_FOCAL_PAT   = 30     # Step3 early stop patience  ← 25→30
-S1_PATIENCE    = 15     # Stage1 전용 patience (config.EARLY_STOP=7과 분리)
+# ═══════════════════════════════════════════════
+# SuperFusion 하이퍼파라미터 (v11.0 메인)
+# ═══════════════════════════════════════════════
+SF_EPOCHS     = 120   # Phase1: 4-head multi-task
+SF_FT_EPOCHS  = 40    # Phase2: 6cls fine-tune
+SF_LR         = 1e-4  # Phase1 LR (head random init → 높은 LR)
+SF_PATIENCE   = 20    # Phase1 early stop patience
+SF_AUX_W3     = 0.30  # 3cls 보조 가중치 (flat/up/down)
+SF_AUX_WFLAT  = 0.20  # flat3 보조 가중치 (C1/C4C5/C6)
+SF_AUX_WBIN   = 0.40  # binary 보조 가중치 (C4/C5) ← C4/C5 식별 강화
+SF_WCONS      = 0.10  # consistency KL 가중치
 
-FOCAL_GAMMA    = 1.5    # Focal Loss gamma  ← 2.0→1.5 (S2 수렴 안정화)
-TEMPERATURE    = 0.10   # SupCon temperature (미사용)
+# ═══════════════════════════════════════════════
+# TCN Sequence Refiner 하이퍼파라미터 (v11.0)
+# ═══════════════════════════════════════════════
+TCN_SEQ_LEN   = 9     # 슬라이딩 윈도우 길이 (홀수: 중심 예측)
+TCN_HIDDEN    = 128   # TCN 은닉 채널
+TCN_EPOCHS    = 40    # TCN 학습 에포크
+TCN_LR        = 5e-4  # TCN 학습률
+TCN_PATIENCE  = 10    # TCN early stop
 
-# Stage3 (C4 vs C5 binary, ArcFace)
-S3_EPOCHS      = 120    # Stage3 ArcFace 에포크 (2-phase)
-S3_CE_FT_EP    = 20     # Stage3 CE 마무리 20ep (ArcFace margin 구조 보존)  ← 버그수정 40→20
-S3_LR          = 5e-5   # Stage3 학습률
-S3_ARCFACE_S   = 32.0   # ArcFace scale
-S3_ARCFACE_M   = 0.50   # ArcFace margin
-S3_PATIENCE    = 25     # Stage3 early stop patience  ← 20→25 (C5 충분히 학습)
-S3_C5_WEIGHT   = 1.4    # Stage3 CE 마무리 C5 upweight (C5 recall 개선)
-
-S3_FFT_BINS    = 64     # FFT 스펙트럼 bin 수
-S3_FFT_DIM     = 128    # FFT branch 출력 차원
-S3_MIXUP_ALPHA = 0.3    # Mixup alpha (미사용 — ArcFace 충돌 확인)
-
-S1_SOFT_THRESHOLD = 0.35  # Soft routing: flat 확률 ≥ threshold → Stage2 라우팅
-S2_WEIGHTS        = None  # None → auto_class_weights() 사용
+# backward compat alias
+E2E_EPOCHS    = SF_EPOCHS
+E2E_FT_EPOCHS = SF_FT_EPOCHS
+E2E_LR        = SF_LR
+E2E_AUX_W3    = SF_AUX_W3
+E2E_AUX_WB    = SF_AUX_WBIN
+E2E_PATIENCE  = SF_PATIENCE
 
 
 # ═══════════════════════════════════════════════
@@ -143,62 +145,60 @@ S2_WEIGHTS        = None  # None → auto_class_weights() 사용
 # ═══════════════════════════════════════════════
 
 def parse_args() -> argparse.Namespace:
-    """CLI로 하이퍼파라미터 오버라이드.
-
-    기본값은 위 상수와 동일. 실험별로 변경 가능.
-
-    Examples:
-        python train_hierarchical.py
-        python train_hierarchical.py --s1_epochs 80 --temperature 0.05
-        python train_hierarchical.py --s2_lr 5e-5 --focal_gamma 1.5 --no_vote
-    """
+    """CLI로 하이퍼파라미터 오버라이드 (v11.0)."""
     p = argparse.ArgumentParser(
-        description="Hierarchical SupCon Terrain Classifier",
+        description="SuperFusion + TCN Terrain Classifier v11.0",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    # Stage1
+    # Stage1 (SF 초기화용)
     p.add_argument("--s1_epochs",    type=int,   default=S1_EPOCHS)
     p.add_argument("--s1_lr",        type=float, default=S1_LR)
-    # Stage2
-    p.add_argument("--s2_warmup",    type=int,   default=S2_WARMUP_EP)
-    p.add_argument("--s2_pretrain",  type=int,   default=S2_PRETRAIN_EP)
-    p.add_argument("--s2_focal",     type=int,   default=S2_FOCAL_EP)
-    p.add_argument("--s2_finetune",  type=int,   default=S2_FINETUNE_EP)
-    p.add_argument("--s2_lr",        type=float, default=S2_LR)
-    p.add_argument("--s2_focal_lr",  type=float, default=S2_FOCAL_LR)
-    p.add_argument("--s2_focal_pat", type=int,   default=S2_FOCAL_PAT)
-    p.add_argument("--temperature",  type=float, default=TEMPERATURE)
+    # SuperFusion
+    p.add_argument("--sf_epochs",    type=int,   default=SF_EPOCHS)
+    p.add_argument("--sf_ft_epochs", type=int,   default=SF_FT_EPOCHS)
+    p.add_argument("--sf_lr",        type=float, default=SF_LR)
+    p.add_argument("--sf_patience",  type=int,   default=SF_PATIENCE)
     p.add_argument("--focal_gamma",  type=float, default=FOCAL_GAMMA)
+    # TCN
+    p.add_argument("--tcn_seq_len",  type=int,   default=TCN_SEQ_LEN)
+    p.add_argument("--tcn_epochs",   type=int,   default=TCN_EPOCHS)
     # Post-processing
     p.add_argument("--vote_window",  type=int,   default=5,
-                   help="Majority vote window size (0 = 비활성)")
-    # Stage3 ArcFace
-    p.add_argument("--s3_epochs",    type=int,   default=S3_EPOCHS)
-    p.add_argument("--arcface_s",    type=float, default=S3_ARCFACE_S)
-    p.add_argument("--arcface_m",    type=float, default=S3_ARCFACE_M)
+                   help="Majority vote window (0=off)")
+    # Data
+    p.add_argument("--n_subjects",   type=int,   default=None)
+    # W&B
+    p.add_argument("--wandb",        action="store_true",
+                   help="W&B 실험 로깅 활성화")
+    p.add_argument("--wandb_project", type=str, default="imu-terrain",
+                   help="W&B 프로젝트 이름")
+    p.add_argument("--run_name",     type=str, default=None,
+                   help="W&B run 이름 (기본: 자동)")
     return p.parse_args()
 
 
 def apply_args(args: argparse.Namespace) -> None:
-    """파싱된 args를 전역 하이퍼파라미터에 반영."""
+    """파싱된 args를 전역 하이퍼파라미터에 반영 (v11.0)."""
     global S1_EPOCHS, S1_LR
-    global S2_WARMUP_EP, S2_PRETRAIN_EP, S2_FOCAL_EP, S2_FINETUNE_EP
-    global S2_LR, S2_FOCAL_LR, S2_FOCAL_PAT, TEMPERATURE, FOCAL_GAMMA
-    global S3_EPOCHS, S3_ARCFACE_S, S3_ARCFACE_M
+    global SF_EPOCHS, SF_FT_EPOCHS, SF_LR, SF_PATIENCE, FOCAL_GAMMA
+    global TCN_SEQ_LEN, TCN_EPOCHS
+    # backward compat aliases
+    global E2E_EPOCHS, E2E_FT_EPOCHS, E2E_LR, E2E_PATIENCE
     S1_EPOCHS      = args.s1_epochs
     S1_LR          = args.s1_lr
-    S2_WARMUP_EP   = args.s2_warmup
-    S2_PRETRAIN_EP = args.s2_pretrain
-    S2_FOCAL_EP    = args.s2_focal
-    S2_FINETUNE_EP = args.s2_finetune
-    S2_LR          = args.s2_lr
-    S2_FOCAL_LR    = args.s2_focal_lr
-    S2_FOCAL_PAT   = args.s2_focal_pat
-    TEMPERATURE    = args.temperature
+    SF_EPOCHS      = args.sf_epochs
+    SF_FT_EPOCHS   = args.sf_ft_epochs
+    SF_LR          = args.sf_lr
+    SF_PATIENCE    = args.sf_patience
     FOCAL_GAMMA    = args.focal_gamma
-    S3_EPOCHS      = args.s3_epochs
-    S3_ARCFACE_S   = args.arcface_s
-    S3_ARCFACE_M   = args.arcface_m
+    TCN_SEQ_LEN    = args.tcn_seq_len
+    TCN_EPOCHS     = args.tcn_epochs
+    E2E_EPOCHS     = SF_EPOCHS
+    E2E_FT_EPOCHS  = SF_FT_EPOCHS
+    E2E_LR         = SF_LR
+    E2E_PATIENCE   = SF_PATIENCE
+    if args.n_subjects is not None:
+        config.apply_overrides(n_subjects=args.n_subjects)
 
 
 # ═══════════════════════════════════════════════
@@ -343,11 +343,8 @@ def _run_epoch(
 # 후처리
 # ═══════════════════════════════════════════════
 
-def auto_class_weights(y_flat: np.ndarray) -> list[float]:
-    """학습 데이터 기반 클래스 가중치 자동 계산.
-
-    classes를 y_flat에서 동적으로 추론 → 3cls/4cls 모두 호환.
-    """
+def auto_class_weights(y_flat: np.ndarray) -> torch.Tensor:
+    """학습 데이터 기반 클래스 가중치 자동 계산. (B, 6) 호환 Tensor 반환"""
     classes = np.unique(y_flat)
     weights = compute_class_weight("balanced", classes=classes, y=y_flat)
     w_list  = weights.tolist()
@@ -356,7 +353,7 @@ def auto_class_weights(y_flat: np.ndarray) -> list[float]:
               [str(c) for c in classes]
     parts   = "  ".join(f"{l}={w:.3f}" for l, w in zip(label, w_list))
     log(f"    auto class_weights (balanced): {parts}")
-    return w_list
+    return torch.tensor(w_list, dtype=torch.float32)
 
 
 def majority_vote_smooth(preds: np.ndarray, window: int = 5) -> np.ndarray:
@@ -376,208 +373,150 @@ def majority_vote_smooth(preds: np.ndarray, window: int = 5) -> np.ndarray:
     return smoothed
 
 
-def combine_predictions_3stage(
-    s1_preds: np.ndarray,
-    s2_preds: np.ndarray,
-    s3_preds: np.ndarray,
-) -> np.ndarray:
-    """3단계 Hard Routing 결합 (벡터화).
-
-    Stage1: 0=flat → Stage2,  1=C2 오르막,  2=C3 내리막
-    Stage2: 0=C1,  1=C6,  2=C4C5 → Stage3
-    Stage3: 0=C4,  1=C5
-
-    Args:
-        s1_preds: (N_te,)     Stage1 예측
-        s2_preds: (N_flat,)   Stage2 예측 (s1==0 샘플만)
-        s3_preds: (N_c4c5,)   Stage3 예측 (s2==2 샘플만)
-    """
-    final    = s1_preds.copy().astype(np.int64)
-    flat_idx = np.where(s1_preds == 0)[0]
-
-    # S2 결과: 0→C1(0), 1→C6(5), 2→placeholder(-1)
-    s2_full = np.where(s2_preds == 0, 0,
-              np.where(s2_preds == 1, 5, -1)).astype(np.int64)
-
-    # S3 결과: 0→C4(3), 1→C5(4), s2==2 위치에 삽입
-    c4c5_in_s2 = (s2_preds == 2)
-    s2_full[c4c5_in_s2] = np.where(s3_preds == 0, 3, 4)
-
-    final[flat_idx] = s2_full
-    return final
-
-
-def majority_vote_by_subject(preds: np.ndarray,
-                              te_idx: np.ndarray,
-                              groups: np.ndarray,
-                              window: int = 5) -> np.ndarray:
-    """Subject-aware majority vote post-processing.
-
-    fold 전체에 걸지 않고 subject 단위로 적용:
-    다른 subject 샘플끼리 vote되는 평가 artifact 방지.
-    """
-    out       = preds.copy()
-    te_groups = groups[te_idx]
-    for sbj in np.unique(te_groups):
-        idx_local        = np.where(te_groups == sbj)[0]
-        out[idx_local]   = majority_vote_smooth(out[idx_local], window=window)
-    return out
-
-
-def combine_predictions_score_fusion(
-    s1_probs: np.ndarray,
-    s2_probs: np.ndarray,
-    s3_probs: np.ndarray,
-    s1_preds: np.ndarray,
-) -> np.ndarray:
-    """Score Fusion — hard label routing 대신 확률 곱으로 최종 6cls 결정.
-
-    Hard routing은 S1이 flat을 argmax로 안 줘도 P(flat)이 있으면
-    downstream 정보가 완전히 버려지는 문제 → score fusion으로 해결.
-
-    최종 6cls 확률 계산:
-      C2(오르막) = P_s1(up)
-      C3(내리막) = P_s1(down)
-      C1(미끄러운) = P_s1(flat) × P_s2(C1)
-      C6(평지)     = P_s1(flat) × P_s2(C6)
-      C4(흙길)     = P_s1(flat) × P_s2(C4C5) × P_s3(C4)
-      C5(잔디)     = P_s1(flat) × P_s2(C4C5) × P_s3(C5)
-
-    Args:
-        s1_probs: (N, 3)      P(flat), P(up), P(down)
-        s2_probs: (N_flat, 3) P(C1), P(C6), P(C4C5) — s1_preds==0 샘플만
-        s3_probs: (N_c4c5, 2) P(C4), P(C5) — s2에서 C4C5 라우팅된 샘플만
-        s1_preds: (N,)        soft routing 결과 (슬롯 인덱스 추적용)
-    """
-    N       = len(s1_probs)
-    score6  = np.zeros((N, 6), dtype=np.float64)
-
-    p_flat = s1_probs[:, 0]   # (N,)
-    p_up   = s1_probs[:, 1]   # (N,)
-    p_down = s1_probs[:, 2]   # (N,)
-
-    score6[:, 1] = p_up    # C2 오르막
-    score6[:, 2] = p_down  # C3 내리막
-
-    # S2 확률 삽입 (s1_preds==0 위치)
-    flat_idx = np.where(s1_preds == 0)[0]
-    if len(flat_idx) > 0 and len(s2_probs) > 0:
-        n_s2 = min(len(flat_idx), len(s2_probs))
-        for i, fi in enumerate(flat_idx[:n_s2]):
-            pf         = p_flat[fi]
-            score6[fi, 0] = pf * s2_probs[i, 0]   # C1
-            score6[fi, 5] = pf * s2_probs[i, 1]   # C6
-            # C4C5 → S3
-            p_c4c5    = pf * s2_probs[i, 2]
-            score6[fi, 3] = p_c4c5 * 0.5          # placeholder C4
-            score6[fi, 4] = p_c4c5 * 0.5          # placeholder C5
-
-        # S3 확률 삽입 (s2에서 C4C5 → 2 라우팅된 샘플)
-        if len(s3_probs) > 0:
-            c4c5_in_flat = np.where(
-                np.argmax(s2_probs[:n_s2], axis=1) == 2)[0]
-            for j, ci in enumerate(c4c5_in_flat):
-                if j >= len(s3_probs): break
-                fi         = flat_idx[ci]
-                p_c4c5    = score6[fi, 3] + score6[fi, 4]   # 기존 합
-                score6[fi, 3] = p_c4c5 * s3_probs[j, 0]    # C4
-                score6[fi, 4] = p_c4c5 * s3_probs[j, 1]    # C5
-
-    return score6.argmax(axis=1).astype(np.int64)
-
-
-# ═══════════════════════════════════════════════
-# 1. Biomechanical Feature Extractor (N_BIO=20)
-# ═══════════════════════════════════════════════
-
 class BioMechFeatures(nn.Module):
-    """생체역학 충격 피처 추출기.
+    """생체역학 충격 피처 추출기 v11.0.
 
-    스텝 분절 신호에서 Heel-Strike 기반 생체역학 지표 추출.
-    Niswander et al. (2021) 충격 분석 기반.
-
-    피처 20개:
+    피처 38개:
+      [Accel 기반 — 기존 20개]
       0~3  : Foot/Shank LT/RT 충격 피크값
-      4~5  : Foot/Shank 충격비 (지면 흡수량 지표)
-      6~7  : step-domain 상위 주파수 에너지 비율
-      8~9  : Foot LT/RT 신호 표준편차 (C1 미끄러운 → 변동성↑)
-      10~11: Foot LT/RT 피크 후 감쇠율 (C5 잔디 → 빠른 감쇠)
-      12~13: Shank LT/RT 진동 |diff|.mean (C4 흙길 → 진동↑)
-      14~15: Foot/Shank 분산비 LT/RT (C1 불안정 지표)
-      16~17: Spectral Centroid LT/RT — Niswander2021
-             C4 흙길 → 고주파↑ → centroid↑
-             C5 잔디 → 부드러운 흡수 → centroid↓
-      18~19: Impact Duration LT/RT — Niswander2021
-             C5 잔디 → 충격 넓게 분산 → duration↑
-             C4 흙길 → 짧고 날카로운 충격 → duration↓
+      4~5  : Foot/Shank 충격비 (log1p)
+      6~7  : 고주파 에너지 비율 (C4 흙길 특화)
+      8~9  : Foot LT/RT 표준편차 (C1 불안정↑)
+      10~11: 피크 후 감쇠율 (C5 잔디 → 빠른 감쇠)
+      12~13: Shank LT/RT 진동 |diff|.mean (C4 흙길↑)
+      14~15: Foot/Shank 분산비 (C1 불안정 지표)
+      16~17: Spectral Centroid LT/RT (C4 흙길 → centroid↑)
+      18~19: Impact Duration LT/RT (C5 잔디 → duration↑)
+
+      [자이로 기반 — 추가 18개]
+      20~21: Foot LT/RT 자이로 분산 (log1p) — C1 미끄러움/발목 불안정
+      22~23: Foot LT/RT 자이로 피크 각속도
+      24~25: Shank LT/RT 자이로 분산 — C4 흙길 → 정강이 회전↑
+      26~27: Shank LT/RT 자이로 피크
+      28~29: Thigh LT/RT 자이로 분산 — 상체 전달 충격
+      30~31: Thigh LT/RT 자이로 피크
+
+      [비대칭/전달 기반 — 추가 8개]
+      32~33: LT/RT 가속도 피크 비대칭 (|L-R|) — C1 미끄러움 → 좌우 차이↑
+      34~35: LT/RT 자이로 에너지 비대칭 — C5 잔디 → 발목 비대칭↑
+      36~37: Foot→Shank 진동 전달비 LT/RT — C4 흙길 → 비정상 전달↑
     """
-    N_BIO = 20
+    N_BIO = 38
 
     def __init__(self) -> None:
         super().__init__()
         self.foot_z  = config.FOOT_Z_ACCEL_IDX
         self.shank_z = config.SHANK_Z_ACCEL_IDX
-        self.sr      = config.SAMPLE_RATE
-        self.hf_bin  = int(30 * config.TS / config.SAMPLE_RATE)  # 30Hz 이상 고주파 (C4 흙길 특화)
+        self.hf_bin  = int(30 * config.TS / config.SAMPLE_RATE)
+        # 12ch 센서 그룹 내부 인덱스 (LT: 0~5, RT: 6~11)
+        # accel: [0,1,2] / [6,7,8], gyro: [3,4,5] / [9,10,11]
+        self.gyro_lt = [3, 4, 5]
+        self.gyro_rt = [9, 10, 11]
 
     @torch.no_grad()
-    def forward(self, foot_x: torch.Tensor, shank_x: torch.Tensor) -> torch.Tensor:
+    def forward(self, bi: dict) -> torch.Tensor:
         """
         Args:
-            foot_x:  (B, 12, T)
-            shank_x: (B, 12, T)
+            bi: dict with keys 'Foot', 'Shank', 'Thigh' (B, 12, T) each
         Returns:
-            (B, N_BIO)
+            (B, 38)
         """
-        foot_x  = foot_x.float()
-        shank_x = shank_x.float()
-        eps     = 1e-6
+        foot_x  = bi["Foot"].float()          # (B, 12, T)
+        shank_x = bi["Shank"].float()
+        thigh_x = bi.get("Thigh")
+        if thigh_x is not None:
+            thigh_x = thigh_x.float()
+        eps = 1e-6
 
         fz_lt = foot_x[:,  self.foot_z[0],  :]
         fz_rt = foot_x[:,  self.foot_z[1],  :]
         sz_lt = shank_x[:, self.shank_z[0], :]
         sz_rt = shank_x[:, self.shank_z[1], :]
 
-        # 0~3: 피크값
+        # ── 0~3: 피크값 ───────────────────────────
         f_pk_lt = fz_lt.abs().max(dim=1).values
         f_pk_rt = fz_rt.abs().max(dim=1).values
         s_pk_lt = sz_lt.abs().max(dim=1).values
         s_pk_rt = sz_rt.abs().max(dim=1).values
 
-        # 4~5: Foot/Shank 충격비 (log1p: 분모 0 근접 시 값 폭발 방지 — 리뷰2)
+        # ── 4~5: 충격비 ───────────────────────────
         ratio_lt = torch.log1p(f_pk_lt / (s_pk_lt + 1e-4))
         ratio_rt = torch.log1p(f_pk_rt / (s_pk_rt + 1e-4))
 
-        # 6~7: step-domain 상대 고주파 에너지
+        # ── 6~7: 고주파 에너지 ────────────────────
         hf_lt = self._hf_ratio(fz_lt)
         hf_rt = self._hf_ratio(fz_rt)
 
-        # 8~9: 변동성
+        # ── 8~9: 변동성 ───────────────────────────
         std_lt = fz_lt.std(dim=1)
         std_rt = fz_rt.std(dim=1)
 
-        # 10~11: 피크 후 감쇠율
+        # ── 10~11: 감쇠율 ─────────────────────────
         T_half   = fz_lt.shape[1] // 2
         decay_lt = (fz_lt[:, :T_half].abs().mean(dim=1) /
                     (fz_lt[:, T_half:].abs().mean(dim=1) + eps))
         decay_rt = (fz_rt[:, :T_half].abs().mean(dim=1) /
                     (fz_rt[:, T_half:].abs().mean(dim=1) + eps))
 
-        # 12~13: Shank 진동
+        # ── 12~13: Shank 진동 ─────────────────────
         vib_lt = (sz_lt[:, 1:] - sz_lt[:, :-1]).abs().mean(dim=1)
         vib_rt = (sz_rt[:, 1:] - sz_rt[:, :-1]).abs().mean(dim=1)
 
-        # 14~15: Foot/Shank 분산비 (log1p: 폭발 방지 — 리뷰2)
+        # ── 14~15: Foot/Shank 분산비 ─────────────
         var_ratio_lt = torch.log1p(fz_lt.var(dim=1) / (sz_lt.var(dim=1) + 1e-4))
         var_ratio_rt = torch.log1p(fz_rt.var(dim=1) / (sz_rt.var(dim=1) + 1e-4))
 
-        # 16~17: Spectral Centroid (Niswander 2021)
+        # ── 16~17: Spectral Centroid ──────────────
         sc_lt = self._spectral_centroid(fz_lt)
         sc_rt = self._spectral_centroid(fz_rt)
 
-        # 18~19: Impact Duration (Niswander 2021)
+        # ── 18~19: Impact Duration ────────────────
         dur_lt = self._impact_duration(fz_lt)
         dur_rt = self._impact_duration(fz_rt)
+
+        # ── 20~23: Foot 자이로 ────────────────────
+        fg_lt = foot_x[:, self.gyro_lt, :]    # (B, 3, T)
+        fg_rt = foot_x[:, self.gyro_rt, :]
+        fg_var_lt  = torch.log1p(fg_lt.var(dim=2).sum(dim=1))
+        fg_var_rt  = torch.log1p(fg_rt.var(dim=2).sum(dim=1))
+        fg_peak_lt = fg_lt.abs().amax(dim=(1, 2))
+        fg_peak_rt = fg_rt.abs().amax(dim=(1, 2))
+
+        # ── 24~27: Shank 자이로 ───────────────────
+        sg_lt = shank_x[:, self.gyro_lt, :]
+        sg_rt = shank_x[:, self.gyro_rt, :]
+        sg_var_lt  = torch.log1p(sg_lt.var(dim=2).sum(dim=1))
+        sg_var_rt  = torch.log1p(sg_rt.var(dim=2).sum(dim=1))
+        sg_peak_lt = sg_lt.abs().amax(dim=(1, 2))
+        sg_peak_rt = sg_rt.abs().amax(dim=(1, 2))
+
+        # ── 28~31: Thigh 자이로 ───────────────────
+        if thigh_x is not None:
+            tg_lt = thigh_x[:, self.gyro_lt, :]
+            tg_rt = thigh_x[:, self.gyro_rt, :]
+            tg_var_lt  = torch.log1p(tg_lt.var(dim=2).sum(dim=1))
+            tg_var_rt  = torch.log1p(tg_rt.var(dim=2).sum(dim=1))
+            tg_peak_lt = tg_lt.abs().amax(dim=(1, 2))
+            tg_peak_rt = tg_rt.abs().amax(dim=(1, 2))
+        else:
+            z = torch.zeros(foot_x.shape[0], device=foot_x.device)
+            tg_var_lt = tg_var_rt = tg_peak_lt = tg_peak_rt = z
+
+        # ── 32~33: 가속도 피크 비대칭 (C1 미끄러움) ─
+        asym_acc_lt = (f_pk_lt - s_pk_lt).abs()
+        asym_acc_rt = (f_pk_rt - s_pk_rt).abs()
+
+        # ── 34~35: 자이로 에너지 비대칭 (C5 잔디) ──
+        asym_gy_lt = (fg_var_lt - sg_var_lt).abs()
+        asym_gy_rt = (fg_var_rt - sg_var_rt).abs()
+
+        # ── 36~37: Foot→Shank 진동 전달비 (C4 흙길) ─
+        foot_rms_lt = fz_lt.pow(2).mean(dim=1).sqrt()
+        foot_rms_rt = fz_rt.pow(2).mean(dim=1).sqrt()
+        shank_rms_lt = sz_lt.pow(2).mean(dim=1).sqrt()
+        shank_rms_rt = sz_rt.pow(2).mean(dim=1).sqrt()
+        trans_lt = torch.log1p(shank_rms_lt / (foot_rms_lt + eps))
+        trans_rt = torch.log1p(shank_rms_rt / (foot_rms_rt + eps))
 
         return torch.stack([
             f_pk_lt, f_pk_rt, s_pk_lt, s_pk_rt,
@@ -585,7 +524,13 @@ class BioMechFeatures(nn.Module):
             std_lt, std_rt, decay_lt, decay_rt,
             vib_lt, vib_rt, var_ratio_lt, var_ratio_rt,
             sc_lt, sc_rt, dur_lt, dur_rt,
-        ], dim=1)   # (B, 20)
+            fg_var_lt, fg_var_rt, fg_peak_lt, fg_peak_rt,
+            sg_var_lt, sg_var_rt, sg_peak_lt, sg_peak_rt,
+            tg_var_lt, tg_var_rt, tg_peak_lt, tg_peak_rt,
+            asym_acc_lt, asym_acc_rt,
+            asym_gy_lt, asym_gy_rt,
+            trans_lt, trans_rt,
+        ], dim=1)   # (B, 38)
 
     def _hf_ratio(self, x: torch.Tensor) -> torch.Tensor:
         fft_mag = torch.fft.rfft(x, dim=1).abs()
@@ -856,18 +801,17 @@ class Stage3Model(nn.Module):
 # 4b. E2E Hierarchical Model (v8.9 핵심)
 # ═══════════════════════════════════════════════
 
-class E2EHierModel(nn.Module):
-    """End-to-end 6cls + 계층 보조 손실 단일 모델.
+class SuperFusionModel(nn.Module):
+    """v11.0 메인 모델 — SuperFusion 단일 6cls 직접 예측.
 
-    3-Stage 하드 라우팅의 컴파운딩 오류 제거:
-      S1 오류 → S2 못 봄, S2 오류 → S3 못 봄 문제 근본 해결.
+    구조: backbone(CNN) + FFT + BioMech → Shared(512→256) → 4 heads
+      head_6cls : 주 출력 (최종 6cls 직접 최적화)
+      head_3cls : 보조 (flat/오르막/내리막 — 거시 지형)
+      head_flat : 보조 (C1/C4C5/C6 — 평탄 지형 세분화)
+      head_bin  : 보조 (C4 vs C5 — 흙길/잔디 미세 분리)
 
-    구조: backbone + BioMech + FFT → shared → 3 heads
-      head_6cls: 주 출력 (직접 6cls 최적화)
-      head_3cls: 보조 (flat/오르막/내리막, S1 역할)
-      head_bin:  보조 (C4/C5 binary, S3 역할)
-
-    Loss = CE_6cls + W3*CE_3cls + WB*CE_bin(C4C5 샘플만)
+    Loss = Focal_6cls + 0.30*CE_3cls + 0.20*CE_flat + 0.40*CE_bin + 0.10*KL_cons
+    Hard routing 완전 제거 → compounding error 구조적 해결
     """
     def __init__(self, backbone, feat_dim: int,
                  bio_dim: int = 128,
@@ -877,32 +821,140 @@ class E2EHierModel(nn.Module):
         self.bio_head   = BioMechHead(BioMechFeatures.N_BIO, bio_dim)
         self.fft_branch = FFTBranch(n_bins=129, out_dim=fft_dim)
         total = feat_dim + bio_dim + fft_dim
-        self.shared = nn.Sequential(
-            nn.Linear(total, 512), nn.BatchNorm1d(512), nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(512, 256), nn.BatchNorm1d(256), nn.ReLU(),
-            nn.Dropout(0.2),
-        )
-        self.head_6cls = nn.Linear(256, 6)   # 주: 6cls
-        self.head_3cls = nn.Linear(256, 3)   # 보조: flat/up/down
-        self.head_bin  = nn.Linear(256, 2)   # 보조: C4/C5 binary
 
-    def _fuse(self, bi: dict, bio_f: torch.Tensor) -> torch.Tensor:
-        cnn = self.backbone.extract(bi)
+        self.shared = nn.Sequential(
+            nn.Linear(total, 512), nn.BatchNorm1d(512), nn.GELU(),
+            nn.Dropout(0.35),
+            nn.Linear(512, 256), nn.BatchNorm1d(256), nn.GELU(),
+            nn.Dropout(0.20),
+        )
+        self.head_6cls  = nn.Linear(256, 6)   # 주: 6cls
+        self.head_3cls  = nn.Linear(256, 3)   # 보조: flat/up/down
+        self.head_flat  = nn.Linear(256, 3)   # 보조: C1/C4C5/C6
+        self.head_bin   = nn.Linear(256, 2)   # 보조: C4/C5
+
+    @staticmethod
+    def _augment_bi(bi: dict) -> dict:
+        """raw 브랜치에 accel_magnitude + gyro_magnitude + jerk 채널 추가.
+
+        Foot/Shank 각 12ch → 18ch:
+          +3ch: accel_xyz magnitude (3축 RMS)
+          +3ch: gyro_xyz magnitude
+        BackBone이 더 풍부한 시간 표현 학습 가능.
+        원본 bi를 복사하지 않고 새 key로 augment.
+        """
+        aug = {}
+        for k, v in bi.items():
+            x = v.float()          # (B, 12, T)
+            # accel: ch 0~2 (LT), 6~8 (RT) / gyro: 3~5 (LT), 9~11 (RT)
+            accel_lt = x[:, 0:3, :]
+            gyro_lt  = x[:, 3:6, :]
+            accel_rt = x[:, 6:9, :]
+            gyro_rt  = x[:, 9:12, :]
+            # magnitude = L2 norm across 3-axis (unsqueeze to keep dim)
+            amag_lt  = accel_lt.norm(dim=1, keepdim=True)   # (B,1,T)
+            gmag_lt  = gyro_lt.norm(dim=1, keepdim=True)
+            amag_rt  = accel_rt.norm(dim=1, keepdim=True)
+            gmag_rt  = gyro_rt.norm(dim=1, keepdim=True)
+            # jerk (derivative) of foot accel magnitude — C4 불규칙 충격 표시
+            jerk_lt  = F.pad(amag_lt[:, :, 1:] - amag_lt[:, :, :-1], (0, 1))
+            jerk_rt  = F.pad(amag_rt[:, :, 1:] - amag_rt[:, :, :-1], (0, 1))
+            aug[k] = torch.cat([x, amag_lt, gmag_lt, amag_rt, gmag_rt,
+                                 jerk_lt, jerk_rt], dim=1)   # (B, 18, T)
+        return aug
+
+    def _embed(self, bi: dict, bio_f: torch.Tensor) -> torch.Tensor:
+        bi_aug = self._augment_bi(bi)
+        cnn = self.backbone.extract(bi_aug)
         bio = self.bio_head(bio_f)
         fft = self.fft_branch(bi["Foot"].float())
-        return self.shared(torch.cat([cnn, bio, fft], dim=1))
+        return self.shared(torch.cat([cnn, bio, fft], dim=1))   # (B, 256)
 
-    def forward(self, bi: dict,
-                bio_f: torch.Tensor):
-        """Multi-task forward — 학습용. (l6, l3, lbin) 반환."""
-        h = self._fuse(bi, bio_f)
-        return self.head_6cls(h), self.head_3cls(h), self.head_bin(h)
+    def forward(self, bi: dict, bio_f: torch.Tensor):
+        """학습용: (l6, l3, lflat, lbin, emb) 반환."""
+        emb = self._embed(bi, bio_f)
+        return (self.head_6cls(emb),
+                self.head_3cls(emb),
+                self.head_flat(emb),
+                self.head_bin(emb),
+                emb)
 
-    def predict(self, bi: dict,
-                bio_f: torch.Tensor) -> torch.Tensor:
-        """Inference용: 6cls logit만 반환."""
-        return self.head_6cls(self._fuse(bi, bio_f))
+    def predict(self, bi: dict, bio_f: torch.Tensor) -> torch.Tensor:
+        """Inference: 6cls logit만 반환."""
+        return self.head_6cls(self._embed(bi, bio_f))
+
+    def embed(self, bi: dict, bio_f: torch.Tensor) -> torch.Tensor:
+        """TCN Refiner용 256-dim embedding 반환."""
+        return self._embed(bi, bio_f)
+
+
+def consistency_kl_loss(l6: torch.Tensor, l3: torch.Tensor) -> torch.Tensor:
+    """Consistency KL Loss: 6cls→3cls 파생 분포 vs 3cls head.
+
+    flat   = C0(미끄)+C3(흙)+C4(잔디)+C5(평지)
+    up     = C1(오르막)
+    down   = C2(내리막)
+    → 두 분포가 일관되도록 KL 규제
+    """
+    p6 = torch.softmax(l6.float(), dim=1)   # (B, 6)
+    # 6cls 확률에서 3cls 파생
+    p_flat = p6[:, 0] + p6[:, 3] + p6[:, 4] + p6[:, 5]  # C1+C4+C5+C6
+    p_up   = p6[:, 1]                                      # C2 오르막
+    p_down = p6[:, 2]                                      # C3 내리막
+    p3_from6 = torch.stack([p_flat, p_up, p_down], dim=1).clamp(1e-8, 1.0)
+
+    p3_head = torch.softmax(l3.float(), dim=1).clamp(1e-8, 1.0)
+    # KL(p3_head || p3_from6) — 두 분포가 가까워지도록
+    return F.kl_div(p3_head.log(), p3_from6, reduction="batchmean")
+
+
+# ═══════════════════════════════════════════════
+# TCN Sequence Refiner (v11.0)
+# ═══════════════════════════════════════════════
+
+class _TCNBlock(nn.Module):
+    """Dilated Causal Conv1D block."""
+    def __init__(self, ch: int, dilation: int) -> None:
+        super().__init__()
+        pad = dilation  # causal: left-pad only
+        self.conv = nn.Conv1d(ch, ch, kernel_size=3,
+                              padding=pad, dilation=dilation)
+        self.bn   = nn.BatchNorm1d(ch)
+        self.act  = nn.GELU()
+        self.drop = nn.Dropout(0.1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, ch, T) → causal: 오른쪽 패딩 제거
+        out = self.conv(x)[:, :, :x.shape[2]]
+        return x + self.drop(self.act(self.bn(out)))
+
+
+class TCNRefiner(nn.Module):
+    """Subject window sequence → refined 6cls logits.
+
+    입력: (B, T_seq, 256) embedding sequences
+    출력: (B, T_seq, 6) refined logits
+    """
+    def __init__(self, in_dim: int = 256,
+                 hidden: int = TCN_HIDDEN,
+                 num_classes: int = 6) -> None:
+        super().__init__()
+        self.proj = nn.Linear(in_dim, hidden)
+        # dilations: 1, 2, 4 → receptive field = 13 windows
+        self.tcn  = nn.Sequential(
+            _TCNBlock(hidden, dilation=1),
+            _TCNBlock(hidden, dilation=2),
+            _TCNBlock(hidden, dilation=4),
+        )
+        self.head = nn.Linear(hidden, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, in_dim)
+        h = self.proj(x)            # (B, T, hidden)
+        h = h.transpose(1, 2)       # (B, hidden, T)
+        h = self.tcn(h)
+        h = h.transpose(1, 2)       # (B, T, hidden)
+        return self.head(h)         # (B, T, 6)
 
 
 # ═══════════════════════════════════════════════
@@ -967,13 +1019,8 @@ def make_flat_loader(ds: FlatBranchDataset, shuffle: bool,
 
 
 class AllDataBioDataset(Dataset):
-    """전체 6cls 데이터셋 + BioMech 피처. E2E 학습용.
-
-    FlatBranchDataset과 동일 구조이나 클래스 필터링 없이
-    전체 샘플에 BioMech 피처를 on-the-fly로 계산.
-    """
-    def __init__(self, branch_ds, bio_extractor,
-                 y_all: np.ndarray) -> None:
+    """전체 6cls 데이터셋 + BioMech 피처. SuperFusion 학습용."""
+    def __init__(self, branch_ds, bio_extractor, y_all: np.ndarray) -> None:
         self.ds  = branch_ds
         self.bio = bio_extractor
         self.y   = y_all
@@ -983,10 +1030,10 @@ class AllDataBioDataset(Dataset):
 
     def __getitem__(self, i: int):
         bi, _   = self.ds[i]
-        foot_t  = bi["Foot"].unsqueeze(0).float()
-        shank_t = bi["Shank"].unsqueeze(0).float()
+        # bi dict를 batch dim 추가해서 BioMech에 전달
+        bi_b = {k: v.unsqueeze(0) for k, v in bi.items()}
         with torch.no_grad():
-            bio_f = self.bio(foot_t, shank_t).squeeze(0)
+            bio_f = self.bio(bi_b).squeeze(0)
         return bi, bio_f, int(self.y[i])
 
 
@@ -1237,61 +1284,71 @@ def train_stage1(backbone, tr_dl, val_dl, te_dl, tag: str = "",
 # 9b. E2E End-to-End Training (v8.9 핵심)
 # ═══════════════════════════════════════════════
 
-def train_e2e(backbone, tr_dl, val_dl, te_dl, tag: str = "",
-              curve_dir: Path | None = None):
-    """End-to-end 6cls 학습 + 계층 보조 손실.
+def train_superfusion(backbone, tr_dl, val_dl, te_dl, tag: str = "",
+                      curve_dir: Path | None = None):
+    """SuperFusion v11.0 학습.
 
-    3-Stage 컴파운딩 라우팅 오류 제거.
-    S1 backbone 전이 → multi-task fine-tuning:
-      Phase1: 6cls + 3cls보조 + binary보조 (E2E_EPOCHS ep)
-      Phase2: 6cls 집중 파인튜닝 (E2E_FT_EPOCHS ep)
+    Phase1: 4-head multi-task (SF_EPOCHS)
+      Loss = Focal_6(γ=1.5,cls_w) + 0.30*CE_3 + 0.20*CE_flat + 0.40*CE_bin + 0.10*KL_cons
+    Phase2: 6cls 집중 파인튜닝 (SF_FT_EPOCHS)
+      Loss = CE_6(cls_w)
 
-    Returns:
-        (preds, labels) — 6cls 예측 및 정답
+    Returns: (preds, labels, embeddings_dict)
+      embeddings_dict: {idx: emb} — TCN Refiner용
     """
     feat_dim = _get_feat_dim(backbone)
-    model    = E2EHierModel(backbone, feat_dim).to(DEVICE)
+    model    = SuperFusionModel(backbone, feat_dim).to(DEVICE)
     params   = list(model.parameters())
 
-    opt    = torch.optim.AdamW(params, lr=E2E_LR,
-                                weight_decay=config.WEIGHT_DECAY)
-    sch    = _make_sch(opt, E2E_EPOCHS, warmup=15, base_lr=E2E_LR)
-    scaler = GradScaler(enabled=(config.USE_AMP and
-                                  config.AMP_DTYPE == torch.float16))
-    curve  = CurveTracker(f"E2E_{tag.replace('[','').replace(']','')}")
+    # ── 클래스 가중치 ──────────────────────────
+    all_y = np.concatenate([yb.numpy() for _, _, yb in tr_dl])
+    cls_w = auto_class_weights(all_y).to(DEVICE)   # Tensor → device
+    log(f"  {tag} class_weights: {[f'{w:.2f}' for w in cls_w.tolist()]}")
 
-    crit_6 = nn.CrossEntropyLoss(label_smoothing=0.05)
-    crit_3 = nn.CrossEntropyLoss(label_smoothing=0.05)
-    crit_b = nn.CrossEntropyLoss()
+    opt    = torch.optim.AdamW(params, lr=SF_LR, weight_decay=config.WEIGHT_DECAY)
+    sch    = _make_sch(opt, SF_EPOCHS, warmup=10, base_lr=SF_LR)
+    scaler = GradScaler(enabled=(config.USE_AMP and config.AMP_DTYPE == torch.float16))
+    curve  = CurveTracker(f"SF_{tag.replace('[','').replace(']','')}")
 
-    best_va    = 0.0
-    best_state = None
-    patience   = 0
-    t0         = time.time()
+    # Focal(γ=1.5) + class weight → C1/C6 소수 클래스 보정
+    crit_6    = FocalLoss(gamma=1.5, weight=cls_w)
+    crit_3    = nn.CrossEntropyLoss(label_smoothing=0.05)
+    crit_flat = nn.CrossEntropyLoss(label_smoothing=0.05)
+    crit_bin  = nn.CrossEntropyLoss()
 
-    log(f"  {tag} E2E Phase1 ({E2E_EPOCHS}ep, LR={E2E_LR:.0e})"
-        f"  aux: 3cls×{E2E_AUX_W3}  bin×{E2E_AUX_WB}")
+    # flat3 label map: C1→0, C4C5→1, C6→2 (flat 샘플에만 적용)
+    flat3_map = {0: 0, 3: 1, 4: 1, 5: 2}
 
-    for ep in range(1, E2E_EPOCHS + 1):
+    best_va = 0.0; best_state = None; patience = 0; t0 = time.time()
+    log(f"  {tag} SuperFusion Phase1 ({SF_EPOCHS}ep, LR={SF_LR:.0e})"
+        f"  Focal+cls_w | aux: 3cls×{SF_AUX_W3} flat×{SF_AUX_WFLAT}"
+        f" bin×{SF_AUX_WBIN} cons×{SF_WCONS}")
+
+    for ep in range(1, SF_EPOCHS + 1):
         model.train()
-        step_i = -1
         opt.zero_grad(set_to_none=True)
         for step_i, (bi, bio_f, yb) in enumerate(tr_dl):
             bi, bio_f, yb = _to_device(bi, bio_f, yb)
             yb3       = _y6_to_y3(yb)
-            c4c5_mask = (yb == 3) | (yb == 4)   # C4/C5 in 0-indexed
+            flat_mask = ((yb == 0) | (yb == 3) | (yb == 4) | (yb == 5))
+            c4c5_mask = ((yb == 3) | (yb == 4))
 
             with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
-                l6, l3, lbin = model(bi, bio_f)
-                loss_6 = crit_6(l6, yb)
-                loss_3 = crit_3(l3, yb3)
+                l6, l3, lflat, lbin, _ = model(bi, bio_f)
+                loss = crit_6(l6, yb) + SF_AUX_W3 * crit_3(l3, yb3)
+
+                if flat_mask.sum() > 2:
+                    yb_flat3 = torch.tensor(
+                        [flat3_map.get(int(c), 1) for c in yb[flat_mask].tolist()],
+                        dtype=torch.long, device=DEVICE)
+                    loss = loss + SF_AUX_WFLAT * crit_flat(lflat[flat_mask], yb_flat3)
+
                 if c4c5_mask.sum() > 1:
-                    yb_bin = (yb[c4c5_mask] == 4).long()   # C5→1, C4→0
-                    loss_b = crit_b(lbin[c4c5_mask], yb_bin)
-                    loss   = (loss_6 + E2E_AUX_W3 * loss_3 +
-                              E2E_AUX_WB * loss_b) / config.GRAD_ACCUM_STEPS
-                else:
-                    loss = (loss_6 + E2E_AUX_W3 * loss_3) / config.GRAD_ACCUM_STEPS
+                    yb_bin = (yb[c4c5_mask] == 4).long()
+                    loss   = loss + SF_AUX_WBIN * crit_bin(lbin[c4c5_mask], yb_bin)
+
+                loss = loss + SF_WCONS * consistency_kl_loss(l6, l3)
+                loss = loss / config.GRAD_ACCUM_STEPS
 
             scaler.scale(loss).backward()
             if (step_i + 1) % config.GRAD_ACCUM_STEPS == 0:
@@ -1300,15 +1357,15 @@ def train_e2e(backbone, tr_dl, val_dl, te_dl, tag: str = "",
                 scaler.step(opt); scaler.update()
                 opt.zero_grad(set_to_none=True)
 
-        # 마지막 배치 grad 누락 방지
-        if step_i >= 0 and (step_i + 1) % config.GRAD_ACCUM_STEPS != 0:
+        # 마지막 배치 처리
+        if (step_i + 1) % config.GRAD_ACCUM_STEPS != 0:
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(params, config.GRAD_CLIP_NORM)
             scaler.step(opt); scaler.update()
             opt.zero_grad(set_to_none=True)
         sch.step()
 
-        # val
+        # validation
         model.eval()
         va_c = va_n = 0
         with torch.inference_mode():
@@ -1322,37 +1379,37 @@ def train_e2e(backbone, tr_dl, val_dl, te_dl, tag: str = "",
         curve.record(acc=va)
 
         if va > best_va:
-            best_va    = va
-            best_state = _clone_state(model)
-            patience   = 0
+            best_va = va; best_state = _clone_state(model); patience = 0
         else:
             patience += 1
-            if patience >= E2E_PATIENCE and ep > 30:
-                log(f"  {tag} E2E EarlyStop ep{ep}"); break
+            if patience >= SF_PATIENCE and ep > 20:
+                log(f"  {tag} SF EarlyStop ep{ep}  best={best_va:.4f}"); break
 
-        if ep % 30 == 0:
-            log(f"  {tag} E2E ep{ep:03d}/{E2E_EPOCHS}"
+        if ep % 15 == 0 or ep == 1:
+            log(f"  {tag} SF ep{ep:03d}/{SF_EPOCHS}"
                 f"  val={va:.4f}  best={best_va:.4f}"
-                f"  ({time.time()-t0:.0f}s)")
+                f"  lr={opt.param_groups[0]['lr']:.1e}  ({time.time()-t0:.0f}s)")
+            if _WANDB_OK and wandb.run is not None:
+                wandb.log({
+                    f"{tag}/sf_p1_val_acc": va,
+                    f"{tag}/sf_p1_lr":      opt.param_groups[0]['lr'],
+                }, step=ep)
 
-    if best_state:
-        model.load_state_dict(best_state); model.to(DEVICE)
-    log(f"  {tag} E2E Phase1 완료  best_val={best_va:.4f}")
+    if best_state: model.load_state_dict(best_state); model.to(DEVICE)
+    log(f"  {tag} SF Phase1 완료  best_val={best_va:.4f}")
     if curve_dir: curve.save(curve_dir)
 
-    # Phase 2: 6cls CE 집중 파인튜닝 (aux heads 동결)
-    for p in model.head_3cls.parameters(): p.requires_grad = False
-    for p in model.head_bin.parameters():  p.requires_grad = False
-    params2  = list(filter(lambda p: p.requires_grad, model.parameters()))
-    opt2     = torch.optim.AdamW(params2, lr=E2E_LR * 0.2,
-                                  weight_decay=config.WEIGHT_DECAY)
-    crit_ft  = nn.CrossEntropyLoss(label_smoothing=0.03)
-    best_va2    = 0.0
-    best_state2 = None
-    patience2   = 0
+    # ── Phase2: 6cls 집중 파인튜닝 ────────────
+    for p in model.head_3cls.parameters():  p.requires_grad = False
+    for p in model.head_flat.parameters():  p.requires_grad = False
+    for p in model.head_bin.parameters():   p.requires_grad = False
+    params2  = [p for p in model.parameters() if p.requires_grad]
+    opt2     = torch.optim.AdamW(params2, lr=SF_LR * 0.5, weight_decay=config.WEIGHT_DECAY)
+    crit_ft  = nn.CrossEntropyLoss(weight=cls_w, label_smoothing=0.03)
+    best_va2 = 0.0; best_st2 = None; pat2 = 0
 
-    log(f"  {tag} E2E Phase2 6cls 파인튜닝 ({E2E_FT_EPOCHS}ep)")
-    for ep in range(1, E2E_FT_EPOCHS + 1):
+    log(f"  {tag} SF Phase2 6cls ({SF_FT_EPOCHS}ep, LR={SF_LR*0.5:.0e})")
+    for ep in range(1, SF_FT_EPOCHS + 1):
         model.train()
         for bi, bio_f, yb in tr_dl:
             bi, bio_f, yb = _to_device(bi, bio_f, yb)
@@ -1360,6 +1417,8 @@ def train_e2e(backbone, tr_dl, val_dl, te_dl, tag: str = "",
             with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
                 loss = crit_ft(model.predict(bi, bio_f), yb)
             scaler.scale(loss).backward()
+            scaler.unscale_(opt2)
+            torch.nn.utils.clip_grad_norm_(params2, config.GRAD_CLIP_NORM)
             scaler.step(opt2); scaler.update()
 
         model.eval()
@@ -1373,515 +1432,200 @@ def train_e2e(backbone, tr_dl, val_dl, te_dl, tag: str = "",
                 va_n += len(yb)
         va2 = va_c / max(va_n, 1)
         if va2 > best_va2:
-            best_va2    = va2
-            best_state2 = _clone_state(model)
-            patience2   = 0
+            best_va2 = va2; best_st2 = _clone_state(model); pat2 = 0
         else:
-            patience2 += 1
-            if patience2 >= 10:
-                break
+            pat2 += 1
+            if pat2 >= 12: break
 
-    if best_state2:
-        model.load_state_dict(best_state2); model.to(DEVICE)
+    if best_st2:
+        model.load_state_dict(best_st2); model.to(DEVICE)
     for p in model.parameters(): p.requires_grad = True
-    log(f"  {tag} E2E Phase2 완료  best_val={best_va2:.4f}")
+    log(f"  {tag} SF Phase2 완료  best_val={best_va2:.4f}")
 
-    # test 평가
+    # ── test 평가 + embedding 수집 ────────────
     model.eval()
-    preds_list, labels_list = [], []
+    preds_list, labels_list, emb_list = [], [], []
     with torch.inference_mode():
         for bi, bio_f, yb in te_dl:
             bi, bio_f, yb = _to_device(bi, bio_f, yb)
             with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
-                logits = model.predict(bi, bio_f)
+                emb    = model.embed(bi, bio_f)
+                logits = model.head_6cls(emb)
             preds_list.append(logits.argmax(1).cpu())
             labels_list.append(yb.cpu())
+            emb_list.append(emb.cpu())
 
-    return (torch.cat(preds_list).numpy(),
-            torch.cat(labels_list).numpy())
+    te_preds  = torch.cat(preds_list).numpy()
+    te_labels = torch.cat(labels_list).numpy()
+    te_embs   = torch.cat(emb_list)   # (N_te, 256)
+    return te_preds, te_labels, te_embs, model
+
+
+def train_tcn_refiner(sf_model, tr_all_ds, va_all_ds, te_all_ds,
+                      tr_groups: np.ndarray, va_groups: np.ndarray,
+                      te_groups: np.ndarray,
+                      tag: str = "") -> np.ndarray:
+    """TCN Sequence Refiner — subject-aware 구현.
+
+    Subject 단위로 연속 window sequence 생성 (subject 경계 절대 넘지 않음).
+    입력: SuperFusion 256-dim embedding
+    출력: refined test 6cls predictions
+    """
+    # ── embedding 추출 (순서 보장, shuffle=False) ──
+    def _extract_embs(ds, model):
+        dl = DataLoader(ds, batch_size=config.BATCH, shuffle=False,
+                        collate_fn=flat_collate, pin_memory=config.USE_GPU)
+        embs, lbls = [], []
+        model.eval()
+        with torch.inference_mode():
+            for bi, bio_f, yb in dl:
+                bi, bio_f, _ = _to_device(bi, bio_f, yb)
+                with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
+                    embs.append(sf_model.embed(bi, bio_f).cpu())
+                lbls.append(yb)
+        return torch.cat(embs), torch.cat(lbls)
+
+    log(f"  {tag} TCN: embedding 추출...")
+    tr_emb, tr_lbl = _extract_embs(tr_all_ds, sf_model)
+    va_emb, va_lbl = _extract_embs(va_all_ds, sf_model)
+    te_emb, te_lbl = _extract_embs(te_all_ds, sf_model)
+
+    # ── Subject-aware sequence dataset ───────────
+    def _make_seq_ds(emb: torch.Tensor, lbl: torch.Tensor,
+                     grp: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+        """Subject 경계를 넘지 않는 슬라이딩 윈도우 생성."""
+        half = TCN_SEQ_LEN // 2
+        seqs, tgts = [], []
+        for sbj in np.unique(grp):
+            idx = np.where(grp == sbj)[0]          # subject 내 인덱스 (오름차순)
+            se  = emb[idx]                          # (N_sbj, 256)
+            sl  = lbl[idx]
+            N   = len(idx)
+            for i in range(N):
+                start = max(0, i - half)
+                end   = min(N, i + half + 1)
+                win   = se[start:end]               # (<=TCN_SEQ_LEN, 256)
+                # 좌우 zero-padding으로 고정 길이 맞춤
+                pad_l = half - (i - start)
+                pad_r = TCN_SEQ_LEN - win.shape[0] - pad_l
+                win_p = F.pad(win.T, (pad_l, pad_r)).T  # (TCN_SEQ_LEN, 256)
+                seqs.append(win_p)
+                tgts.append(int(sl[i]))
+        return torch.stack(seqs), torch.tensor(tgts, dtype=torch.long)
+
+    log(f"  {tag} TCN: subject-aware sequence 생성...")
+    tr_seq, tr_tgt = _make_seq_ds(tr_emb, tr_lbl, tr_groups)
+    va_seq, va_tgt = _make_seq_ds(va_emb, va_lbl, va_groups)
+    te_seq, te_tgt = _make_seq_ds(te_emb, te_lbl, te_groups)
+    log(f"  {tag} TCN: tr={len(tr_seq)}  va={len(va_seq)}  te={len(te_seq)}")
+
+    # ── TCN 학습 ──────────────────────────────────
+    tcn      = TCNRefiner(in_dim=256, hidden=TCN_HIDDEN, num_classes=6).to(DEVICE)
+    cls_w_tcn = auto_class_weights(tr_tgt.numpy()).to(DEVICE)
+    crit     = nn.CrossEntropyLoss(weight=cls_w_tcn)
+    opt      = torch.optim.AdamW(tcn.parameters(), lr=TCN_LR, weight_decay=1e-4)
+    best_va  = 0.0; best_st = None; pat = 0; half = TCN_SEQ_LEN // 2
+
+    tr_loader = DataLoader(list(zip(tr_seq, tr_tgt)),
+                           batch_size=512, shuffle=True, drop_last=True)
+    va_loader = DataLoader(list(zip(va_seq, va_tgt)),
+                           batch_size=512, shuffle=False)
+
+    log(f"  {tag} TCN 학습 ({TCN_EPOCHS}ep, LR={TCN_LR:.0e})"
+        f"  seq_len={TCN_SEQ_LEN}  subjects={len(np.unique(tr_groups))}")
+    for ep in range(1, TCN_EPOCHS + 1):
+        tcn.train()
+        for xb, yb in tr_loader:
+            xb = xb.to(DEVICE); yb = yb.to(DEVICE)
+            opt.zero_grad()
+            out  = tcn(xb)[:, half, :]    # 중심 타임스텝 예측 (B, 6)
+            loss = crit(out, yb)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(tcn.parameters(), 1.0)
+            opt.step()
+
+        tcn.eval()
+        va_c = va_n = 0
+        with torch.inference_mode():
+            for xb, yb in va_loader:
+                xb = xb.to(DEVICE); yb = yb.to(DEVICE)
+                out = tcn(xb)[:, half, :]
+                va_c += (out.argmax(1) == yb).sum().item()
+                va_n += len(yb)
+        va = va_c / max(va_n, 1)
+        if va > best_va:
+            best_va = va
+            best_st = {k: v.clone() for k, v in tcn.state_dict().items()}
+            pat = 0
+        else:
+            pat += 1
+            if pat >= TCN_PATIENCE: break
+        if ep % 10 == 0:
+            log(f"  {tag} TCN ep{ep:02d}/{TCN_EPOCHS}"
+                f"  val={va:.4f}  best={best_va:.4f}")
+
+    if best_st: tcn.load_state_dict(best_st)
+    log(f"  {tag} TCN 완료  best_val={best_va:.4f}")
+
+    # ── test 예측 ─────────────────────────────────
+    tcn.eval()
+    te_loader = DataLoader(list(zip(te_seq, te_tgt)), batch_size=512, shuffle=False)
+    preds_list = []
+    with torch.inference_mode():
+        for xb, _ in te_loader:
+            xb  = xb.to(DEVICE)
+            out = tcn(xb)[:, half, :]
+            preds_list.append(out.argmax(1).cpu())
+    tcn_preds = torch.cat(preds_list).numpy()
+    tcn_acc   = accuracy_score(te_tgt.numpy(), tcn_preds)
+    log(f"  {tag} TCN test Acc={tcn_acc:.4f}")
+    return tcn_preds
 
 
 # ═══════════════════════════════════════════════
 # 10. Stage 2 — Step1: CE Warmup
 # ═══════════════════════════════════════════════
 
-def warmup_stage2_ce(model: Stage2Model, tr_dl, val_dl,
-                     tag: str = "", weights: list | None = None,
-                     curve_dir: Path | None = None):
-    """Step1: CE 워밍업. 전체 파라미터 학습."""
-    w      = weights or [1.0, 1.0, 1.0, 1.0]
-    weight = torch.tensor(w, dtype=torch.float32).to(DEVICE)
-    crit   = nn.CrossEntropyLoss(weight=weight, label_smoothing=0.05)
-    params = list(model.parameters())
-    opt    = torch.optim.AdamW(params, lr=S2_LR,
-                                weight_decay=config.WEIGHT_DECAY)
-    sch    = _make_sch(opt, S2_WARMUP_EP, warmup=5, base_lr=S2_LR)
-    scaler = GradScaler(enabled=(config.USE_AMP and
-                                  config.AMP_DTYPE == torch.float16))
-    curve  = CurveTracker(f"S2W_{tag.replace('[','').replace(']','')}")
-
-    best_va    = 0.0
-    best_state = None
-    patience   = 0
-    t0         = time.time()
-
-    log(f"  {tag} S2 Step1 CE Warmup ({S2_WARMUP_EP}ep)  [val=inner split]")
-    for ep in range(1, S2_WARMUP_EP + 1):
-        _run_epoch(model, tr_dl, crit, opt, scaler, params)
-        sch.step()
-        _, va = _eval_flat_dl(model, val_dl, crit)
-
-        if va > best_va:
-            best_va    = va
-            best_state = _clone_state(model)
-            patience   = 0
-        else:
-            patience += 1
-            if patience >= 20:
-                log(f"  {tag} S2 Warmup EarlyStop ep{ep}"); break
-
-        curve.record(acc=va)
-        if ep % 10 == 0:
-            log(f"  {tag} S2W ep{ep:03d}/{S2_WARMUP_EP}"
-                f"  val={va:.4f}  best={best_va:.4f}"
-                f"  ({time.time()-t0:.0f}s)")
-
-    if best_state:
-        model.load_state_dict(best_state); model.to(DEVICE)
-    log(f"  {tag} S2 Warmup 완료  best_val={best_va:.4f}")
-    if curve_dir: curve.save(curve_dir)
-
-
-# ═══════════════════════════════════════════════
-# 11. Stage 2 — Step2: SupCon Pretrain
-# ═══════════════════════════════════════════════
-
-def pretrain_stage2(model: Stage2Model, tr_dl, tag: str = ""):
-    """Step2: SupCon (balanced sampler 사용).
-
-    proj_head + backbone + bio_head 학습.
-    classifier는 학습 제외 (표현 학습에 집중).
-    """
-    supcon = SupConLoss(temperature=TEMPERATURE)
-    params = (list(model.backbone.parameters()) +
-              list(model.bio_head.parameters()) +
-              list(model.proj_head.parameters()))
-    opt    = torch.optim.AdamW(params, lr=S2_LR * 0.5,
-                                weight_decay=config.WEIGHT_DECAY)
-    sch    = _make_sch(opt, S2_PRETRAIN_EP, warmup=5, base_lr=S2_LR * 0.5)
-    scaler = GradScaler(enabled=(config.USE_AMP and
-                                  config.AMP_DTYPE == torch.float16))
-
-    best_loss = float("inf")
-    t0        = time.time()
-
-    log(f"  {tag} S2 Step2 SupCon ({S2_PRETRAIN_EP}ep, T={TEMPERATURE})"
-        f"  [balanced sampler]")
-    for ep in range(1, S2_PRETRAIN_EP + 1):
-        avg = _run_epoch(
-            model, tr_dl,
-            loss_fn    = lambda proj, yb: supcon(proj, yb),
-            opt        = opt,
-            scaler     = scaler,
-            params     = params,
-            forward_fn = model.forward_proj,
-        )
-        sch.step()
-        if avg < best_loss: best_loss = avg
-        if ep % 30 == 0:
-            log(f"  {tag} S2P2 ep{ep:03d}/{S2_PRETRAIN_EP}"
-                f"  loss={avg:.4f}  best={best_loss:.4f}"
-                f"  lr={opt.param_groups[0]['lr']:.1e}"
-                f"  ({time.time()-t0:.0f}s)")
-    log(f"  {tag} S2 SupCon 완료  best_loss={best_loss:.4f}")
-
-
-# ═══════════════════════════════════════════════
-# 12. Stage 2 — Step3: Focal Loss Finetune
-# ═══════════════════════════════════════════════
-
-def focal_finetune_stage2(model: Stage2Model, tr_dl, val_dl,
-                          tag: str = "", weights: list | None = None):
-    """Step3: Focal Loss Finetune.
-
-    SupCon으로 feature space 분리 후,
-    FocalLoss로 C4/C5 어려운 샘플 집중 학습.
-    backbone fc 레이어만 부분 해제 → 세밀한 representation tuning.
-    """
-    w      = weights or [1.0, 1.0, 1.0, 1.0]
-    weight = torch.tensor(w, dtype=torch.float32).to(DEVICE)
-    crit   = FocalLoss(gamma=FOCAL_GAMMA, weight=weight)
-    log(f"    Focal Loss(gamma={FOCAL_GAMMA}, weights=[{', '.join(f'{x:.3f}' for x in w)}])")
-
-    # [리뷰2] backbone 동결 제거: CE Warmup 표현을 Focal로 전체 파인튜닝
-    for p in model.parameters(): p.requires_grad = True
-    for p in model.proj_head.parameters(): p.requires_grad = False  # proj_head만 제외
-
-    params = list(filter(lambda p: p.requires_grad, model.parameters()))
-    opt    = torch.optim.AdamW(params, lr=S2_FOCAL_LR,
-                                weight_decay=config.WEIGHT_DECAY)
-    sch    = _make_sch(opt, S2_FOCAL_EP, warmup=5, base_lr=S2_FOCAL_LR)
-    scaler = GradScaler(enabled=(config.USE_AMP and
-                                  config.AMP_DTYPE == torch.float16))
-
-    val_crit   = nn.CrossEntropyLoss(weight=weight)
-    best_vl    = float("inf")
-    best_state = None
-    patience   = 0
-    t0         = time.time()
-
-    log(f"  {tag} S2 Step3 FocalFinetune ({S2_FOCAL_EP}ep)  [val=inner split]")
-    for ep in range(1, S2_FOCAL_EP + 1):
-        _run_epoch(model, tr_dl, crit, opt, scaler, params)
-        sch.step()
-        vl, va = _eval_flat_dl(model, val_dl, val_crit)
-
-        if ep % 25 == 0:
-            log(f"  {tag} S2P3F ep{ep:03d}/{S2_FOCAL_EP}"
-                f"  val={vl:.4f}/{va:.4f}"
-                f"  lr={opt.param_groups[0]['lr']:.1e}"
-                f"  ({time.time()-t0:.0f}s)")
-
-        if vl < best_vl:
-            best_vl    = vl
-            best_state = _clone_state(model)
-            patience   = 0
-        else:
-            patience += 1
-            if patience >= S2_FOCAL_PAT:
-                log(f"  {tag} S2 FocalFinetune EarlyStop ep{ep}"); break
-
-    if best_state:
-        model.load_state_dict(best_state); model.to(DEVICE)
-    # backbone 다시 활성화
-    for p in model.backbone.parameters(): p.requires_grad = True
-    log(f"  {tag} S2 FocalFinetune 완료  best_val_loss={best_vl:.4f}")
-
-
-# ═══════════════════════════════════════════════
-# 13. Stage 2 — Step4: CE Finetune
-# ═══════════════════════════════════════════════
-
-def finetune_stage2(model: Stage2Model, tr_dl, val_dl, te_dl,
-                    tag: str = "", weights: list | None = None,
-                    curve_dir: Path | None = None):
-    """Step4: CE 마무리.
-
-    backbone 완전 고정 대신 상위 fc/head 레이어만 partial unfreeze.
-    Focal로 전체 파인튜닝 후 최종 조정 → 과도한 frozen이 성능 손실.
-    """
-    # backbone 전체 동결
-    for p in model.backbone.parameters():   p.requires_grad = False
-    for p in model.proj_head.parameters():  p.requires_grad = False
-    # backbone 상위 fc/head 레이어만 선택적 해제 (표현 미세 조정)
-    for name, p in model.backbone.named_parameters():
-        if any(k in name for k in ("fc", "clf", "out", "head", "proj", "linear")):
-            p.requires_grad = True
-
-    w      = weights or [1.0, 1.0, 1.0, 1.0]
-    weight = torch.tensor(w, dtype=torch.float32).to(DEVICE)
-    crit   = nn.CrossEntropyLoss(weight=weight,
-                                  label_smoothing=config.LABEL_SMOOTH)
-    log(f"    CE 마무리(auto_weights=[{', '.join(f'{x:.3f}' for x in w)}]) + backbone fc partial unfreeze")
-
-    params = (list(model.classifier.parameters()) +
-              list(model.bio_head.parameters()) +
-              [p for p in model.backbone.parameters() if p.requires_grad])
-    opt    = torch.optim.AdamW(params, lr=S2_LR * 0.5,
-                                weight_decay=config.WEIGHT_DECAY)
-    sch    = _make_sch(opt, S2_FINETUNE_EP, warmup=5, base_lr=S2_LR * 0.5)
-    scaler = GradScaler(enabled=(config.USE_AMP and
-                                  config.AMP_DTYPE == torch.float16))
-    curve  = CurveTracker(f"S2FT_{tag.replace('[','').replace(']','')}")
-
-    best_vl    = float("inf")
-    best_state = None
-    patience   = 0
-    t0         = time.time()
-
-    log(f"  {tag} S2 Step4 CE-마무리 ({S2_FINETUNE_EP}ep)  [val=inner split]")
-    for ep in range(1, S2_FINETUNE_EP + 1):
-        _run_epoch(model, tr_dl, crit, opt, scaler, params)
-        sch.step()
-        vl, va = _eval_flat_dl(model, val_dl, crit)
-
-        if ep % 15 == 0:
-            log(f"  {tag} S2P4 ep{ep:03d}/{S2_FINETUNE_EP}"
-                f"  val={vl:.4f}/{va:.4f}"
-                f"  lr={opt.param_groups[0]['lr']:.1e}"
-                f"  ({time.time()-t0:.0f}s)")
-
-        if vl < best_vl:
-            best_vl    = vl
-            best_state = _clone_state(model)
-            patience   = 0
-        else:
-            patience += 1
-            if patience >= config.EARLY_STOP:
-                log(f"  {tag} S2 Finetune EarlyStop ep{ep}"); break
-
-        curve.record(loss=vl, acc=va)
-
-    if best_state:
-        model.load_state_dict(best_state); model.to(DEVICE)
-    for p in model.backbone.parameters(): p.requires_grad = True
-    if curve_dir: curve.save(curve_dir)
-
-    # 최종 test 평가 + score fusion용 probs 반환
-    model.eval()
-    preds_list, labels_list, probs_list = [], [], []
-    with torch.inference_mode():
-        for bi, bio_f, yb in te_dl:
-            bi, bio_f, yb = _to_device(bi, bio_f, yb)
-            with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
-                logits = model(bi, bio_f)
-            probs_list.append(torch.softmax(logits.float(), dim=1).cpu())
-            preds_list.append(logits.argmax(1).cpu())
-            labels_list.append(yb.cpu())
-
-    s2_probs = torch.cat(probs_list).numpy() if probs_list else np.zeros((0, 3))
-    return (torch.cat(preds_list).numpy(),
-            torch.cat(labels_list).numpy(),
-            s2_probs)
-
-
-# ═══════════════════════════════════════════════
-# 13. Stage 3 — C4 vs C5 Binary (ArcFace)
-# ═══════════════════════════════════════════════
-
-def mixup_batch(bi: dict, bio_f: torch.Tensor, yb: torch.Tensor,
-                alpha: float = 0.3):
-    """C4/C5 Mixup augmentation — Zhang et al. (2018).
-
-    λ ~ Beta(α, α) 로 두 샘플 선형 보간.
-    decision boundary 주변 샘플 생성 → ArcFace margin 강화.
-    """
-    lam = float(np.random.beta(alpha, alpha))
-    B   = yb.shape[0]
-    idx = torch.randperm(B, device=yb.device)
-    mixed_bi  = {k: lam * v + (1 - lam) * v[idx] for k, v in bi.items()}
-    mixed_bio = lam * bio_f + (1 - lam) * bio_f[idx]
-    return mixed_bi, mixed_bio, yb, yb[idx], lam
-
-
-def train_stage3(backbone, tr_dl, val_dl, te_dl,
-                 tag: str = "",
-                 curve_dir: Path | None = None):
-    """Stage3: C4(흙길) vs C5(잔디) binary ArcFace 학습.
-
-    전략 A: FFT Branch (Zheng et al. 2021) — 주파수 도메인 패턴
-    전략 B: Mixup (Zhang et al. 2018) — decision boundary 강화
-    ArcFace (Deng et al. CVPR 2019) — angular margin
-
-    학습 2단계:
-      Step1: ArcFace + Mixup (S3_EPOCHS ep)
-      Step2: CE 마무리 (20ep, backbone 고정)
-    """
-    feat_dim = _get_feat_dim(backbone)
-    model    = Stage3Model(backbone, feat_dim,
-                           bio_dim=128, embed_dim=128,
-                           fft_dim=S3_FFT_DIM).to(DEVICE)
-    arcface  = ArcFaceLoss(feat_dim=128, num_classes=2,
-                           s=S3_ARCFACE_S, m=S3_ARCFACE_M).to(DEVICE)
-
-    params = list(model.parameters()) + list(arcface.parameters())
-    opt    = torch.optim.AdamW(params, lr=S3_LR,
-                                weight_decay=config.WEIGHT_DECAY)
-    sch    = _make_sch(opt, S3_EPOCHS, warmup=10, base_lr=S3_LR)
-    scaler = GradScaler(enabled=(config.USE_AMP and
-                                  config.AMP_DTYPE == torch.float16))
-    curve  = CurveTracker(f"S3_{tag.replace('[','').replace(']','')}")
-
-    best_va    = 0.0
-    best_state = None
-    patience   = 0
-    t0         = time.time()
-
-    log(f"  {tag} Stage3 C4vsC5 ArcFace+FFT+Mixup"
-        f" ({S3_EPOCHS}ep, s={S3_ARCFACE_S}, m={S3_ARCFACE_M},"
-        f" α={S3_MIXUP_ALPHA})")
-
-    # Step1: ArcFace (Mixup 제거 — 리뷰2: ArcFace와 수학적 충돌)
-    for ep in range(1, S3_EPOCHS + 1):
-        model.train(); arcface.train()
-        for bi, bio_f, yb in tr_dl:
-            bi, bio_f, yb = _to_device(bi, bio_f, yb)
-            opt.zero_grad(set_to_none=True)
-            with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
-                embed = model.forward_embed(bi, bio_f)
-                loss  = arcface(embed, yb)
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(params, 1.0)
-            scaler.step(opt); scaler.update()
-        sch.step()
-
-        # val — balanced accuracy (C4/C5 편향 방지)
-        model.eval()
-        va_preds, va_labels = [], []
-        with torch.inference_mode():
-            for bi, bio_f, yb in val_dl:
-                bi, bio_f, yb = _to_device(bi, bio_f, yb)
-                with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
-                    logits = model(bi, bio_f)
-                va_preds.append(logits.argmax(1).cpu())
-                va_labels.append(yb.cpu())
-        vp = torch.cat(va_preds).numpy()
-        vl = torch.cat(va_labels).numpy()
-        # balanced: C4 recall + C5 recall 평균 → C4 편향 early stop 방지
-        c4_rec = ((vp == 0) & (vl == 0)).sum() / max((vl == 0).sum(), 1)
-        c5_rec = ((vp == 1) & (vl == 1)).sum() / max((vl == 1).sum(), 1)
-        va = (c4_rec + c5_rec) / 2.0
-        curve.record(acc=va)
-
-        if va > best_va:
-            best_va    = va
-            best_state = _clone_state(model)
-            patience   = 0
-        else:
-            patience += 1
-            if patience >= S3_PATIENCE and ep > 20:
-                log(f"  {tag} S3 EarlyStop ep{ep}"); break
-
-        if ep % 30 == 0:
-            log(f"  {tag} S3 ep{ep:03d}/{S3_EPOCHS}"
-                f"  bal_acc={va:.4f}  best={best_va:.4f}"
-                f"  C4={c4_rec:.3f}  C5={c5_rec:.3f}"
-                f"  ({time.time()-t0:.0f}s)")
-
-    if best_state:
-        model.load_state_dict(best_state); model.to(DEVICE)
-    log(f"  {tag} S3 ArcFace 완료  best_val={best_va:.4f}")
-
-    # Step2: CE 마무리 2-phase
-    # Phase A: backbone 완전 동결 — head/embed/fft만 먼저 정착 (10ep)
-    # Phase B: backbone fc 레이어만 선택 해제 — 세밀 조정 (10ep)
-    # 총 S3_CE_FT_EP=20ep (40→20 축소: ArcFace margin 구조 보존)
-    for p in model.backbone.parameters(): p.requires_grad = False
-    head_params = (list(model.embed.parameters()) +
-                   list(model.bio_head.parameters()) +
-                   list(model.fft_branch.parameters()) +
-                   list(model.classifier.parameters()))
-    opt2   = torch.optim.AdamW(head_params, lr=S3_LR * 0.3,
-                                weight_decay=config.WEIGHT_DECAY)
-    # C5 upweight: C4_recall 97% vs C5_recall 30% 불균형 → C5 집중
-    s3_crit_weight = torch.tensor([0.8, S3_C5_WEIGHT], dtype=torch.float32, device=DEVICE)
-    crit2  = FocalLoss(gamma=1.0, weight=s3_crit_weight)
-    best_va2    = 0.0
-    best_state2 = None
-    patience2   = 0
-    phase_a_ep  = S3_CE_FT_EP // 2   # 10ep
-
-    log(f"  {tag} S3 CE 마무리 Phase A ({phase_a_ep}ep, head only)")
-    for ep in range(1, phase_a_ep + 1):
-        model.train()
-        for bi, bio_f, yb in tr_dl:
-            bi, bio_f, yb = _to_device(bi, bio_f, yb)
-            opt2.zero_grad(set_to_none=True)
-            with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
-                loss = crit2(model(bi, bio_f), yb)
-            scaler.scale(loss).backward()
-            scaler.step(opt2); scaler.update()
-
-        model.eval()
-        va_c = va_n = 0
-        with torch.inference_mode():
-            for bi, bio_f, yb in val_dl:
-                bi, bio_f, yb = _to_device(bi, bio_f, yb)
-                with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
-                    logits = model(bi, bio_f)
-                va_c += (logits.argmax(1) == yb).sum().item()
-                va_n += len(yb)
-        va2 = va_c / max(va_n, 1)
-        if va2 > best_va2:
-            best_va2    = va2
-            best_state2 = _clone_state(model)
-            patience2   = 0
-        else:
-            patience2 += 1
-            if patience2 >= 5: break
-
-    # Phase B: backbone fc 레이어 선택 해제
-    for name, p in model.backbone.named_parameters():
-        if any(k in name for k in ("fc", "clf", "out", "head", "linear")):
-            p.requires_grad = True
-    all_ft_params = head_params + [p for p in model.backbone.parameters()
-                                   if p.requires_grad]
-    opt3 = torch.optim.AdamW(all_ft_params, lr=S3_LR * 0.1,
-                              weight_decay=config.WEIGHT_DECAY)
-    phase_b_ep = S3_CE_FT_EP - phase_a_ep   # 10ep
-    patience3  = 0
-
-    log(f"  {tag} S3 CE 마무리 Phase B ({phase_b_ep}ep, +backbone fc unfreeze)")
-    for ep in range(1, phase_b_ep + 1):
-        model.train()
-        for bi, bio_f, yb in tr_dl:
-            bi, bio_f, yb = _to_device(bi, bio_f, yb)
-            opt3.zero_grad(set_to_none=True)
-            with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
-                loss = crit2(model(bi, bio_f), yb)
-            scaler.scale(loss).backward()
-            scaler.step(opt3); scaler.update()
-
-        model.eval()
-        va_c = va_n = 0
-        with torch.inference_mode():
-            for bi, bio_f, yb in val_dl:
-                bi, bio_f, yb = _to_device(bi, bio_f, yb)
-                with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
-                    logits = model(bi, bio_f)
-                va_c += (logits.argmax(1) == yb).sum().item()
-                va_n += len(yb)
-        va3 = va_c / max(va_n, 1)
-        if va3 > best_va2:
-            best_va2    = va3
-            best_state2 = _clone_state(model)
-            patience3   = 0
-        else:
-            patience3 += 1
-            if patience3 >= 5: break
-
-    if best_state2:
-        model.load_state_dict(best_state2); model.to(DEVICE)
-    for p in model.backbone.parameters(): p.requires_grad = True
-    log(f"  {tag} S3 완료  best_val={best_va2:.4f}")
-    if curve_dir: curve.save(curve_dir)
-
-    # 최종 test 평가 + score fusion용 probs 반환
-    model.eval()
-    preds_list, labels_list, probs_list = [], [], []
-    with torch.inference_mode():
-        for bi, bio_f, yb in te_dl:
-            bi, bio_f, yb = _to_device(bi, bio_f, yb)
-            with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
-                logits = model(bi, bio_f)
-            probs_list.append(torch.softmax(logits.float(), dim=1).cpu())
-            preds_list.append(logits.argmax(1).cpu())
-            labels_list.append(yb.cpu())
-
-    s3_probs = torch.cat(probs_list).numpy() if probs_list else np.zeros((0, 2))
-    return (torch.cat(preds_list).numpy(),
-            torch.cat(labels_list).numpy(),
-            s3_probs,
-            model)
-
-
 def main() -> None:
     args = parse_args()
     apply_args(args)
 
+    # ── W&B 초기화 ────────────────────────────────
+    use_wandb = args.wandb and _WANDB_OK
+    if args.wandb and not _WANDB_OK:
+        log("  [W&B] wandb 미설치 — pip install wandb 후 재실행. 로컬 로그만 기록.")
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.run_name or f"v11-N{getattr(args,'n_subjects','?')}",
+            config={
+                "version":     "v11.1",
+                "sf_epochs":   SF_EPOCHS,
+                "sf_ft_epochs":SF_FT_EPOCHS,
+                "sf_lr":       SF_LR,
+                "sf_patience": SF_PATIENCE,
+                "focal_gamma": FOCAL_GAMMA,
+                "tcn_seq_len": TCN_SEQ_LEN,
+                "tcn_epochs":  TCN_EPOCHS,
+                "n_bio":       BioMechFeatures.N_BIO,
+                "vote_window": args.vote_window,
+                "aux_w3":      SF_AUX_W3,
+                "aux_wflat":   SF_AUX_WFLAT,
+                "aux_wbin":    SF_AUX_WBIN,
+                "cons_w":      SF_WCONS,
+            },
+        )
+        log(f"  [W&B] project={args.wandb_project}  run={wandb.run.name}")
+
     config.print_config()
     log(
-        f"  ★ Hierarchical v9.0  K-Fold (3-Stage + ArcFace + C5Fix)\n"
-        f"  Stage1: 3cls CE {S1_EPOCHS}ep (LR={S1_LR:.0e})"
-        f"  Soft-Routing threshold={S1_SOFT_THRESHOLD}\n"
-        f"  Stage2: CE-Warmup({S2_WARMUP_EP}ep)"
-        f" → Focal({S2_FOCAL_EP}ep, γ={FOCAL_GAMMA}, LR={S2_FOCAL_LR:.0e})"
-        f" → CE({S2_FINETUNE_EP}ep, backbone fc partial unfreeze)\n"
-        f"  Stage3: binary [C4 vs C5] ArcFace+FFT"
-        f" (s={S3_ARCFACE_S}, m={S3_ARCFACE_M}, {S3_EPOCHS}ep)"
-        f"  CE마무리 {S3_CE_FT_EP}ep Focal(C5w={S3_C5_WEIGHT})\n"
-        f"  결합: Hard Routing  Subject-aware majority vote(window={args.vote_window})\n"
+        f"  ★ v11.0  SuperFusion + TCN Refiner\n"
+        f"  SF: {SF_EPOCHS}ep Phase1 + {SF_FT_EPOCHS}ep Phase2"
+        f"  LR={SF_LR:.0e}  Focal(γ=1.5)+cls_w\n"
+        f"  Loss: 6cls + {SF_AUX_W3}×3cls + {SF_AUX_WFLAT}×flat3"
+        f" + {SF_AUX_WBIN}×bin + {SF_WCONS}×KL_cons\n"
+        f"  BioMech N_BIO={BioMechFeatures.N_BIO}  TCN seq={TCN_SEQ_LEN}"
+        f"  Vote window={args.vote_window}\n"
     )
 
     out       = config.RESULT_KFOLD / "hierarchical"
@@ -1934,185 +1678,113 @@ def main() -> None:
         val_dl = make_loader(val_ds, False, branch=True)
         te_dl  = make_loader(te_ds,  False, branch=True)
 
-        # ── Stage 1 ───────────────────────────────
-        tag         = f"[F{fi}][Hier]"
+        # ── Stage1 (3cls, SF backbone warmup용) ──
+        # 주: 18ch augment backbone과 ch 불일치 → S1 backbone 전이 미사용
+        # S1 acc만 reference로 기록
+        tag         = f"[F{fi}]"
         backbone_s1 = M6_BranchCBAMCrossAug(branch_ch).to(DEVICE)
         s1_preds, s1_labels, s1_probs, s1_model = train_stage1(
             backbone_s1, tr_dl, val_dl, te_dl, tag, curve_dir=curve_dir)
         s1_acc = accuracy_score(s1_labels, s1_preds)
-        log(f"  {tag} Stage1 Acc={s1_acc:.4f}")
+        log(f"  {tag} Stage1 Acc={s1_acc:.4f}  (reference only; SF uses random init 18ch)")
 
-        # ── Stage 2/3 데이터 준비 ─────────────────
+        # ── SuperFusion (v11.0 메인) ──────────────
+        # mag(1)+gyro_mag(1)+jerk(1) × 2측 = 6ch 추가 → 12→18ch per branch
+        sf_branch_ch = {k: v + 6 for k, v in branch_ch.items()}
+        log(f"  {tag} ★ SuperFusion 시작 (S1→SF backbone 전이 불가"
+            f" — augmented 18ch, random init)  N_BIO={BioMechFeatures.N_BIO}")
+        backbone_sf = M6_BranchCBAMCrossAug(sf_branch_ch).to(DEVICE)
+
         te_y6 = y[te_idx]
         tr_y6 = y[inner_tr_idx]
         va_y6 = y[inner_va_idx]
 
-        def _make_flat_ds_3cls(base_ds, y6, mask):
-            y_3cls = np.array([S2_3CLS_MAP[c] for c in y6[mask]])
-            return FlatBranchDataset(base_ds, bio_extractor, mask, y_3cls), y_3cls
+        tr_all_ds = AllDataBioDataset(tr_ds,  bio_extractor, tr_y6)
+        va_all_ds = AllDataBioDataset(val_ds, bio_extractor, va_y6)
+        te_all_ds = AllDataBioDataset(te_ds,  bio_extractor, te_y6)
 
-        def _make_binary_ds(base_ds, y6, mask):
-            y_bin = np.array([S3_BINARY_MAP[c] for c in y6[mask]])
-            return FlatBranchDataset(base_ds, bio_extractor, mask, y_bin), y_bin
+        tr_sf_dl = make_all_loader(tr_all_ds, True,  balanced=True)
+        va_sf_dl = make_all_loader(va_all_ds, False)
+        te_sf_dl = make_all_loader(te_all_ds, False)
 
-        tr_flat_mask   = np.isin(tr_y6, FLAT_CLASSES)
-        va_flat_mask   = np.isin(va_y6, FLAT_CLASSES)
-        te_flat_mask   = (s1_preds == 0)
-        te_oracle_mask = np.isin(te_y6, FLAT_CLASSES)
+        sf_preds, sf_labels, sf_te_embs, sf_model = train_superfusion(
+            backbone_sf, tr_sf_dl, va_sf_dl, te_sf_dl,
+            tag=f"{tag}[SF]", curve_dir=curve_dir)
 
-        tr_flat_ds, tr_y_3cls     = _make_flat_ds_3cls(tr_ds, tr_y6, tr_flat_mask)
-        va_flat_ds, _             = _make_flat_ds_3cls(val_ds, va_y6, va_flat_mask)
-        te_oracle_ds, te_oracle_y3 = _make_flat_ds_3cls(te_ds, te_y6, te_oracle_mask)
+        sf_acc = accuracy_score(sf_labels, sf_preds)
+        sf_f1  = f1_score(sf_labels, sf_preds, average="macro", zero_division=0)
+        log(f"  {tag} SF (before TCN)  Acc={sf_acc:.4f}  F1={sf_f1:.4f}")
 
-        te_y6_flat = te_y6[te_flat_mask]
-        te_y_3cls  = np.array([S2_3CLS_MAP.get(c, 2) for c in te_y6_flat])
-        te_flat_ds = FlatBranchDataset(te_ds, bio_extractor, te_flat_mask, te_y_3cls)
+        # ── TCN Sequence Refiner (subject-aware) ──
+        log(f"  {tag} ★ TCN Refiner 시작 (subject-aware)")
+        tr_groups_local = groups[inner_tr_idx]
+        va_groups_local = groups[inner_va_idx]
+        te_groups_local = groups[te_idx]
+        tcn_preds = train_tcn_refiner(
+            sf_model,
+            tr_all_ds, va_all_ds, te_all_ds,
+            tr_groups=tr_groups_local,
+            va_groups=va_groups_local,
+            te_groups=te_groups_local,
+            tag=f"{tag}[TCN]")
 
-        tr_flat_dl_bal = make_flat_loader(tr_flat_ds, True,  balanced=True)
-        tr_flat_dl_ce  = make_flat_loader(tr_flat_ds, True,  balanced=False)
-        va_flat_dl     = make_flat_loader(va_flat_ds, False)
-        te_flat_dl     = make_flat_loader(te_flat_ds, False)
-        te_oracle_dl   = make_flat_loader(te_oracle_ds, False)
-
-        log(f"  {tag} Stage2 (3cls: C1/C6/C4C5)"
-            f"  tr_flat={tr_flat_mask.sum()}"
-            f"  va_flat={va_flat_mask.sum()}"
-            f"  te_pipeline={te_flat_mask.sum()}"
-            f"  te_oracle={te_oracle_mask.sum()}")
-
-        # ── Stage2 모델 (S1 backbone 전이) ────────
-        # S1 backbone 전이: flat 특성 이미 학습 → warmup 수렴 가속
-        backbone_s2 = M6_BranchCBAMCrossAug(branch_ch).to(DEVICE)
-        backbone_s2.load_state_dict(s1_model.backbone.state_dict())
-        feat_dim = _get_feat_dim(backbone_s2)
-        s2_model = Stage2Model(backbone_s2, feat_dim,
-                               bio_dim=128, num_classes=3).to(DEVICE)
-
-        s2_weights = auto_class_weights(tr_y_3cls)
-
-        # Stage2: CE Warmup(80ep) → Focal(100ep, full params) → CE(50ep)
-        warmup_stage2_ce(     s2_model, tr_flat_dl_ce, va_flat_dl, tag, s2_weights,
-                              curve_dir=curve_dir)
-        focal_finetune_stage2(s2_model, tr_flat_dl_ce, va_flat_dl, tag, s2_weights)
-        s2_preds, s2_labels, s2_te_probs = finetune_stage2(
-            s2_model, tr_flat_dl_ce, va_flat_dl, te_flat_dl, tag, s2_weights,
-            curve_dir=curve_dir)
-
-        # Stage2 Oracle 평가
-        s2_pipeline_acc = accuracy_score(s2_labels, s2_preds)
-        s2_model.eval()
-        oracle_preds_list = []
-        with torch.inference_mode():
-            for bi, bio_f, yb in te_oracle_dl:
-                bi, bio_f, _ = _to_device(bi, bio_f, yb)
-                with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
-                    oracle_preds_list.append(
-                        s2_model(bi, bio_f).argmax(1).cpu())
-        oracle_preds  = torch.cat(oracle_preds_list).numpy()
-        s2_oracle_acc = accuracy_score(te_oracle_y3, oracle_preds)
-        log(f"  {tag} Stage2  oracle={s2_oracle_acc:.4f}"
-            f"  pipeline={s2_pipeline_acc:.4f}")
-
-        # ── Stage3 데이터 준비 ────────────────────
-        tr_c4c5_mask          = np.isin(tr_y6, [3, 4])
-        va_c4c5_mask          = np.isin(va_y6, [3, 4])
-        te_c4c5_pipeline_mask = te_flat_mask.copy()
-        te_c4c5_pipeline_mask[te_flat_mask] = (s2_preds == 2)
-        te_c4c5_oracle_mask   = np.isin(te_y6, [3, 4])
-
-        tr_c4c5_ds, tr_y_bin          = _make_binary_ds(tr_ds, tr_y6, tr_c4c5_mask)
-        va_c4c5_ds, _                 = _make_binary_ds(val_ds, va_y6, va_c4c5_mask)
-        te_c4c5_oracle_ds, te_c4c5_oracle_y = _make_binary_ds(
-            te_ds, te_y6, te_c4c5_oracle_mask)
-
-        te_y6_c4c5 = te_y6[te_c4c5_pipeline_mask]
-        te_y_bin   = np.array([S3_BINARY_MAP.get(c, 0) for c in te_y6_c4c5])
-        te_c4c5_ds = FlatBranchDataset(
-            te_ds, bio_extractor, te_c4c5_pipeline_mask, te_y_bin)
-
-        tr_c4c5_dl        = make_flat_loader(tr_c4c5_ds, True, balanced=True)
-        va_c4c5_dl        = make_flat_loader(va_c4c5_ds, False)
-        te_c4c5_dl        = make_flat_loader(te_c4c5_ds, False)
-        te_c4c5_oracle_dl = make_flat_loader(te_c4c5_oracle_ds, False)
-
-        log(f"  {tag} Stage3 (C4vsC5 binary)"
-            f"  tr={tr_c4c5_mask.sum()}"
-            f"  va={va_c4c5_mask.sum()}"
-            f"  te_pipeline={te_c4c5_pipeline_mask.sum()}"
-            f"  te_oracle={te_c4c5_oracle_mask.sum()}")
-
-        # ── Stage3 (S2 backbone 전이 + ArcFace) ───
-        backbone_s3 = M6_BranchCBAMCrossAug(branch_ch).to(DEVICE)
-        backbone_s3.load_state_dict(s2_model.backbone.state_dict())
-        s3_preds, _, s3_te_probs, s3_model = train_stage3(
-            backbone_s3, tr_c4c5_dl, va_c4c5_dl, te_c4c5_dl, tag,
-            curve_dir=curve_dir)
-
-        # Stage3 Oracle 평가 + C4/C5 recall 분리
-        s3_model.eval()
-        s3_oracle_preds_list = []
-        with torch.inference_mode():
-            for bi, bio_f, yb in te_c4c5_oracle_dl:
-                bi, bio_f, _ = _to_device(bi, bio_f, yb)
-                with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
-                    s3_oracle_preds_list.append(
-                        s3_model(bi, bio_f).argmax(1).cpu())
-        s3_oracle_preds = torch.cat(s3_oracle_preds_list).numpy() \
-                          if s3_oracle_preds_list else np.array([])
-        s3_oracle_acc   = accuracy_score(te_c4c5_oracle_y, s3_oracle_preds) \
-                          if len(s3_oracle_preds) > 0 else 0.0
-        s3_pipeline_acc = accuracy_score(te_y_bin, s3_preds) \
-                          if len(s3_preds) > 0 else 0.0
-
-        # C4/C5 recall 분리 — binary에서 한 클래스만 잘 맞는 착시 방지
-        if len(s3_oracle_preds) > 0:
-            cm_s3  = confusion_matrix(te_c4c5_oracle_y, s3_oracle_preds, labels=[0, 1])
-            rec_c4 = cm_s3[0, 0] / max(cm_s3[0].sum(), 1)
-            rec_c5 = cm_s3[1, 1] / max(cm_s3[1].sum(), 1)
-        else:
-            rec_c4 = rec_c5 = 0.0
-        log(f"  {tag} Stage3  oracle={s3_oracle_acc:.4f}"
-            f"  pipeline={s3_pipeline_acc:.4f}"
-            f"  C4_recall={rec_c4:.3f}  C5_recall={rec_c5:.3f}"
-            f"  (C4={(te_y_bin==0).sum()}  C5={(te_y_bin==1).sum()})")
-
-        # ── 최종 결합: Hard Routing (검증된 방식) ──
-        # Score Fusion 실험 결과: p_flat×p_s2 < p_up 조건에서 역전 발생
-        # → 확률 미보정 상태에서 hard routing이 더 안정적
-        final_preds = combine_predictions_3stage(s1_preds, s2_preds, s3_preds)
-        final_preds_raw = final_preds.copy()
-
-        # Subject-aware majority vote (fold 전체 아닌 subject 단위)
+        # ── 후처리: Majority Vote ─────────────────
+        sf_preds_vote  = sf_preds.copy()
+        tcn_preds_vote = tcn_preds.copy()
         if args.vote_window > 0:
-            final_preds = majority_vote_by_subject(
-                final_preds, te_idx=te_idx, groups=groups,
-                window=args.vote_window)
+            sf_preds_vote  = majority_vote_by_subject(
+                sf_preds, te_idx=te_idx, groups=groups, window=args.vote_window)
+            tcn_preds_vote = majority_vote_by_subject(
+                tcn_preds, te_idx=te_idx, groups=groups, window=args.vote_window)
 
-        acc_raw = accuracy_score(te_y6, final_preds_raw)
-        acc     = accuracy_score(te_y6, final_preds)
-        f1      = f1_score(te_y6, final_preds, average="macro", zero_division=0)
-        vote_info = f"  (before vote={acc_raw:.4f})" if args.vote_window > 0 else ""
-        log(f"  {tag} ★ 최종 6cls  Acc={acc:.4f}  F1={f1:.4f}{vote_info}")
+        acc_sf  = accuracy_score(sf_labels, sf_preds_vote)
+        f1_sf   = f1_score(sf_labels, sf_preds_vote, average="macro", zero_division=0)
+        acc_tcn = accuracy_score(sf_labels, tcn_preds_vote)
+        f1_tcn  = f1_score(sf_labels, tcn_preds_vote, average="macro", zero_division=0)
+        log(f"  {tag} ★ SF+Vote   Acc={acc_sf:.4f}  F1={f1_sf:.4f}")
+        log(f"  {tag} ★ TCN+Vote  Acc={acc_tcn:.4f}  F1={f1_tcn:.4f}")
+
+        # TCN이 SF보다 나으면 TCN 사용
+        final_preds  = tcn_preds_vote if acc_tcn >= acc_sf else sf_preds_vote
+        final_labels = sf_labels
+        acc = max(acc_tcn, acc_sf)
+        f1  = f1_tcn if acc_tcn >= acc_sf else f1_sf
+        log(f"  {tag} ★ 최종  Acc={acc:.4f}  F1={f1:.4f}"
+            f"  ({'TCN' if acc_tcn >= acc_sf else 'SF'})")
 
         all_preds.append(final_preds)
-        all_labels.append(te_y6)
+        all_labels.append(final_labels)
         fold_meta.append({
-            "fold":             fi,
-            "test_subjects":    te_s,
-            "s1_acc":           round(s1_acc, 4),
-            "s2_oracle_acc":    round(s2_oracle_acc, 4),
-            "s2_pipeline_acc":  round(s2_pipeline_acc, 4),
-            "s3_oracle_acc":    round(s3_oracle_acc, 4),
-            "s3_pipeline_acc":  round(s3_pipeline_acc, 4),
-            "final_acc_raw":    round(acc_raw, 4),
-            "final_acc":        round(acc, 4),
-            "final_f1":         round(f1, 4),
-            "fold_time_min":    round((time.time() - t_fold) / 60, 1),
+            "fold":          fi,
+            "test_subjects": te_s,
+            "s1_acc":        round(s1_acc, 4),
+            "sf_acc":        round(acc_sf, 4),
+            "sf_f1":         round(f1_sf, 4),
+            "tcn_acc":       round(acc_tcn, 4),
+            "tcn_f1":        round(f1_tcn, 4),
+            "final_acc":     round(acc, 4),
+            "final_f1":      round(f1, 4),
+            "used_tcn":      acc_tcn >= acc_sf,
+            "fold_time_min": round((time.time() - t_fold) / 60, 1),
         })
 
-        del backbone_s1, backbone_s2, backbone_s3, s2_model, s3_model, s1_model
+        # W&B fold 결과 로깅
+        if _WANDB_OK and wandb.run is not None:
+            wandb.log({
+                f"fold{fi}/s1_acc":  s1_acc,
+                f"fold{fi}/sf_acc":  acc_sf,
+                f"fold{fi}/sf_f1":   f1_sf,
+                f"fold{fi}/tcn_acc": acc_tcn,
+                f"fold{fi}/tcn_f1":  f1_tcn,
+                f"fold{fi}/final_acc": acc,
+                f"fold{fi}/final_f1":  f1,
+            })
+
+        # ── fold 메모리 정리 ─────────────────────
+        del backbone_s1, backbone_sf, s1_model, sf_model
+        del tr_all_ds, va_all_ds, te_all_ds
+        del tr_sf_dl, va_sf_dl, te_sf_dl
         del tr_ds, val_ds, te_ds
-        del tr_flat_ds, va_flat_ds, te_flat_ds, te_oracle_ds
         gc.collect()
         if config.USE_GPU: torch.cuda.empty_cache()
         clear_fold_cache(f"HC{fi}")
@@ -2128,7 +1800,7 @@ def main() -> None:
     total_min  = (time.time() - t_total) / 60
 
     print(f"\n{'='*60}")
-    print(f"  ★ Hierarchical v8.9  {config.KFOLD}-Fold")
+    print(f"  ★ v11.0 SuperFusion+TCN  {config.KFOLD}-Fold")
     print(f"  총 소요: {total_min:.1f}분")
     print(f"  Acc={acc_all:.4f}  MacroF1={f1_all:.4f}")
     print(f"{'='*60}")
@@ -2139,35 +1811,18 @@ def main() -> None:
     rep = classification_report(
         labels_all, preds_all,
         target_names=[f"C{c}" for c in le.classes_], digits=4, zero_division=0)
-    (out / "report_v89.txt").write_text(
-        f"Hierarchical v8.9\nAcc={acc_all:.4f}  F1={f1_all:.4f}\n\n{rep}")
+    (out / "report_v110.txt").write_text(
+        f"v11.0 SuperFusion+TCN\nAcc={acc_all:.4f}  F1={f1_all:.4f}\n\n{rep}")
 
     le_out = LabelEncoder()
     le_out.fit(sorted(set(labels_all.tolist())))
-    save_cm(preds_all, labels_all, le_out, "Hierarchical_v89_KFold", out)
+    save_cm(preds_all, labels_all, le_out, "SuperFusion_TCN_v110_KFold", out)
 
     summary = {
-        "experiment":  "hierarchical_kfold_v89",
-        "version":     "v8.9",
-        "method":      "Hierarchical Soft-Routing + CE Warmup + FocalLoss + ArcFace + FFT + ScoreFusion + SubjectVote",
-        "routing":     f"soft (Stage1 flat prob >= {S1_SOFT_THRESHOLD} → Stage2 → Stage3) + Score Fusion 6cls",
-        "postprocess": f"majority_vote_by_subject(window={args.vote_window})" if args.vote_window > 0 else "none",
-        "hyperparams": {
-            "s1_epochs":        S1_EPOCHS,
-            "s1_lr":            S1_LR,
-            "s1_soft_threshold": S1_SOFT_THRESHOLD,
-            "s2_warmup_ep":     S2_WARMUP_EP,
-            "s2_focal_ep":      S2_FOCAL_EP,
-            "s2_focal_lr":      S2_FOCAL_LR,
-            "s2_finetune_ep":   S2_FINETUNE_EP,
-            "focal_gamma":      FOCAL_GAMMA,
-            "s3_epochs":        S3_EPOCHS,
-            "s3_ce_ft_ep":      S3_CE_FT_EP,
-            "s3_arcface_s":     S3_ARCFACE_S,
-            "s3_arcface_m":     S3_ARCFACE_M,
-            "n_bio":            BioMechFeatures.N_BIO,
-            "hf_bin":           "30Hz",
-        },
+        "experiment":  "hierarchical_kfold_v110",
+        "version":     "v11.0",
+        "method":      "SuperFusion (4-head) + TCN Sequence Refiner",
+        "n_bio":       BioMechFeatures.N_BIO,
         "total_minutes": round(total_min, 1),
         "overall": {"acc": round(acc_all, 4), "f1": round(f1_all, 4)},
         "per_class_recall": {
@@ -2176,9 +1831,34 @@ def main() -> None:
         },
         "fold_meta": fold_meta,
     }
-    path_json = out / "summary_v89.json"
+    path_json = out / "summary_v110.json"
     path_json.write_text(json.dumps(summary, indent=2, ensure_ascii=False))
     log(f"  ✅ {path_json}")
+
+    # ── W&B 최종 요약 ─────────────────────────────
+    if _WANDB_OK and wandb.run is not None:
+        # 전체 지표
+        wandb.summary["overall_acc"] = acc_all
+        wandb.summary["overall_f1"]  = f1_all
+        for i, r in enumerate(recalls):
+            name = CLASS_NAMES_ALL.get(i, f"C{i+1}")
+            wandb.summary[f"recall_{name}"] = round(float(r), 4)
+
+        # Confusion Matrix (W&B 전용 시각화)
+        class_names = [CLASS_NAMES_ALL.get(i, f"C{i+1}") for i in range(6)]
+        wandb.log({
+            "confusion_matrix": wandb.plot.confusion_matrix(
+                probs=None,
+                y_true=labels_all.tolist(),
+                preds=preds_all.tolist(),
+                class_names=class_names,
+            ),
+            "overall_acc": acc_all,
+            "overall_f1":  f1_all,
+        })
+        wandb.finish()
+        log("  [W&B] 로깅 완료 — 대시보드에서 결과 확인")
+
     h5data.close()
 
 
