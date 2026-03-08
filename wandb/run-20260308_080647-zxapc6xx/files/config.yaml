@@ -1,0 +1,91 @@
+_wandb:
+    value:
+        cli_version: 0.25.0
+        e:
+            rcfjuzsh0ni3xzaaydk36uqvq7qlgbyi:
+                args:
+                    - --wandb
+                    - --wandb_project
+                    - imu-terrain
+                    - --run_name
+                    - v11.3-N50
+                codePath: experiments/hierarchical/train_hierarchical.py
+                codePathLocal: experiments/hierarchical/train_hierarchical.py
+                cpu_count: 4
+                cpu_count_logical: 8
+                cudaVersion: "13.1"
+                disk:
+                    /:
+                        total: "206900281344"
+                        used: "94474588160"
+                email: qkrwngh10@khu.ac.kr
+                executable: /home/ubuntu/project/.venv/bin/python
+                git:
+                    commit: 38b8122bc128dfe2d6d36477a399ef8c274e85bf
+                    remote: https://github.com/Kyle-bbajo/IMU-terrain-classifier.git
+                gpu: NVIDIA L4
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ada
+                      cudaCores: 7424
+                      memoryTotal: "24152899584"
+                      name: NVIDIA L4
+                      uuid: GPU-7f598f27-8c3e-b5d3-c74a-5bb7b54a3bb4
+                host: ip-172-31-45-152
+                memory:
+                    total: "32380186624"
+                os: Linux-6.17.0-1007-aws-x86_64-with-glibc2.39
+                program: /home/ubuntu/project/repo/experiments/hierarchical/train_hierarchical.py
+                python: CPython 3.12.3
+                root: /home/ubuntu/project/repo
+                startedAt: "2026-03-08T08:06:47.931156Z"
+                writerId: rcfjuzsh0ni3xzaaydk36uqvq7qlgbyi
+        m: []
+        python_version: 3.12.3
+        t:
+            "1":
+                - 1
+                - 5
+                - 53
+            "2":
+                - 1
+                - 5
+                - 53
+            "3":
+                - 13
+                - 16
+                - 61
+            "4": 3.12.3
+            "5": 0.25.0
+            "12": 0.25.0
+            "13": linux-x86_64
+aux_w3:
+    value: 0.3
+aux_wbin:
+    value: 0.4
+aux_wflat:
+    value: 0.2
+cons_w:
+    value: 0.1
+focal_gamma:
+    value: 1.5
+git_commit:
+    value: 38b8122
+n_bio:
+    value: 44
+sf_epochs:
+    value: 120
+sf_ft_epochs:
+    value: 40
+sf_lr:
+    value: 0.0001
+sf_patience:
+    value: 20
+tcn_epochs:
+    value: 40
+tcn_seq_len:
+    value: 9
+version:
+    value: v11.3
+vote_window:
+    value: 5

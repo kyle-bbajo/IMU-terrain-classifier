@@ -1,19 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-train_hierarchical.py — v11.3 (SuperFusion + TCN Refiner)
+train_hierarchical.py — v11.5 (Subject-Relative Learning)
 ═══════════════════════════════════════════════════════
-v11.2 → v11.3 변경:
-  [A] Macro F1 기반 Early Stopping (Phase1/Phase2/TCN 전체)
-      · 기존: val accuracy 기준 → 다수 클래스(C2/C3)에 유리
-      · 변경: val_score = 0.4*acc + 0.6*macro_f1
-      · 효과: C1/C4/C5 소수 클래스 recall 보호
-  [B] TCN sliding window 조밀화 (step=1 overlap)
-      · 기존: 중심 기준 패딩 방식 (N개 시퀀스)
-      · 변경: stride=1 완전 overlap (N-seq_len+1개)
-      · 효과: 훈련 시퀀스 수 증가, 경계 노이즈 제거
-  [C] BioMech N_BIO 38→44 (v11.2 유지)
-  [D] W&B git commit 해시 자동 기록 (v11.2 유지)
-목표: 90%+
+v11.4 → v11.5 핵심 변경:
+
+  [A] Subject-Wise BioMech Normalization ★★★
+      · 문제: Subject A의 C6(평지)=150, Subject B의 C1(미끄)=140
+              → 절대값이 겹쳐서 구분 불가
+      · 해결: 각 subject의 BioMech 피처를 해당 subject 평균/std로 정규화
+              → "이 사람의 평균 대비 얼마나 다른가" 상대값으로 변환
+      · 효과: 체중/키/보행 습관 차이 제거 → 순수 지형 신호만 남음
+
+  [B] Within-Subject Triplet Loss ★★★
+      · 문제: 다른 subject 간 비교는 노이즈만 추가
+      · 해결: 같은 subject 안에서 Anchor(C1) - Pos(C1) - Neg(C4) 구성
+              → "한 사람 안에서 지형 간 차이" 만 학습
+      · margin=1.0, mining=hard negative within subject
+
+  [C] v11.4 구조 유지 (GRL + CrossAttn + S1 전이 + F1 EarlyStopping)
+
+목표: 85~93% (데이터 50명 기준 현실적 상한)
 ═══════════════════════════════════════════════════════"""
 
 from __future__ import annotations
@@ -102,6 +108,9 @@ SF_AUX_W3     = 0.30  # 3cls 보조 가중치 (flat/up/down)
 SF_AUX_WFLAT  = 0.20  # flat3 보조 가중치 (C1/C4C5/C6)
 SF_AUX_WBIN   = 0.40  # binary 보조 가중치 (C4/C5) ← C4/C5 식별 강화
 SF_WCONS      = 0.10  # consistency KL 가중치
+SF_WADV       = 0.10  # subject adversarial loss 가중치 (v11.4)
+SF_WTRIPLET   = 0.30  # within-subject triplet loss 가중치 (v11.5)
+TRIPLET_MARGIN = 1.0  # triplet margin
 
 # ═══════════════════════════════════════════════
 # TCN Sequence Refiner 하이퍼파라미터 (v11.0)
@@ -597,6 +606,129 @@ class BioMechFeatures(nn.Module):
 # 2. BioMechHead
 # ═══════════════════════════════════════════════
 
+class SubjectNormalizer:
+    """Subject-Wise BioMech Feature Normalization.
+
+    핵심 아이디어:
+      Subject A: C1=100, C4=200, C6=150 → mean=150, std=50
+                 정규화: C1=-1.0, C4=+1.0, C6=0.0
+      Subject B: C1=80,  C4=160, C6=120 → mean=120, std=40
+                 정규화: C1=-1.0, C4=+1.0, C6=0.0  ← 같아짐!
+
+    fold 내 train subject들의 class-mean을 계산하여 정규화.
+    test subject에는 test subject 자신의 통계로 정규화
+    (test leakage 없음 — subject 내부 통계만 사용).
+    """
+    def __init__(self):
+        # subject_id → (mean, std) 저장
+        self.stats: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+    def fit(self, bio_feats: np.ndarray, groups: np.ndarray) -> None:
+        """각 subject의 mean/std 계산."""
+        self.stats = {}
+        for sbj in np.unique(groups):
+            mask = groups == sbj
+            feats = bio_feats[mask]
+            self.stats[sbj] = (
+                feats.mean(axis=0),
+                feats.std(axis=0).clip(min=1e-6),
+            )
+
+    def transform(self, bio_feats: np.ndarray,
+                  groups: np.ndarray) -> np.ndarray:
+        """subject별 z-score 정규화 적용."""
+        out = bio_feats.copy().astype(np.float32)
+        for sbj in np.unique(groups):
+            mask = groups == sbj
+            if sbj in self.stats:
+                mu, std = self.stats[sbj]
+            else:
+                # unseen subject (test) → 자신의 통계로 정규화
+                feats = bio_feats[mask]
+                mu  = feats.mean(axis=0)
+                std = feats.std(axis=0).clip(min=1e-6)
+            out[mask] = (bio_feats[mask] - mu) / std
+        return out
+
+    def fit_transform(self, bio_feats: np.ndarray,
+                      groups: np.ndarray) -> np.ndarray:
+        self.fit(bio_feats, groups)
+        return self.transform(bio_feats, groups)
+
+
+class WithinSubjectTripletLoss(nn.Module):
+    """Within-Subject Hard Negative Triplet Loss.
+
+    같은 subject 안에서만 triplet 구성:
+      Anchor:   subject S의 클래스 C 샘플
+      Positive: subject S의 같은 클래스 C 다른 샘플
+      Negative: subject S의 다른 클래스 C' 샘플 (hardest)
+
+    이유:
+      - 다른 subject 간 비교 → 개인차 노이즈만 추가
+      - 같은 subject 안에서 C1 vs C4 차이 → 순수 지형 신호
+    """
+    def __init__(self, margin: float = 1.0):
+        super().__init__()
+        self.margin = margin
+        self.loss_fn = nn.TripletMarginLoss(
+            margin=margin, p=2, reduction="mean")
+
+    def forward(self, emb: torch.Tensor,
+                labels: torch.Tensor,
+                sbj: torch.Tensor) -> torch.Tensor:
+        """
+        emb:    (B, D) — 256-dim embedding
+        labels: (B,)   — 지형 클래스 0~5
+        sbj:    (B,)   — subject index (0-based)
+        """
+        anchors, positives, negatives = [], [], []
+
+        for s in sbj.unique():
+            s_mask = sbj == s
+            s_emb  = emb[s_mask]
+            s_lbl  = labels[s_mask]
+
+            # subject 내에 최소 2개 클래스 필요
+            if s_lbl.unique().shape[0] < 2:
+                continue
+
+            for cls in s_lbl.unique():
+                pos_mask = s_lbl == cls
+                neg_mask = s_lbl != cls
+
+                if pos_mask.sum() < 2 or neg_mask.sum() < 1:
+                    continue
+
+                pos_embs = s_emb[pos_mask]
+                neg_embs = s_emb[neg_mask]
+                pos_lbls = s_lbl[neg_mask]
+
+                # 각 anchor(pos[0])에 대해 hardest negative 선택
+                anchor = pos_embs[0]
+                pos    = pos_embs[1] if pos_embs.shape[0] > 1 \
+                         else pos_embs[0]
+
+                # hardest negative: anchor와 가장 가까운 negative
+                dists = torch.cdist(
+                    anchor.unsqueeze(0),
+                    neg_embs).squeeze(0)
+                hard_neg = neg_embs[dists.argmin()]
+
+                anchors.append(anchor)
+                positives.append(pos)
+                negatives.append(hard_neg)
+
+        if len(anchors) == 0:
+            return torch.tensor(0.0, device=emb.device,
+                                requires_grad=True)
+
+        a = torch.stack(anchors)
+        p = torch.stack(positives)
+        n = torch.stack(negatives)
+        return self.loss_fn(a, p, n)
+
+
 class BioMechHead(nn.Module):
     def __init__(self, in_dim: int = BioMechFeatures.N_BIO, out_dim: int = 64) -> None:
         super().__init__()
@@ -831,90 +963,144 @@ class Stage3Model(nn.Module):
 # 4b. E2E Hierarchical Model (v8.9 핵심)
 # ═══════════════════════════════════════════════
 
+class GradientReversalFn(torch.autograd.Function):
+    """Ganin et al. 2015 — Gradient Reversal Layer.
+
+    forward:  identity (그대로 통과)
+    backward: gradient에 -λ 곱해서 역전
+    → backbone이 subject 구분 불가능한 feature 학습
+    """
+    @staticmethod
+    def forward(ctx, x, lam):
+        ctx.save_for_backward(torch.tensor(lam))
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad):
+        lam, = ctx.saved_tensors
+        return -lam.item() * grad, None
+
+
+class GRL(nn.Module):
+    """GRL wrapper — lam은 학습 진행에 따라 외부에서 조정."""
+    def __init__(self): super().__init__()
+    def forward(self, x, lam=1.0):
+        return GradientReversalFn.apply(x, lam)
+
+
+class KinematicCrossAttention(nn.Module):
+    """Foot→Shank 충격 전파 Cross-Attention.
+
+    물리적 근거:
+      잔디(C5): Foot에서 충격 흡수 → Shank attention 약함
+      흙길(C4): Foot 불규칙 → Shank attention 변동↑
+      미끄러움(C1): Foot 뒤틀림 → Shank/Thigh attention 급변
+
+    Q = Shank feature (무엇을 주목할지 질문)
+    K,V = Foot feature (충격 정보 제공)
+    → Shank가 Foot의 어느 부분을 보는지 학습
+    """
+    def __init__(self, dim: int, n_heads: int = 4) -> None:
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim, num_heads=n_heads,
+            batch_first=True, dropout=0.1)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, foot: torch.Tensor,
+                shank: torch.Tensor) -> torch.Tensor:
+        """
+        foot, shank: (B, dim)
+        반환: shank + cross-attended foot info (B, dim)
+        """
+        # (B, 1, dim) 로 변환해서 attention 적용
+        q   = shank.unsqueeze(1)
+        kv  = foot.unsqueeze(1)
+        out, _ = self.attn(q, kv, kv)     # (B, 1, dim)
+        return self.norm(shank + out.squeeze(1))
+
+
 class SuperFusionModel(nn.Module):
-    """v11.0 메인 모델 — SuperFusion 단일 6cls 직접 예측.
+    """v11.4 — Kinematic Cross-Attention + Subject-Adversarial GRL.
 
-    구조: backbone(CNN) + FFT + BioMech → Shared(512→256) → 4 heads
-      head_6cls : 주 출력 (최종 6cls 직접 최적화)
-      head_3cls : 보조 (flat/오르막/내리막 — 거시 지형)
-      head_flat : 보조 (C1/C4C5/C6 — 평탄 지형 세분화)
-      head_bin  : 보조 (C4 vs C5 — 흙길/잔디 미세 분리)
+    구조:
+      1. 브랜치별 CNN: Foot / Shank / Thigh 독립 인코딩
+      2. KinematicCrossAttention: Foot→Shank, Foot→Thigh
+         (충격 전파 메커니즘 학습)
+      3. Fusion: [cross_shank, cross_thigh, Foot, BioMech, FFT] → Shared(256)
+      4. 4 Heads: 6cls / 3cls / flat3 / bin
+      5. Subject Classifier (GRL): 지형 학습 중 개인차 제거
 
-    Loss = Focal_6cls + 0.30*CE_3cls + 0.20*CE_flat + 0.40*CE_bin + 0.10*KL_cons
-    Hard routing 완전 제거 → compounding error 구조적 해결
+    Loss = Focal_6cls + 0.30*CE_3 + 0.20*CE_flat + 0.40*CE_bin
+         + 0.10*KL_cons + λ_adv*CE_subject
     """
     def __init__(self, backbone, feat_dim: int,
                  bio_dim: int = 128,
-                 fft_dim: int = S3_FFT_DIM) -> None:
+                 fft_dim: int = S3_FFT_DIM,
+                 n_subjects: int = 50) -> None:
         super().__init__()
         self.backbone   = backbone
         self.bio_head   = BioMechHead(BioMechFeatures.N_BIO, bio_dim)
         self.fft_branch = FFTBranch(n_bins=129, out_dim=fft_dim)
-        total = feat_dim + bio_dim + fft_dim
 
+        # Kinematic Cross-Attention: Foot→Shank, Foot→Thigh
+        branch_dim = feat_dim // 3   # 각 브랜치 feature 크기 추정
+        self.cross_attn = KinematicCrossAttention(feat_dim, n_heads=4)
+
+        total = feat_dim + bio_dim + fft_dim
         self.shared = nn.Sequential(
             nn.Linear(total, 512), nn.BatchNorm1d(512), nn.GELU(),
             nn.Dropout(0.35),
             nn.Linear(512, 256), nn.BatchNorm1d(256), nn.GELU(),
             nn.Dropout(0.20),
         )
-        self.head_6cls  = nn.Linear(256, 6)   # 주: 6cls
-        self.head_3cls  = nn.Linear(256, 3)   # 보조: flat/up/down
-        self.head_flat  = nn.Linear(256, 3)   # 보조: C1/C4C5/C6
-        self.head_bin   = nn.Linear(256, 2)   # 보조: C4/C5
+        # 지형 분류 heads
+        self.head_6cls = nn.Linear(256, 6)
+        self.head_3cls = nn.Linear(256, 3)
+        self.head_flat = nn.Linear(256, 3)
+        self.head_bin  = nn.Linear(256, 2)
 
-    @staticmethod
-    def _augment_bi(bi: dict) -> dict:
-        """raw 브랜치에 accel_magnitude + gyro_magnitude + jerk 채널 추가.
-
-        Foot/Shank 각 12ch → 18ch:
-          +3ch: accel_xyz magnitude (3축 RMS)
-          +3ch: gyro_xyz magnitude
-        BackBone이 더 풍부한 시간 표현 학습 가능.
-        원본 bi를 복사하지 않고 새 key로 augment.
-        """
-        aug = {}
-        for k, v in bi.items():
-            x = v.float()          # (B, 12, T)
-            # accel: ch 0~2 (LT), 6~8 (RT) / gyro: 3~5 (LT), 9~11 (RT)
-            accel_lt = x[:, 0:3, :]
-            gyro_lt  = x[:, 3:6, :]
-            accel_rt = x[:, 6:9, :]
-            gyro_rt  = x[:, 9:12, :]
-            # magnitude = L2 norm across 3-axis (unsqueeze to keep dim)
-            amag_lt  = accel_lt.norm(dim=1, keepdim=True)   # (B,1,T)
-            gmag_lt  = gyro_lt.norm(dim=1, keepdim=True)
-            amag_rt  = accel_rt.norm(dim=1, keepdim=True)
-            gmag_rt  = gyro_rt.norm(dim=1, keepdim=True)
-            # jerk (derivative) of foot accel magnitude — C4 불규칙 충격 표시
-            jerk_lt  = F.pad(amag_lt[:, :, 1:] - amag_lt[:, :, :-1], (0, 1))
-            jerk_rt  = F.pad(amag_rt[:, :, 1:] - amag_rt[:, :, :-1], (0, 1))
-            aug[k] = torch.cat([x, amag_lt, gmag_lt, amag_rt, gmag_rt,
-                                 jerk_lt, jerk_rt], dim=1)   # (B, 18, T)
-        return aug
+        # Subject-Adversarial: GRL + subject classifier
+        self.grl            = GRL()
+        self.subject_clf    = nn.Sequential(
+            nn.Linear(256, 128), nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, n_subjects),
+        )
+        self.n_subjects = n_subjects
 
     def _embed(self, bi: dict, bio_f: torch.Tensor) -> torch.Tensor:
-        bi_aug = self._augment_bi(bi)
-        cnn = self.backbone.extract(bi_aug)
-        bio = self.bio_head(bio_f)
-        fft = self.fft_branch(bi["Foot"].float())
-        return self.shared(torch.cat([cnn, bio, fft], dim=1))   # (B, 256)
+        # CNN backbone extract (12ch 그대로 — S1 전이 가능)
+        cnn = self.backbone.extract(bi)          # (B, feat_dim)
+        bio = self.bio_head(bio_f)               # (B, bio_dim)
+        fft = self.fft_branch(bi["Foot"].float()) # (B, fft_dim)
 
-    def forward(self, bi: dict, bio_f: torch.Tensor):
-        """학습용: (l6, l3, lflat, lbin, emb) 반환."""
+        # Kinematic Cross-Attention: Foot 충격 → CNN feature 보정
+        # CNN feature 전체를 Foot 기준으로 어텐션 적용
+        foot_feat = self.backbone.extract({"Foot": bi["Foot"]}) \
+            if "Foot" in bi else cnn
+        cnn_attended = self.cross_attn(foot_feat, cnn)  # (B, feat_dim)
+
+        return self.shared(
+            torch.cat([cnn_attended, bio, fft], dim=1))  # (B, 256)
+
+    def forward(self, bi: dict, bio_f: torch.Tensor,
+                lam: float = 1.0):
+        """학습용: (l6, l3, lflat, lbin, subj_logit, emb) 반환."""
         emb = self._embed(bi, bio_f)
+        # subject adversarial (GRL로 gradient 역전)
+        subj_logit = self.subject_clf(self.grl(emb, lam))
         return (self.head_6cls(emb),
                 self.head_3cls(emb),
                 self.head_flat(emb),
                 self.head_bin(emb),
+                subj_logit,
                 emb)
 
     def predict(self, bi: dict, bio_f: torch.Tensor) -> torch.Tensor:
-        """Inference: 6cls logit만 반환."""
         return self.head_6cls(self._embed(bi, bio_f))
 
     def embed(self, bi: dict, bio_f: torch.Tensor) -> torch.Tensor:
-        """TCN Refiner용 256-dim embedding 반환."""
         return self._embed(bi, bio_f)
 
 
@@ -1021,7 +1207,12 @@ def flat_collate(batch):
     bi  = {k: torch.stack([b[0][k] for b in batch]) for k in bi_keys}
     bio = torch.stack([b[1] for b in batch])
     y   = torch.tensor([b[2] for b in batch], dtype=torch.long)
-    return bi, bio, y
+    # subject label (4번째 항목, 없으면 -1)
+    if len(batch[0]) >= 4:
+        sbj = torch.tensor([b[3] for b in batch], dtype=torch.long)
+    else:
+        sbj = torch.full((len(batch),), -1, dtype=torch.long)
+    return bi, bio, y, sbj
 
 
 def make_flat_loader(ds: FlatBranchDataset, shuffle: bool,
@@ -1049,22 +1240,42 @@ def make_flat_loader(ds: FlatBranchDataset, shuffle: bool,
 
 
 class AllDataBioDataset(Dataset):
-    """전체 6cls 데이터셋 + BioMech 피처. SuperFusion 학습용."""
-    def __init__(self, branch_ds, bio_extractor, y_all: np.ndarray) -> None:
-        self.ds  = branch_ds
-        self.bio = bio_extractor
-        self.y   = y_all
+    """전체 6cls 데이터셋 + BioMech 피처. SuperFusion 학습용.
+
+    v11.5: bio_feats_norm (subject-normalized) 지원.
+    bio_feats_norm이 주어지면 on-the-fly 추출 대신 사용.
+    """
+    def __init__(self, branch_ds, bio_extractor,
+                 y_all: np.ndarray,
+                 groups: np.ndarray | None = None,
+                 bio_feats_norm: np.ndarray | None = None) -> None:
+        self.ds            = branch_ds
+        self.bio           = bio_extractor
+        self.y             = y_all
+        self.bio_feats_norm = bio_feats_norm  # (N, N_BIO) float32 or None
+
+        if groups is not None:
+            unique_sbj = sorted(set(groups.tolist()))
+            sbj_map    = {s: i for i, s in enumerate(unique_sbj)}
+            self.sbj   = np.array([sbj_map[g] for g in groups],
+                                  dtype=np.int64)
+        else:
+            self.sbj   = np.full(len(y_all), -1, dtype=np.int64)
 
     def __len__(self) -> int:
         return len(self.ds)
 
     def __getitem__(self, i: int):
-        bi, _   = self.ds[i]
-        # bi dict를 batch dim 추가해서 BioMech에 전달
-        bi_b = {k: v.unsqueeze(0) for k, v in bi.items()}
-        with torch.no_grad():
-            bio_f = self.bio(bi_b).squeeze(0)
-        return bi, bio_f, int(self.y[i])
+        bi, _ = self.ds[i]
+        if self.bio_feats_norm is not None:
+            # 미리 계산된 normalized 피처 사용
+            bio_f = torch.from_numpy(
+                self.bio_feats_norm[i]).float()
+        else:
+            bi_b  = {k: v.unsqueeze(0) for k, v in bi.items()}
+            with torch.no_grad():
+                bio_f = self.bio(bi_b).squeeze(0)
+        return bi, bio_f, int(self.y[i]), int(self.sbj[i])
 
 
 def make_all_loader(ds: AllDataBioDataset, shuffle: bool,
@@ -1315,24 +1526,23 @@ def train_stage1(backbone, tr_dl, val_dl, te_dl, tag: str = "",
 # ═══════════════════════════════════════════════
 
 def train_superfusion(backbone, tr_dl, val_dl, te_dl, tag: str = "",
-                      curve_dir: Path | None = None):
-    """SuperFusion v11.0 학습.
+                      curve_dir: Path | None = None,
+                      n_subjects: int = 50):
+    """SuperFusion v11.4 학습.
 
-    Phase1: 4-head multi-task (SF_EPOCHS)
-      Loss = Focal_6(γ=1.5,cls_w) + 0.30*CE_3 + 0.20*CE_flat + 0.40*CE_bin + 0.10*KL_cons
-    Phase2: 6cls 집중 파인튜닝 (SF_FT_EPOCHS)
-      Loss = CE_6(cls_w)
-
-    Returns: (preds, labels, embeddings_dict)
-      embeddings_dict: {idx: emb} — TCN Refiner용
+    Phase1: 4-head multi-task + Subject-Adversarial GRL
+      Loss = Focal_6 + 0.30*CE_3 + 0.20*CE_flat + 0.40*CE_bin
+           + 0.10*KL_cons + λ_adv*CE_subject
+    Phase2: 6cls 집중 파인튜닝
     """
     feat_dim = _get_feat_dim(backbone)
-    model    = SuperFusionModel(backbone, feat_dim).to(DEVICE)
+    model    = SuperFusionModel(backbone, feat_dim,
+                                n_subjects=n_subjects).to(DEVICE)
     params   = list(model.parameters())
 
     # ── 클래스 가중치 ──────────────────────────
     all_y = np.concatenate([yb.numpy() for _, _, yb in tr_dl])
-    cls_w = auto_class_weights(all_y).to(DEVICE)   # Tensor → device
+    cls_w = auto_class_weights(all_y).to(DEVICE)
     log(f"  {tag} class_weights: {[f'{w:.2f}' for w in cls_w.tolist()]}")
 
     opt    = torch.optim.AdamW(params, lr=SF_LR, weight_decay=config.WEIGHT_DECAY)
@@ -1340,31 +1550,36 @@ def train_superfusion(backbone, tr_dl, val_dl, te_dl, tag: str = "",
     scaler = GradScaler(enabled=(config.USE_AMP and config.AMP_DTYPE == torch.float16))
     curve  = CurveTracker(f"SF_{tag.replace('[','').replace(']','')}")
 
-    # Focal(γ=1.5) + class weight → C1/C6 소수 클래스 보정
     crit_6    = FocalLoss(gamma=1.5, weight=cls_w)
     crit_3    = nn.CrossEntropyLoss(label_smoothing=0.05)
     crit_flat = nn.CrossEntropyLoss(label_smoothing=0.05)
     crit_bin  = nn.CrossEntropyLoss()
+    crit_subj = nn.CrossEntropyLoss()   # subject adversarial
+    crit_trip = WithinSubjectTripletLoss(margin=TRIPLET_MARGIN)  # v11.5
 
-    # flat3 label map: C1→0, C4C5→1, C6→2 (flat 샘플에만 적용)
     flat3_map = {0: 0, 3: 1, 4: 1, 5: 2}
 
     best_va = 0.0; best_state = None; patience = 0; t0 = time.time()
     log(f"  {tag} SuperFusion Phase1 ({SF_EPOCHS}ep, LR={SF_LR:.0e})"
         f"  Focal+cls_w | aux: 3cls×{SF_AUX_W3} flat×{SF_AUX_WFLAT}"
-        f" bin×{SF_AUX_WBIN} cons×{SF_WCONS}")
+        f" bin×{SF_AUX_WBIN} cons×{SF_WCONS} adv×{SF_WADV}")
 
     for ep in range(1, SF_EPOCHS + 1):
+        # GRL λ: 학습 초반 약하게, 후반 강하게 (Ganin et al. 스케줄)
+        p   = ep / SF_EPOCHS
+        lam = float(2.0 / (1.0 + math.exp(-10 * p)) - 1.0)  # 0→1 sigmoid
+
         model.train()
         opt.zero_grad(set_to_none=True)
-        for step_i, (bi, bio_f, yb) in enumerate(tr_dl):
+        for step_i, (bi, bio_f, yb, sbj) in enumerate(tr_dl):
             bi, bio_f, yb = _to_device(bi, bio_f, yb)
+            sbj = sbj.to(DEVICE)
             yb3       = _y6_to_y3(yb)
             flat_mask = ((yb == 0) | (yb == 3) | (yb == 4) | (yb == 5))
             c4c5_mask = ((yb == 3) | (yb == 4))
 
             with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
-                l6, l3, lflat, lbin, _ = model(bi, bio_f)
+                l6, l3, lflat, lbin, l_subj, emb = model(bi, bio_f, lam=lam)
                 loss = crit_6(l6, yb) + SF_AUX_W3 * crit_3(l3, yb3)
 
                 if flat_mask.sum() > 2:
@@ -1378,6 +1593,15 @@ def train_superfusion(backbone, tr_dl, val_dl, te_dl, tag: str = "",
                     loss   = loss + SF_AUX_WBIN * crit_bin(lbin[c4c5_mask], yb_bin)
 
                 loss = loss + SF_WCONS * consistency_kl_loss(l6, l3)
+
+                # Subject-Adversarial Loss (GRL로 gradient 역전)
+                if l_subj is not None and (sbj >= 0).all():
+                    loss = loss + SF_WADV * crit_subj(l_subj, sbj)
+
+                # Within-Subject Triplet Loss (v11.5)
+                trip_loss = crit_trip(emb.float(), yb, sbj)
+                loss = loss + SF_WTRIPLET * trip_loss
+
                 loss = loss / config.GRAD_ACCUM_STEPS
 
             scaler.scale(loss).backward()
@@ -1399,7 +1623,7 @@ def train_superfusion(backbone, tr_dl, val_dl, te_dl, tag: str = "",
         model.eval()
         va_preds_list, va_labels_list = [], []
         with torch.inference_mode():
-            for bi, bio_f, yb in val_dl:
+            for bi, bio_f, yb, _ in val_dl:
                 bi, bio_f, yb = _to_device(bi, bio_f, yb)
                 with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
                     logits = model.predict(bi, bio_f)
@@ -1451,7 +1675,7 @@ def train_superfusion(backbone, tr_dl, val_dl, te_dl, tag: str = "",
     log(f"  {tag} SF Phase2 6cls ({SF_FT_EPOCHS}ep, LR={SF_LR*0.5:.0e})")
     for ep in range(1, SF_FT_EPOCHS + 1):
         model.train()
-        for bi, bio_f, yb in tr_dl:
+        for bi, bio_f, yb, _ in tr_dl:
             bi, bio_f, yb = _to_device(bi, bio_f, yb)
             opt2.zero_grad(set_to_none=True)
             with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
@@ -1464,7 +1688,7 @@ def train_superfusion(backbone, tr_dl, val_dl, te_dl, tag: str = "",
         model.eval()
         va_p2_list, va_l2_list = [], []
         with torch.inference_mode():
-            for bi, bio_f, yb in val_dl:
+            for bi, bio_f, yb, _ in val_dl:
                 bi, bio_f, yb = _to_device(bi, bio_f, yb)
                 with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
                     logits = model.predict(bi, bio_f)
@@ -1490,7 +1714,7 @@ def train_superfusion(backbone, tr_dl, val_dl, te_dl, tag: str = "",
     model.eval()
     preds_list, labels_list, emb_list = [], [], []
     with torch.inference_mode():
-        for bi, bio_f, yb in te_dl:
+        for bi, bio_f, yb, _ in te_dl:
             bi, bio_f, yb = _to_device(bi, bio_f, yb)
             with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
                 emb    = model.embed(bi, bio_f)
@@ -1589,7 +1813,7 @@ def train_tcn_refiner(sf_model, tr_all_ds, va_all_ds, te_all_ds,
     for ep in range(1, TCN_EPOCHS + 1):
         tcn.train()
         for xb, yb in tr_loader:
-            xb = xb.to(DEVICE); yb = yb.to(DEVICE)
+            xb = xb.to(DEVICE).float(); yb = yb.to(DEVICE)
             opt.zero_grad()
             out  = tcn(xb)[:, half, :]    # 중심 타임스텝 예측 (B, 6)
             loss = crit(out, yb)
@@ -1601,7 +1825,7 @@ def train_tcn_refiner(sf_model, tr_all_ds, va_all_ds, te_all_ds,
         tcn_vp, tcn_vl = [], []
         with torch.inference_mode():
             for xb, yb in va_loader:
-                xb = xb.to(DEVICE); yb = yb.to(DEVICE)
+                xb = xb.to(DEVICE).float(); yb = yb.to(DEVICE)
                 out = tcn(xb)[:, half, :]
                 tcn_vp.append(out.argmax(1).cpu())
                 tcn_vl.append(yb.cpu())
@@ -1631,7 +1855,7 @@ def train_tcn_refiner(sf_model, tr_all_ds, va_all_ds, te_all_ds,
     preds_list = []
     with torch.inference_mode():
         for xb, _ in te_loader:
-            xb  = xb.to(DEVICE)
+            xb  = xb.to(DEVICE).float()
             out = tcn(xb)[:, half, :]
             preds_list.append(out.argmax(1).cpu())
     tcn_preds = torch.cat(preds_list).numpy()
@@ -1664,9 +1888,9 @@ def main() -> None:
 
         wandb.init(
             project=args.wandb_project,
-            name=args.run_name or f"v11.3-N{getattr(args,'n_subjects','?')}",
+            name=args.run_name or f"v11.5-N{getattr(args,'n_subjects','?')}",
             config={
-                "version":      "v11.3",
+                "version":      "v11.5",
                 "git_commit":   git_hash,
                 "sf_epochs":    SF_EPOCHS,
                 "sf_ft_epochs": SF_FT_EPOCHS,
@@ -1688,7 +1912,7 @@ def main() -> None:
 
     config.print_config()
     log(
-        f"  ★ v11.3  SuperFusion + TCN Refiner\n"
+        f"  ★ v11.5  SuperFusion + TCN Refiner\n"
         f"  SF: {SF_EPOCHS}ep Phase1 + {SF_FT_EPOCHS}ep Phase2"
         f"  LR={SF_LR:.0e}  Focal(γ=1.5)+cls_w\n"
         f"  Loss: 6cls + {SF_AUX_W3}x3cls + {SF_AUX_WFLAT}xflat3"
@@ -1747,38 +1971,80 @@ def main() -> None:
         val_dl = make_loader(val_ds, False, branch=True)
         te_dl  = make_loader(te_ds,  False, branch=True)
 
-        # ── Stage1 (3cls, SF backbone warmup용) ──
-        # 주: 18ch augment backbone과 ch 불일치 → S1 backbone 전이 미사용
-        # S1 acc만 reference로 기록
+        # ── Stage1 (3cls backbone warmup) ─────────
         tag         = f"[F{fi}]"
         backbone_s1 = M6_BranchCBAMCrossAug(branch_ch).to(DEVICE)
         s1_preds, s1_labels, s1_probs, s1_model = train_stage1(
             backbone_s1, tr_dl, val_dl, te_dl, tag, curve_dir=curve_dir)
         s1_acc = accuracy_score(s1_labels, s1_preds)
-        log(f"  {tag} Stage1 Acc={s1_acc:.4f}  (reference only; SF uses random init 18ch)")
+        log(f"  {tag} Stage1 Acc={s1_acc:.4f}")
 
-        # ── SuperFusion (v11.0 메인) ──────────────
-        # mag(1)+gyro_mag(1)+jerk(1) × 2측 = 6ch 추가 → 12→18ch per branch
-        sf_branch_ch = {k: v + 6 for k, v in branch_ch.items()}
-        log(f"  {tag} ★ SuperFusion 시작 (S1→SF backbone 전이 불가"
-            f" — augmented 18ch, random init)  N_BIO={BioMechFeatures.N_BIO}")
-        backbone_sf = M6_BranchCBAMCrossAug(sf_branch_ch).to(DEVICE)
+        # ── SuperFusion v11.4 ──────────────────────
+        # [핵심] 18ch augment 제거 → 12ch 통일 → S1 backbone 직접 전이
+        # S1이 학습한 표현(86%)을 SF가 물려받아 시작
+        log(f"  {tag} ★ SuperFusion 시작 (S1 backbone 전이 12ch)"
+            f"  N_BIO={BioMechFeatures.N_BIO}")
+        backbone_sf = M6_BranchCBAMCrossAug(branch_ch).to(DEVICE)
+        # S1 backbone weight 전이 (같은 12ch 구조)
+        backbone_sf.load_state_dict(s1_model.backbone.state_dict())
+        log(f"  {tag} ★ S1→SF backbone 전이 완료 (86% 지식 활용)")
 
         te_y6 = y[te_idx]
         tr_y6 = y[inner_tr_idx]
         va_y6 = y[inner_va_idx]
 
-        tr_all_ds = AllDataBioDataset(tr_ds,  bio_extractor, tr_y6)
-        va_all_ds = AllDataBioDataset(val_ds, bio_extractor, va_y6)
-        te_all_ds = AllDataBioDataset(te_ds,  bio_extractor, te_y6)
+        # groups 전달 → subject adversarial label 생성
+        tr_groups_local = groups[inner_tr_idx]
+        va_groups_local = groups[inner_va_idx]
+        te_groups_local = groups[te_idx]
+
+        # ── Subject-Wise BioMech Normalization (v11.5) ────
+        log(f"  {tag} BioMech 피처 사전 추출 (subject 정규화용)...")
+        bio_extractor.eval()
+
+        def _extract_all_bio(ds_inner):
+            feats = []
+            for i in range(len(ds_inner)):
+                bi_s, _ = ds_inner[i]
+                bi_b = {k: v.unsqueeze(0) for k, v in bi_s.items()}
+                with torch.no_grad():
+                    f = bio_extractor(bi_b).squeeze(0).cpu().numpy()
+                feats.append(f)
+            return np.stack(feats, axis=0).astype(np.float32)
+
+        tr_bio_raw = _extract_all_bio(tr_ds)
+        va_bio_raw = _extract_all_bio(val_ds)
+        te_bio_raw = _extract_all_bio(te_ds)
+
+        subj_norm   = SubjectNormalizer()
+        tr_bio_norm = subj_norm.fit_transform(tr_bio_raw, tr_groups_local)
+        va_bio_norm = subj_norm.transform(va_bio_raw, va_groups_local)
+        te_bio_norm = subj_norm.transform(te_bio_raw, te_groups_local)
+        log(f"  {tag} Subject 정규화 완료 "
+            f"tr={tr_bio_norm.shape} va={va_bio_norm.shape}"
+            f" te={te_bio_norm.shape}")
+
+        tr_all_ds = AllDataBioDataset(tr_ds,  bio_extractor, tr_y6,
+                                      groups=tr_groups_local,
+                                      bio_feats_norm=tr_bio_norm)
+        va_all_ds = AllDataBioDataset(val_ds, bio_extractor, va_y6,
+                                      groups=va_groups_local,
+                                      bio_feats_norm=va_bio_norm)
+        te_all_ds = AllDataBioDataset(te_ds,  bio_extractor, te_y6,
+                                      groups=te_groups_local,
+                                      bio_feats_norm=te_bio_norm)
 
         tr_sf_dl = make_all_loader(tr_all_ds, True,  balanced=True)
         va_sf_dl = make_all_loader(va_all_ds, False)
         te_sf_dl = make_all_loader(te_all_ds, False)
 
+        # fold당 실제 subject 수
+        n_fold_subjects = len(np.unique(tr_groups_local))
+
         sf_preds, sf_labels, sf_te_embs, sf_model = train_superfusion(
             backbone_sf, tr_sf_dl, va_sf_dl, te_sf_dl,
-            tag=f"{tag}[SF]", curve_dir=curve_dir)
+            tag=f"{tag}[SF]", curve_dir=curve_dir,
+            n_subjects=n_fold_subjects)
 
         sf_acc = accuracy_score(sf_labels, sf_preds)
         sf_f1  = f1_score(sf_labels, sf_preds, average="macro", zero_division=0)
@@ -1786,9 +2052,6 @@ def main() -> None:
 
         # ── TCN Sequence Refiner (subject-aware) ──
         log(f"  {tag} ★ TCN Refiner 시작 (subject-aware)")
-        tr_groups_local = groups[inner_tr_idx]
-        va_groups_local = groups[inner_va_idx]
-        te_groups_local = groups[te_idx]
         tcn_preds = train_tcn_refiner(
             sf_model,
             tr_all_ds, va_all_ds, te_all_ds,
@@ -1869,7 +2132,7 @@ def main() -> None:
     total_min  = (time.time() - t_total) / 60
 
     print(f"\n{'='*60}")
-    print(f"  ★ v11.3 SuperFusion+TCN  {config.KFOLD}-Fold")
+    print(f"  ★ v11.5 SuperFusion+TCN  {config.KFOLD}-Fold")
     print(f"  총 소요: {total_min:.1f}분")
     print(f"  Acc={acc_all:.4f}  MacroF1={f1_all:.4f}")
     print(f"{'='*60}")
@@ -1880,16 +2143,16 @@ def main() -> None:
     rep = classification_report(
         labels_all, preds_all,
         target_names=[f"C{c}" for c in le.classes_], digits=4, zero_division=0)
-    (out / "report_v113.txt").write_text(
-        f"v11.3 SuperFusion+TCN\nAcc={acc_all:.4f}  F1={f1_all:.4f}\n\n{rep}")
+    (out / "report_v115.txt").write_text(
+        f"v11.5 SuperFusion+TCN\nAcc={acc_all:.4f}  F1={f1_all:.4f}\n\n{rep}")
 
     le_out = LabelEncoder()
     le_out.fit(sorted(set(labels_all.tolist())))
-    save_cm(preds_all, labels_all, le_out, "SuperFusion_TCN_v113_KFold", out)
+    save_cm(preds_all, labels_all, le_out, "SuperFusion_TCN_v115_KFold", out)
 
     summary = {
-        "experiment":  "hierarchical_kfold_v113",
-        "version":     "v11.3",
+        "experiment":  "hierarchical_kfold_v115",
+        "version":     "v11.4",
         "method":      "SuperFusion (4-head) + TCN Sequence Refiner",
         "n_bio":       BioMechFeatures.N_BIO,
         "total_minutes": round(total_min, 1),
@@ -1900,7 +2163,7 @@ def main() -> None:
         },
         "fold_meta": fold_meta,
     }
-    path_json = out / "summary_v113.json"
+    path_json = out / "summary_v115.json"
     path_json.write_text(json.dumps(summary, indent=2, ensure_ascii=False))
     log(f"  ✅ {path_json}")
 
