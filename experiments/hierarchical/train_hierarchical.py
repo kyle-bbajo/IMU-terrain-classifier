@@ -1043,8 +1043,8 @@ class SuperFusionModel(nn.Module):
         self.bio_head   = BioMechHead(BioMechFeatures.N_BIO, bio_dim)
         self.fft_branch = FFTBranch(n_bins=129, out_dim=fft_dim)
 
-        # Kinematic Cross-Attention: Foot→Shank, Foot→Thigh
-        branch_dim = feat_dim // 3   # 각 브랜치 feature 크기 추정
+        # Kinematic Cross-Attention: Foot→Shank 충격 전파
+        self.foot_proj  = nn.Linear(12, feat_dim)   # Foot 12ch → feat_dim
         self.cross_attn = KinematicCrossAttention(feat_dim, n_heads=4)
 
         total = feat_dim + bio_dim + fft_dim
@@ -1070,16 +1070,17 @@ class SuperFusionModel(nn.Module):
         self.n_subjects = n_subjects
 
     def _embed(self, bi: dict, bio_f: torch.Tensor) -> torch.Tensor:
-        # CNN backbone extract (12ch 그대로 — S1 전이 가능)
-        cnn = self.backbone.extract(bi)          # (B, feat_dim)
-        bio = self.bio_head(bio_f)               # (B, bio_dim)
+        # CNN backbone extract (12ch — S1 전이 가능)
+        cnn = self.backbone.extract(bi)           # (B, feat_dim)
+        bio = self.bio_head(bio_f)                # (B, bio_dim)
         fft = self.fft_branch(bi["Foot"].float()) # (B, fft_dim)
 
-        # Kinematic Cross-Attention: Foot 충격 → CNN feature 보정
-        # CNN feature 전체를 Foot 기준으로 어텐션 적용
-        foot_feat = self.backbone.extract({"Foot": bi["Foot"]}) \
-            if "Foot" in bi else cnn
-        cnn_attended = self.cross_attn(foot_feat, cnn)  # (B, feat_dim)
+        # Kinematic Cross-Attention:
+        # Foot 원시 신호의 temporal mean을 feat_dim으로 projection해서 사용
+        # backbone 재실행 없이 Foot 정보만 경량 추출
+        foot_raw  = bi["Foot"].float().mean(dim=-1)   # (B, 12)
+        foot_proj = self.foot_proj(foot_raw)           # (B, feat_dim)
+        cnn_attended = self.cross_attn(foot_proj, cnn) # (B, feat_dim)
 
         return self.shared(
             torch.cat([cnn_attended, bio, fft], dim=1))  # (B, 256)
