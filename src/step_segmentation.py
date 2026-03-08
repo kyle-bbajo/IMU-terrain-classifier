@@ -1,34 +1,19 @@
 """
-step_segmentation.py — 힐스트라이크 스텝 분할 (v9.4)
+step_segmentation.py — 힐스트라이크 스텝 분할 (v9.4-filewise)
 ═══════════════════════════════════════════════════════════════
-[v9.3 → v9.4 보완]
-  ① --force 조기 종료 기준      : new_records 대신 all_records 기준으로 통일
-  ② HDF5 step_definition 불일치 : --force 없이 append 시 중단 (정책 명문화)
-  ③ step_log 디버깅 정보 확장   : stride 파라미터·LT/RT 후보 수 추가 저장
-  ④ ScoredStep → NamedTuple     : 필드 명시로 가독성·유지보수성 향상
+아키텍처:
+    Pass 0 : 공통 채널 (기존 HDF5 있으면 재사용)
+    Pass 2 : 파일별 적응형 스텝 검출 → HDF5 추가
 
-[v9.2 → v9.3 보완]
-  - --force 시 tp_force_all=True
-  - step_log에 score 저장
-  - flat v7 HDF5 경고 분리
-  - step_definition loader 검증
-
-[v9.0–9.1 유지 사항]
-  - Pass 1 증분화 + _stable 기반 재추정
-  - Threshold 이상치 내성 (percentile 99, fallback 포함)
-  - LT/RT 시간순 품질 기반 병합
-  - step_log JSONL 스트리밍
-  - CSV 읽기 재시도 + **kwargs
-  - terrain_params _meta 버전 검증
+완전 파일 적응형 (v9.4-filewise):
+  - detect_steps()     : 이 파일 신호 통계만으로 피크·stride 기준 결정
+  - score_steps_by_side: 이 파일 raw_steps 간격으로 stride 파라미터 추정
+  - 증분 판정         : processed_files.json (파일 키 기반)
+  - terrain_params / Pass 1 완전 제거
 
 사용법:
-    python3 step_segmentation.py           # 증분 (신규만)
+    python3 step_segmentation.py           # 증분 (미처리 파일만)
     python3 step_segmentation.py --force   # 전체 재생성
-
-3-패스 아키텍처:
-    Pass 0 : 공통 채널 (기존 h5 있으면 재사용)
-    Pass 1 : 지면별 적응 파라미터 (신규/불안정 조건 → all_records 기준)
-    Pass 2 : 신규 피험자만 스텝 검출 → HDF5 추가
 ═══════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -57,11 +42,10 @@ from scipy.signal import find_peaks, resample, butter, filtfilt
 # 상수
 # ──────────────────────────────────────────────────────────────
 
-TERRAIN_PARAMS_VERSION = "v9.4"
-_STRIDE_STABLE_MIN = 20                 # 이 값 미만이면 불안정 → 다음 증분 재계산
-_SUPPORTED_H5_FORMATS = {               # ⑥ 호환 가능한 HDF5 포맷 버전
+SEGMENTATION_VERSION   = "v9.4-filewise-1"  # processed_files 버전 — 로직 변경 시 올림
+_SUPPORTED_H5_FORMATS = {
     "subject_group_v9",
-    "subject_group_v8",                 # v8 구조도 읽기는 허용 (하위 호환)
+    "subject_group_v8",
 }
 
 
@@ -202,40 +186,35 @@ def discover_csvs(data_dir: Path, n_subjects: int) -> list[dict]:
 
 def load_existing_h5_info(
     h5_path: Path,
-    allow_step_def_mismatch: bool = False,  # ② True면 step_definition 불일치도 append 허용
-) -> tuple[set[int], Optional[list[str]], int]:
-    """기존 HDF5에서 처리 완료된 피험자 ID와 채널 목록을 읽는다.
+) -> tuple[Optional[list[str]], int]:
+    """기존 HDF5에서 채널 목록과 총 스텝 수를 읽는다.
 
-    format attr 및 step_definition을 검증한다.
-    step_definition 불일치 시 allow_step_def_mismatch=False(기본)이면 예외 발생.
+    역할: 채널 일관성 검증 + step 수 집계 + format/step_definition 검증.
+    완료 파일 판정은 processed_files.json 에서 담당하므로 done_sids 반환 없음.
     """
     if not h5_path.exists():
-        return set(), None, 0
+        return None, 0
 
     try:
         with h5py.File(h5_path, "r") as f:
-            # ⑥ 포맷 버전 검증  (③ flat v7 / 비호환 메시지 분리)
             h5_format = f.attrs.get("format", "unknown")
             if h5_format == "unknown":
-                # format attr 없음 = flat v7 이전 구조 (하위 호환 읽기 허용)
                 log(
                     "  ℹ HDF5 format attr 없음: flat v7 이전 구조로 추정. "
                     "하위 호환으로 읽지만 step_definition 의미가 다를 수 있습니다."
                 )
             elif h5_format not in _SUPPORTED_H5_FORMATS:
-                # 알 수 없는 포맷 → 진짜 비호환
                 log(
                     f"  ⚠ HDF5 포맷 비호환: '{h5_format}' "
                     f"(지원={_SUPPORTED_H5_FORMATS}). 데이터 구조가 다를 수 있습니다."
                 )
             elif h5_format == "subject_group_v8":
                 log(
-                    "  ⚠ HDF5 포맷 v8 감지: v9.0+ 에서 step_definition이 "
-                    "'bilateral_merged_quality_based'로 변경되었습니다. "
-                    "이전 실험과 직접 비교 불가."
+                    "  ⚠ HDF5 포맷 v8 감지: 구조 확인용 읽기만 허용됩니다. "
+                    "step_definition이 현재 버전과 다르면 append는 차단되므로 "
+                    "--force로 전체 재생성을 권장합니다."
                 )
 
-            # ④ step_definition 검증 (v9.x 내부 의미 차이 경고 + append 차단)
             step_def = f.attrs.get("step_definition", "")
             if step_def and step_def != "bilateral_merged_quality_based_per_side":
                 log(
@@ -243,32 +222,26 @@ def load_existing_h5_info(
                     f"(현재 버전은 'bilateral_merged_quality_based_per_side'). "
                     f"병합 로직이 다른 버전으로 생성된 데이터입니다."
                 )
-                # ② --force 없이 다른 의미의 데이터셋에 append하는 것을 차단
-                if not allow_step_def_mismatch:
-                    raise ValueError(
-                        f"step_definition 불일치 (저장='{step_def}'). "
-                        f"--force 로 전체 재생성하거나 기존 HDF5를 백업 후 삭제하세요."
-                    )
+                raise ValueError(
+                    f"step_definition 불일치 (저장='{step_def}'). "
+                    f"--force 로 전체 재생성하거나 기존 HDF5를 백업 후 삭제하세요."
+                )
 
             if "subjects" in f and "channels" in f:
-                done_sids: set[int] = set()
-                n_existing = 0
-                for skey in f["subjects"]:
-                    sid = int(skey[1:])
-                    done_sids.add(sid)
-                    n_existing += f[f"subjects/{skey}/X"].shape[0]
+                n_existing = sum(
+                    f[f"subjects/{sk}/X"].shape[0] for sk in f["subjects"]
+                )
                 channels = [
                     c.decode() if isinstance(c, bytes) else c
                     for c in f["channels"][:]
                 ]
-                return done_sids, channels, n_existing
+                return channels, n_existing
 
             for key in ("X", "y", "subject_id", "channels"):
                 if key not in f:
                     log(f"  ⚠ 기존 HDF5에 '{key}' 없음, 처음부터 생성")
-                    return set(), None, 0
+                    return None, 0
 
-            # flat v7 구조가 확인됨 → v9 group 방식으로 append하면 구조가 섞임
             raise ValueError(
                 "flat v7 HDF5가 감지되었습니다. "
                 "v9 group 구조와 혼용하면 파일이 손상됩니다. "
@@ -276,10 +249,62 @@ def load_existing_h5_info(
             )
 
     except ValueError:
-        raise   # step_definition 불일치 등 정책 위반은 호출자에게 전파
+        raise
     except Exception as e:
         log(f"  ⚠ 기존 HDF5 읽기 실패: {e}")
-        return set(), None, 0
+        return None, 0
+
+
+# ──────────────────────────────────────────────────────────────
+# 2b. 파일별 증분 처리 — processed_files.json
+# ──────────────────────────────────────────────────────────────
+
+def make_file_key(rec: dict) -> str:
+    """CSV 레코드를 고유 파일 키로 변환한다.
+
+    형식: S{sid:04d}|C{cond:02d}|T{trial:02d}|{filename}
+    동일 피험자의 동일 조건 동일 trial 이라도 파일명이 다르면 다른 키.
+    """
+    return f"S{rec['sid']:04d}|C{rec['cond']:02d}|T{rec['trial']:02d}|{rec['path'].name}"
+
+
+def load_processed_files(path: Path) -> tuple[set[str], str]:
+    """processed_files.json 에서 완료된 파일 키 집합을 읽는다.
+
+    Returns:
+        (files, status)  status ∈ {"valid", "invalid", "missing"}
+        "valid"   : 정상 로드
+        "missing" : 파일 없음 (첫 실행)
+        "invalid" : 버전 불일치 또는 파싱 실패
+    """
+    if not path.exists():
+        return set(), "missing"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        version = raw.get("version", "unknown")
+        if version != SEGMENTATION_VERSION:
+            log(
+                f"  ⚠ processed_files 버전 불일치 "
+                f"(저장={version}, 현재={SEGMENTATION_VERSION}) "
+                f"→ 기존 처리 이력 무효"
+            )
+            return set(), "invalid"
+        return set(raw.get("files", [])), "valid"
+    except Exception as e:
+        log(f"  ⚠ processed_files 로드 실패: {e}")
+        return set(), "invalid"
+
+
+def save_processed_files(path: Path, files: set[str]) -> None:
+    """완료된 파일 키 집합을 processed_files.json 에 저장한다."""
+    payload = {
+        "version": SEGMENTATION_VERSION,
+        "files": sorted(files),
+    }
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 # ──────────────────────────────────────────────────────────────
@@ -435,271 +460,30 @@ def bandpass_filter(
 
 
 # ──────────────────────────────────────────────────────────────
-# 5. Pass 1: 지면별 통계 수집 (증분 + 안정성 보장)
-# ──────────────────────────────────────────────────────────────
-
-def load_existing_terrain_params(
-    params_path: Path,
-) -> tuple[dict[int, dict], bool]:
-    """기존 terrain_params.json을 로드하고 버전·sample_rate 를 검증한다.
-
-    Returns:
-        (params_dict, is_valid)
-        is_valid=False 이면 호출자가 전체 재계산을 수행해야 한다.
-    """
-    if not params_path.exists():
-        return {}, True
-
-    try:
-        raw = json.loads(params_path.read_text(encoding="utf-8"))
-    except Exception as e:
-        log(f"  ⚠ terrain_params.json 파싱 실패: {e}")
-        return {}, False
-
-    meta = raw.get("_meta", {})
-    stored_version = meta.get("version", "unknown")
-    stored_sr = meta.get("sample_rate", None)
-
-    if stored_version != TERRAIN_PARAMS_VERSION:
-        log(
-            f"  ⚠ terrain_params 버전 불일치 "
-            f"(저장={stored_version}, 현재={TERRAIN_PARAMS_VERSION}) → 전체 재계산"
-        )
-        return {}, False
-
-    if stored_sr is not None and stored_sr != config.SAMPLE_RATE:
-        log(
-            f"  ⚠ terrain_params sample_rate 불일치 "
-            f"(저장={stored_sr}, 현재={config.SAMPLE_RATE}) → 전체 재계산"
-        )
-        return {}, False
-
-    params = {int(k): v for k, v in raw.items() if k != "_meta"}
-    return params, True
-
-
-def _compute_params_for_conditions(
-    records: list[dict],
-    conds_to_collect: set[int],
-) -> dict[int, dict]:
-    """지정된 조건들에 대해 terrain 통계를 수집하고 파라미터를 반환한다."""
-    terrain_stats: dict[int, dict[str, list]] = defaultdict(
-        lambda: {"means": [], "stds": [], "peak_heights": [], "stride_intervals": []}
-    )
-    target_records = [r for r in records if r["cond"] in conds_to_collect]
-
-    for i, rec in enumerate(target_records):
-        try:
-            df = read_csv_with_retry(rec["path"])
-            df = rename_columns(df)
-        except Exception as e:
-            log(f"    ⚠ CSV 읽기 실패: {rec['path'].name} ({e})")
-            continue
-
-        cond = rec["cond"]
-        for side in ["LT", "RT"]:
-            try:
-                ml_gyro = extract_ml_gyro(df, side)
-                ap_accel = extract_ap_accel(df, side)
-
-                if ml_gyro is None or ap_accel is None:
-                    norm = compute_foot_acc_norm(df, side)
-                    sig = bandpass_filter(norm)
-                    use_gyro_minima = False
-                else:
-                    sig = bandpass_filter(ml_gyro)
-                    use_gyro_minima = True
-
-                nan_mask = np.isnan(sig)
-                n_valid = int(np.sum(~nan_mask))
-                if n_valid < config.HS_MIN_STRIDE_SAM * 2:
-                    continue
-
-                if nan_mask.any():
-                    x = np.arange(len(sig))
-                    sig = sig.copy()
-                    sig[nan_mask] = np.interp(x[nan_mask], x[~nan_mask], sig[~nan_mask])
-
-                mu = float(np.mean(sig))
-                std = float(np.std(sig))
-                terrain_stats[cond]["means"].append(mu)
-                terrain_stats[cond]["stds"].append(std)
-
-                if use_gyro_minima:
-                    peaks, props = find_peaks(
-                        -sig, prominence=0.4 * std,
-                        distance=config.HS_MIN_STRIDE_SAM,
-                    )
-                    peak_values = props.get("prominences", [])
-                else:
-                    peaks, props = find_peaks(
-                        sig, height=mu + 0.5 * std,
-                        distance=config.HS_MIN_STRIDE_SAM,
-                    )
-                    peak_values = props.get("peak_heights", [])
-
-                if len(peaks) > 0 and len(peak_values) > 0:
-                    terrain_stats[cond]["peak_heights"].extend(
-                        np.asarray(peak_values).tolist()
-                    )
-                if len(peaks) > 1:
-                    terrain_stats[cond]["stride_intervals"].extend(
-                        np.diff(peaks).tolist()
-                    )
-
-            except (KeyError, ValueError):
-                continue
-
-        del df
-        gc.collect()
-
-        if (i + 1) % 50 == 0:
-            log(f"    Pass 1: {i+1}/{len(target_records)} 파일")
-
-    result: dict[int, dict] = {}
-    for cond in sorted(conds_to_collect):
-        s = terrain_stats[cond]
-        if not s["means"]:
-            result[cond] = {
-                "alpha": 1.0,
-                "min_dist": config.HS_MIN_STRIDE_SAM,
-                "min_peak_ratio": config.HS_PEAK_QUALITY_RATIO,
-                "stride_min_sam": config.HS_MIN_STRIDE_SAM,
-                "stride_max_sam": config.HS_MAX_STRIDE_SAM,
-                "stride_mean_ms": 0.0,
-                "stride_std_ms": 0.0,
-                "stride_n_samples": 0,
-                "_stable": False,
-            }
-            continue
-
-        avg_mean = float(np.mean(s["means"]))
-        avg_std = float(np.mean(s["stds"]))
-        avg_peak = (
-            float(np.mean(s["peak_heights"])) if s["peak_heights"] else avg_mean + avg_std
-        )
-        snr = (avg_peak - avg_mean) / avg_std if avg_std > 0 else 0.0
-        alpha = max(0.5, min(2.0, snr * 0.5))
-
-        n_stride = len(s["stride_intervals"])
-        is_stable = n_stride >= _STRIDE_STABLE_MIN
-
-        if is_stable:
-            si = np.array(s["stride_intervals"])
-            stride_min = max(40, int(np.percentile(si, 2) * 0.9))
-            stride_max = int(np.percentile(si, 98) * 1.1)
-            stride_mean = float(np.mean(si))
-            stride_std = float(np.std(si))
-        else:
-            stride_min = config.HS_MIN_STRIDE_SAM
-            stride_max = config.HS_MAX_STRIDE_SAM
-            stride_mean = 0.0
-            stride_std = 0.0
-            log(
-                f"    ⚠ C{cond}: stride 샘플 부족 ({n_stride}개 < {_STRIDE_STABLE_MIN}), "
-                f"기본값 사용. 다음 증분 시 재추정 예정"
-            )
-
-        result[cond] = {
-            "alpha": round(alpha, 3),
-            "min_dist": stride_min,
-            "min_peak_ratio": config.HS_PEAK_QUALITY_RATIO,
-            "stride_min_sam": stride_min,
-            "stride_max_sam": stride_max,
-            "stride_mean_ms": round(stride_mean / config.SAMPLE_RATE * 1000, 1),
-            "stride_std_ms": round(stride_std / config.SAMPLE_RATE * 1000, 1),
-            "stride_n_samples": n_stride,
-            "avg_mean": round(avg_mean, 1),
-            "avg_std": round(avg_std, 1),
-            "avg_peak": round(avg_peak, 1),
-            "_stable": is_stable,
-        }
-
-        log(
-            f"    C{cond}: α={alpha:.2f}  μ={avg_mean:.0f}"
-            f"  σ={avg_std:.0f}  peak={avg_peak:.0f}"
-            f"  stride={stride_min}~{stride_max}sam"
-            f" ({stride_min/config.SAMPLE_RATE*1000:.0f}~"
-            f"{stride_max/config.SAMPLE_RATE*1000:.0f}ms)"
-            f"  n={n_stride}  stable={'✅' if is_stable else '⚠'}"
-        )
-
-    return result
-
-
-def collect_terrain_stats(
-    all_records: list[dict],
-    new_records: list[dict],
-    existing_params: dict[int, dict],
-    force_all: bool = False,            # ② 전체 재계산 강제 플래그
-) -> dict[int, dict]:
-    """지면 조건별 파라미터를 수집/갱신한다.
-
-    Args:
-        all_records: 전체 CSV 레코드 목록
-        new_records: 신규 피험자 CSV 레코드 목록
-        existing_params: 기존 terrain_params
-        force_all: True이면 all_records의 전체 조건 재계산  ← ②
-
-    Returns:
-        전체 조건 → 파라미터 dict
-    """
-    # ② tp_valid=False 시 all_records 전체 조건 재계산
-    if force_all:
-        all_conds: set[int] = {r["cond"] for r in all_records}
-        log(
-            f"  [Pass 1] 전체 재계산 (terrain_params 무효화): "
-            f"조건 {sorted(all_conds)}, all_records {len(all_records)}개 기준"
-        )
-        return _compute_params_for_conditions(all_records, all_conds)
-
-    new_conds: set[int] = {r["cond"] for r in new_records}
-
-    # 재계산 대상: 신규 조건 or 기존이지만 _stable=False
-    conds_to_collect: set[int] = set()
-    for cond in new_conds:
-        existing = existing_params.get(cond)
-        if existing is None:
-            conds_to_collect.add(cond)
-        elif not existing.get("_stable", True):
-            conds_to_collect.add(cond)
-            log(f"  ⚠ C{cond}: 이전에 불안정 판정 → 전체 데이터로 재추정")
-
-    reuse_conds = set(existing_params.keys()) - conds_to_collect
-    if reuse_conds:
-        log(f"  [Pass 1] 재사용 조건: {sorted(reuse_conds)}")
-    if not conds_to_collect:
-        log("  [Pass 1] 모든 지면 조건 안정적 → 파라미터 수집 스킵")
-        return existing_params
-
-    log(
-        f"  [Pass 1] 재계산 조건: {sorted(conds_to_collect)} "
-        f"(all_records {len(all_records)}개 기준)"
-    )
-    new_params = _compute_params_for_conditions(all_records, conds_to_collect)
-    return {**existing_params, **new_params}
-
-
-# ──────────────────────────────────────────────────────────────
-# 6. 힐스트라이크 검출
+# 6. 힐스트라이크 검출 (완전 파일 적응형)
 # ──────────────────────────────────────────────────────────────
 
 def detect_steps(
     ml_gyro: np.ndarray,
     ap_accel: np.ndarray,
-    terrain_params: dict,
-    cond: int,
     fs: int = config.SAMPLE_RATE,
 ) -> list[tuple[int, int]]:
-    """ML Gyro + AP Accel 융합 힐스트라이크 검출."""
+    """ML Gyro + AP Accel 융합 힐스트라이크 검출 — 완전 파일 적응형.
+
+    모든 검출 기준(피크 높이·prominence·stride 범위)을
+    이 파일 신호 자체의 통계에서만 계산한다.
+    terrain_params / cond 에 의존하지 않는다.
+    """
     n = len(ml_gyro)
     if n < fs:
         return []
 
+    # ── NaN 비율 체크 ──
     nan_ratio = (np.isnan(ml_gyro).sum() + np.isnan(ap_accel).sum()) / (2 * n)
     if nan_ratio > config.HS_NAN_THRESHOLD:
         return []
 
+    # ── NaN 선형 보간 ──
     for sig in [ml_gyro, ap_accel]:
         mask = np.isnan(sig)
         if mask.any() and not mask.all():
@@ -709,71 +493,90 @@ def detect_steps(
     ml_f = bandpass_filter(ml_gyro, fs, low=1.0, high=20.0)
     ap_f = bandpass_filter(ap_accel, fs, low=1.0, high=20.0)
 
+    # ── 파일 신호 통계 ──
     sigma_ml = float(np.std(ml_f))
     if sigma_ml == 0:
         return []
+    mean_ap  = float(np.mean(ap_f))
+    sigma_ap = float(np.std(ap_f))
 
-    min_dist_sam = int(fs * 0.35)
+    # ── 최소 피크 간격: 이 파일 신호 IQR로 적응 추정 ──
+    # 초기 느슨한 거리로 후보 피크를 잡은 뒤, 그 간격 중앙값을 min_dist로 재설정
+    loose_dist = int(fs * 0.25)          # 250ms — 매우 빠른 보행도 커버
+    cand_raw, _ = find_peaks(-ml_f, prominence=0.2 * sigma_ml, distance=loose_dist)
+    if len(cand_raw) >= 4:
+        intervals_raw = np.diff(cand_raw).astype(float)
+        med_interval  = float(np.median(intervals_raw))
+        # 중앙값의 40% 이상은 항상 최소 거리로 허용 (너무 타이트하게 막지 않음)
+        min_dist_sam  = max(int(med_interval * 0.40), int(fs * 0.25))
+    else:
+        min_dist_sam  = int(fs * 0.35)   # 후보 부족 → 보수적 350ms
 
+    # ── Swing 피크 검출 (mid-swing: Gyro 양의 피크) ──
     mid_swings, _ = find_peaks(
         ml_f, prominence=0.3 * sigma_ml, distance=min_dist_sam,
     )
-
     if len(mid_swings) > 0:
         peak_ref = float(np.percentile(ml_f[mid_swings], 99))
     else:
         peak_ref = sigma_ml
     trusted_thresh = config.HS_TRUSTED_SWING * peak_ref
 
+    # ── 힐스트라이크 후보: Gyro 음의 피크 ──
     hs_cand, _ = find_peaks(
         -ml_f, prominence=config.HS_GYRO_PROMINENCE * sigma_ml, distance=min_dist_sam,
     )
     if len(hs_cand) < 2:
         return []
 
+    # ── Swing 인접성으로 신뢰도 필터 ──
     hs_trusted: list[int] = []
     for cand in hs_cand:
-        nearby_swings = [p for p in mid_swings if abs(p - cand) < fs // 2]
-        if nearby_swings:
-            nearest = min(nearby_swings, key=lambda p: abs(p - cand))
+        nearby = [p for p in mid_swings if abs(p - cand) < fs // 2]
+        if nearby:
+            nearest = min(nearby, key=lambda p: abs(p - cand))
             if ml_f[nearest] > trusted_thresh:
                 hs_trusted.append(cand)
         else:
-            w_start = max(0, cand - fs // 2)
-            w_end = min(n, cand + fs // 2)
-            local_ref = float(np.percentile(ml_f[w_start:w_end], 99))
-            if local_ref > trusted_thresh:
+            w_s = max(0, cand - fs // 2)
+            w_e = min(n, cand + fs // 2)
+            if float(np.percentile(ml_f[w_s:w_e], 99)) > trusted_thresh:
                 hs_trusted.append(cand)
 
     if len(hs_trusted) < 2:
         return []
 
-    mean_ap = float(np.mean(ap_f))
-    sigma_ap = float(np.std(ap_f))
+    # ── AP Accel 검증: 힐스트라이크 시 AP 가속도 음의 피크 확인 ──
     window = config.HS_FUSION_WINDOW_SAM
-
     hs_final: list[int] = []
     for cand in hs_trusted:
-        w_start = max(0, cand - window)
-        w_end = min(n, cand + window)
-        if np.min(ap_f[w_start:w_end]) < mean_ap - config.HS_ACCEL_THRESHOLD * sigma_ap:
+        w_s = max(0, cand - window)
+        w_e = min(n, cand + window)
+        if np.min(ap_f[w_s:w_e]) < mean_ap - config.HS_ACCEL_THRESHOLD * sigma_ap:
             hs_final.append(cand)
 
     if len(hs_final) < 2:
         return []
 
-    default_params = {
-        "stride_min_sam": config.HS_MIN_STRIDE_SAM,
-        "stride_max_sam": config.HS_MAX_STRIDE_SAM,
-    }
-    params = terrain_params.get(cond, default_params)
-    stride_min = params.get("stride_min_sam", config.HS_MIN_STRIDE_SAM)
-    stride_max = params.get("stride_max_sam", config.HS_MAX_STRIDE_SAM)
+    # ── 파일 적응형 stride 범위 ──
+    # 이 파일의 hs_final 간격 분포에서 직접 계산.
+    # 조건별 평균값을 쓰지 않으므로 보폭이 특이한 피험자도 처리됨.
+    file_intervals = np.diff(hs_final).astype(float)
+    if len(file_intervals) >= 4:
+        p5  = float(np.percentile(file_intervals, 5))
+        p95 = float(np.percentile(file_intervals, 95))
+        med = float(np.median(file_intervals))
+        stride_min = max(int(min(p5,  med * 0.50)), config.HS_MIN_STRIDE_SAM)
+        stride_max = min(int(max(p95, med * 1.50)), config.HS_MAX_STRIDE_SAM)
+    else:
+        stride_min = config.HS_MIN_STRIDE_SAM
+        stride_max = config.HS_MAX_STRIDE_SAM
 
+    # ── 유효 스텝 필터 ──
     valid_steps: list[tuple[int, int]] = []
     for i in range(len(hs_final) - 1):
         start = hs_final[i]
-        end = hs_final[i + 1]
+        end   = hs_final[i + 1]
         length = end - start
         if length < stride_min or length > stride_max:
             continue
@@ -782,6 +585,34 @@ def detect_steps(
         valid_steps.append((start, end))
 
     return valid_steps
+
+
+# ──────────────────────────────────────────────────────────────
+# 6b. 파일별 stride 파라미터 추정
+# ──────────────────────────────────────────────────────────────
+
+def estimate_stride_params_from_steps(
+    steps: list[tuple[int, int]],
+) -> tuple[float, float, float]:
+    """raw_steps 간격에서 이 파일의 stride 통계를 직접 추정한다.
+
+    Returns:
+        (stride_mean, stride_min, stride_max) — 단위: samples
+    """
+    if not steps:
+        return 0.0, float(config.HS_MIN_STRIDE_SAM), float(config.HS_MAX_STRIDE_SAM)
+
+    lengths = np.array([e - s for s, e in steps], dtype=float)
+    stride_mean = float(np.mean(lengths))
+
+    if len(lengths) >= 4:
+        stride_min = float(max(np.percentile(lengths, 5),  config.HS_MIN_STRIDE_SAM))
+        stride_max = float(min(np.percentile(lengths, 95), config.HS_MAX_STRIDE_SAM))
+    else:
+        stride_min = float(config.HS_MIN_STRIDE_SAM)
+        stride_max = float(config.HS_MAX_STRIDE_SAM)
+
+    return stride_mean, stride_min, stride_max
 
 
 # ──────────────────────────────────────────────────────────────
@@ -997,7 +828,7 @@ def main() -> None:
     force = args.force
 
     log(f"{'='*60}")
-    log(f"  step_segmentation.py v9.4 ({'전체 재생성' if force else '증분 모드'})")
+    log(f"  step_segmentation.py v9.4-filewise ({'전체 재생성' if force else '증분 모드'})")
     log(f"  N={config.N_SUBJECTS}  TS={config.TS}pt  {config.SAMPLE_RATE}Hz")
     log(f"{'='*60}\n")
 
@@ -1017,39 +848,37 @@ def main() -> None:
         log(f"    C{c}: {cond_count[c]}파일")
 
     t0 = time.time()
-    params_path = config.BATCH_DIR / "terrain_params.json"
+    processed_files_path = config.BATCH_DIR / "processed_files.json"
 
     if force:
-        done_sids: set[int] = set()
         existing_channels: Optional[list[str]] = None
         existing_n: int = 0
-        existing_terrain_params: dict[int, dict] = {}
-        tp_force_all = True             # ① --force면 Pass 1도 명시적 전체 재계산
-        log("  ★ --force: 기존 HDF5·terrain_params 무시, 전체 재생성")
+        done_files: set[str] = set()
+        log("  ★ --force: 기존 HDF5·processed_files 무시, 전체 재생성")
     else:
-        done_sids, existing_channels, existing_n = load_existing_h5_info(
-            config.H5_PATH  # ② else 분기이므로 force는 항상 False → 기본값으로 충분
-        )
-        existing_terrain_params, tp_valid = load_existing_terrain_params(params_path)
-        # ② tp_valid=False면 all_records 전체 조건 재계산 플래그
-        tp_force_all = not tp_valid
-        if tp_force_all:
-            existing_terrain_params = {}
-        if done_sids:
-            log(f"  ★ 기존 HDF5: {existing_n}스텝, {len(done_sids)}명 완료")
-            log(f"    완료: {sorted(done_sids)}")
-        if existing_terrain_params:
-            log(
-                f"  ★ 기존 terrain_params ({TERRAIN_PARAMS_VERSION}): "
-                f"{sorted(existing_terrain_params.keys())} 조건 재사용 후보"
-            )
+        existing_channels, existing_n = load_existing_h5_info(config.H5_PATH)
+        done_files, pf_status = load_processed_files(processed_files_path)
 
-    new_records = [r for r in all_records if r["sid"] not in done_sids]
+        if pf_status != "valid" and config.H5_PATH.exists():
+            log("  ⚠ processed_files가 무효하므로 기존 HDF5와 일관성을 보장할 수 없습니다.")
+            log("  ⚠ --force와 동일하게 전체 재생성 모드로 전환합니다.")
+            force = True
+            existing_channels = None
+            existing_n = 0
+            done_files = set()
+            log("  ★ 안전 모드 전환 완료: 이후 전체 재생성 경로로 진행합니다.")
+        elif pf_status == "valid":
+            if done_files:
+                log(f"  ★ 기존 processed_files: {len(done_files)}개 파일 완료")
+            if existing_n:
+                log(f"  ★ 기존 HDF5: {existing_n}스텝")
 
-    target_records = all_records if force else new_records  # 이후 모든 처리의 기준
+    new_records = [r for r in all_records if make_file_key(r) not in done_files]
+
+    target_records = all_records if force else new_records
 
     if not target_records:
-        log(f"\n  ✅ 모든 {len(done_sids)}명 처리 완료, 스텝 검출 스킵")
+        log(f"\n  ✅ 모든 {len(done_files)}개 파일 처리 완료, 스텝 검출 스킵")
         log(f"     기존 HDF5: {config.H5_PATH} ({existing_n}스텝)")
         return
 
@@ -1072,21 +901,6 @@ def main() -> None:
 
     n_ch = len(channels)
 
-    # Pass 1
-    terrain_params = collect_terrain_stats(
-        all_records, new_records, existing_terrain_params,
-        force_all=tp_force_all,
-    )
-
-    savable: dict = {
-        "_meta": {"version": TERRAIN_PARAMS_VERSION, "sample_rate": config.SAMPLE_RATE},
-        **{str(k): v for k, v in terrain_params.items()},
-    }
-    params_path.write_text(
-        json.dumps(savable, indent=2, default=str, ensure_ascii=False)
-    )
-    log(f"  지면 파라미터 → {params_path}  ({time.time()-t0:.1f}s)\n")
-
     log(f"  [Pass 2] {mode_text} {len(target_records)}개 CSV → 스텝 검출...")
     log(
         "  ⚠ 주의: v9.0부터 LT/RT 병합 적용 → 데이터셋 의미 변경 "
@@ -1099,15 +913,17 @@ def main() -> None:
     new_steps = 0
     raw_lens: list[int] = []
     log_path = config.BATCH_DIR / "step_log.jsonl"
+    processed_now: set[str] = set()  # 이번 실행에서 성공적으로 처리된 파일 키
 
     with StepLogWriter(log_path) as step_logger:
         for i, rec in enumerate(target_records):
+            file_key = make_file_key(rec)
             try:
                 df = read_csv_with_retry(rec["path"])
                 df = rename_columns(df)
             except Exception as e:
                 log(f"  ⚠ CSV 읽기 실패: {rec['path'].name} ({e})")
-                continue
+                continue  # 읽기 실패 → 완료 처리 안 함
 
             sid = rec["sid"]
             cond = rec["cond"]
@@ -1119,61 +935,86 @@ def main() -> None:
                 log(f"  ⚠ {rec['path'].name}: {len(missing)}개 채널 누락, 스킵")
                 del df
                 gc.collect()
-                continue
+                continue  # 채널 누락 → 완료 처리 안 함
 
             data_np = df[channels].values.astype(np.float32)
 
-            # terrain 파라미터 추출 (stride 정보 포함)
-            tp = terrain_params.get(cond, {})
-            stride_mean_sam = tp.get("stride_mean_ms", 0.0) / 1000.0 * config.SAMPLE_RATE
-            stride_min_sam = float(tp.get("stride_min_sam", config.HS_MIN_STRIDE_SAM))
-            stride_max_sam = float(tp.get("stride_max_sam", config.HS_MAX_STRIDE_SAM))
+            lt_raw_steps: list[tuple[int, int]] = []
+            rt_raw_steps: list[tuple[int, int]] = []
+            side_signals: dict[str, np.ndarray] = {}   # 검출에 실제 쓴 신호 보존
+            side_raw_counts: dict[str, int] = {"LT": 0, "RT": 0}
 
-            # ① side별 신호로 각각 점수화
-            lt_scored: list[ScoredStep] = []
-            rt_scored: list[ScoredStep] = []
-            side_raw_counts: dict[str, int] = {"LT": 0, "RT": 0}  # ③ 후보 수 추적
-
-            for side, scored_bucket in [("LT", lt_scored), ("RT", rt_scored)]:
+            for side, raw_bucket in [("LT", lt_raw_steps), ("RT", rt_raw_steps)]:
                 try:
                     ml_gyro = extract_ml_gyro(df, side)
                     ap_accel = extract_ap_accel(df, side)
 
                     if ml_gyro is None or ap_accel is None:
+                        # 폴백: 발 가속도 norm으로 파일 적응형 검출
                         norm = compute_foot_acc_norm(df, side)
                         norm_f = bandpass_filter(norm)
                         valid = norm_f[~np.isnan(norm_f)]
-                        sigma = float(np.std(valid)) if len(valid) > 0 else 1.0
-                        mu = float(np.mean(valid)) if len(valid) > 0 else 0.0
-                        peaks, _ = find_peaks(
-                            norm_f, height=mu + 0.5 * sigma,
-                            distance=config.HS_MIN_STRIDE_SAM,
-                        )
-                        raw_steps = [
-                            (int(peaks[j]), int(peaks[j + 1]))
-                            for j in range(len(peaks) - 1)
-                            if config.HS_MIN_STRIDE_SAM
-                               <= peaks[j + 1] - peaks[j]
-                               <= config.HS_MAX_STRIDE_SAM
-                        ]
-                        sig_q = norm_f
+                        if len(valid) == 0:
+                            raw_steps = []
+                        else:
+                            mu    = float(np.mean(valid))
+                            sigma = float(np.std(valid))
+                            loose_peaks, _ = find_peaks(
+                                norm_f,
+                                height=mu + 0.3 * sigma,
+                                distance=int(config.SAMPLE_RATE * 0.25),
+                            )
+                            if len(loose_peaks) >= 4:
+                                ivs = np.diff(loose_peaks).astype(float)
+                                med = float(np.median(ivs))
+                                s_min = max(int(med * 0.50), config.HS_MIN_STRIDE_SAM)
+                                s_max = min(int(med * 1.50), config.HS_MAX_STRIDE_SAM)
+                                min_d = max(int(med * 0.40),
+                                            int(config.SAMPLE_RATE * 0.25))
+                            else:
+                                s_min = config.HS_MIN_STRIDE_SAM
+                                s_max = config.HS_MAX_STRIDE_SAM
+                                min_d = config.HS_MIN_STRIDE_SAM
+                            peaks, _ = find_peaks(
+                                norm_f,
+                                height=mu + 0.5 * sigma,
+                                distance=min_d,
+                            )
+                            raw_steps = [
+                                (int(peaks[j]), int(peaks[j + 1]))
+                                for j in range(len(peaks) - 1)
+                                if s_min <= peaks[j + 1] - peaks[j] <= s_max
+                            ]
+                        sig_q = norm_f   # 폴백: norm_f 기준 품질 평가
                     else:
-                        raw_steps = detect_steps(
-                            ml_gyro.copy(), ap_accel.copy(), terrain_params, cond,
-                        )
-                        sig_q = ml_gyro   # ← 해당 발 신호 사용
+                        raw_steps = detect_steps(ml_gyro.copy(), ap_accel.copy())
+                        sig_q = ml_gyro  # 정상: ML gyro 기준 품질 평가
 
-                    # ① 해당 발 신호(sig_q)로만 점수 계산
-                    side_raw_counts[side] = len(raw_steps)   # ③
-                    scored_bucket.extend(
-                        score_steps_by_side(
-                            raw_steps, side, sig_q,
-                            stride_mean_sam, stride_min_sam, stride_max_sam,
-                        )
-                    )
+                    raw_bucket.extend(raw_steps)
+                    side_signals[side] = sig_q   # 검출에 쓴 신호 그대로 보존
+                    side_raw_counts[side] = len(raw_steps)
 
                 except (KeyError, ValueError):
-                    continue
+                    # 예외 시 NaN 배열로 폴백 → _step_quality NaN 비율 1.0 → 점수 0
+                    side_signals[side] = np.full(len(data_np), np.nan, dtype=np.float32)
+
+            # LT+RT 합산으로 파일 기준 stride 파라미터 추정
+            file_stride_mean_sam, file_stride_min_sam, file_stride_max_sam = \
+                estimate_stride_params_from_steps(lt_raw_steps + rt_raw_steps)
+
+            # 검출에 실제 쓴 신호(side_signals)로 점수화.
+            # 정상/폴백 경로에서는 실제 신호가 저장되며,
+            # 예외로 side_signals에 키가 없을 때는 NaN 배열을 사용해
+            # _step_quality가 NaN 비율 1.0 → 점수 0으로 처리되도록 한다.
+            nan_sig = np.full(len(data_np), np.nan, dtype=np.float32)
+            lt_scored: list[ScoredStep] = score_steps_by_side(
+                lt_raw_steps, "LT", side_signals.get("LT", nan_sig),
+                file_stride_mean_sam, file_stride_min_sam, file_stride_max_sam,
+            )
+            rt_scored: list[ScoredStep] = score_steps_by_side(
+                rt_raw_steps, "RT", side_signals.get("RT", nan_sig),
+                file_stride_mean_sam, file_stride_min_sam, file_stride_max_sam,
+            )
 
             # ① side별 점수가 붙은 채로 병합
             merged_steps = merge_bilateral_steps(lt_scored, rt_scored)
@@ -1201,16 +1042,17 @@ def main() -> None:
                     "end": end,
                     "raw_len": raw_len,
                     "score": round(float(_score), 6),
-                    # ③ 병합 기준 재현에 필요한 stride 파라미터
-                    "stride_mean_sam": round(stride_mean_sam, 1),
-                    "stride_min_sam": int(stride_min_sam),
-                    "stride_max_sam": int(stride_max_sam),
+                    # 파일 기준 stride 파라미터 (디버깅 재현 가능)
+                    "stride_mean_sam": round(file_stride_mean_sam, 1),
+                    "stride_min_sam": int(file_stride_min_sam),
+                    "stride_max_sam": int(file_stride_max_sam),
                     "lt_raw_n": side_raw_counts["LT"],
                     "rt_raw_n": side_raw_counts["RT"],
                 })
 
             del df, data_np
             gc.collect()
+            processed_now.add(file_key)  # 파일 읽기·채널 검증 성공 기준 (0-step 포함)
 
             if (i + 1) % 20 == 0 or (i + 1) == len(target_records):
                 log(
@@ -1284,6 +1126,11 @@ def main() -> None:
         )
 
     log(f"  HDF5 쓰기: {time.time()-t2:.1f}s")
+
+    # processed_files.json 갱신
+    all_done_files = processed_now if force else (done_files | processed_now)
+    save_processed_files(processed_files_path, all_done_files)
+    log(f"  processed_files: {len(all_done_files)}개 → {processed_files_path}")
 
     size_mb = config.H5_PATH.stat().st_size / 1024**2
     log(f"\n  ✅ HDF5: {config.H5_PATH}")
