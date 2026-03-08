@@ -2,7 +2,7 @@
 """
 train_hierarchical.py — v11.5 (Subject-Relative Learning)
 ═══════════════════════════════════════════════════════
-v11.4 → v11.5 핵심 변경:
+v11.4 → v11.5 핵심 변경
 
   [A] Subject-Wise BioMech Normalization ★★★
       · 문제: Subject A의 C6(평지)=150, Subject B의 C1(미끄)=140
