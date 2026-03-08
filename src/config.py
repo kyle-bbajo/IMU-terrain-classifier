@@ -292,7 +292,7 @@ class ConfigState:
     """
 
     # ── 실험 파라미터 ──────────────────────────────────
-    n_subjects: int = 40
+    n_subjects: int = 50
     num_classes: int = 6
     ts: int = 256
     pca_ch: int = 32

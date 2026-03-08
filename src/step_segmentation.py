@@ -42,7 +42,7 @@ from scipy.signal import find_peaks, resample, butter, filtfilt
 # 상수
 # ──────────────────────────────────────────────────────────────
 
-SEGMENTATION_VERSION   = "v9.4-filewise-1"  # processed_files 버전 — 로직 변경 시 올림
+SEGMENTATION_VERSION   = "v9.4-filewise-consensus-2"  # processed_files 버전 — 로직 변경 시 올림
 _SUPPORTED_H5_FORMATS = {
     "subject_group_v9",
     "subject_group_v8",
@@ -216,10 +216,10 @@ def load_existing_h5_info(
                 )
 
             step_def = f.attrs.get("step_definition", "")
-            if step_def and step_def != "bilateral_merged_quality_based_per_side":
+            if step_def and step_def != "filewise_dual_signal_consensus_bilateral_merge":
                 log(
                     f"  ℹ step_definition='{step_def}' "
-                    f"(현재 버전은 'bilateral_merged_quality_based_per_side'). "
+                    f"(현재 버전은 'filewise_dual_signal_consensus_bilateral_merge'). "
                     f"병합 로직이 다른 버전으로 생성된 데이터입니다."
                 )
                 raise ValueError(
@@ -463,128 +463,349 @@ def bandpass_filter(
 # 6. 힐스트라이크 검출 (완전 파일 적응형)
 # ──────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────
+# 6. 힐스트라이크 검출 — dual-signal consensus (파일 적응형)
+# ──────────────────────────────────────────────────────────────
+
+def _adaptive_peaks(
+    sig: np.ndarray,
+    fs: int,
+    negate: bool = False,
+    loose_dist_ms: float = 250.0,
+) -> tuple[np.ndarray, float]:
+    """파일 신호 통계로 prominence·min_dist를 자동 결정하고 피크를 반환한다.
+
+    Returns:
+        (peaks, sigma)
+    """
+    src = -sig if negate else sig
+    sigma = float(np.std(src))
+    if sigma == 0:
+        return np.array([], dtype=int), 0.0
+
+    loose_dist = int(fs * loose_dist_ms / 1000)
+    cands, _ = find_peaks(src, prominence=0.2 * sigma, distance=loose_dist)
+
+    if len(cands) >= 4:
+        med = float(np.median(np.diff(cands).astype(float)))
+        min_dist = int(np.clip(med * 0.40, fs * 0.25, fs * 0.80))
+    else:
+        min_dist = int(fs * 0.35)
+
+    peaks, _ = find_peaks(src, prominence=0.3 * sigma, distance=min_dist)
+    return peaks, sigma
+
+
+def _detect_hs_acc(
+    ap_accel: np.ndarray,
+    fs: int,
+) -> np.ndarray:
+    """AP Accel 기반 힐스트라이크 후보 검출.
+
+    HS 시점에서 AP 가속도가 감속(음의 피크)하는 것을 검출.
+    local dip sharpness 필터로 단순 노이즈성 dip을 제거한다.
+    """
+    n = len(ap_accel)
+    sig = ap_accel.copy()
+    mask = np.isnan(sig)
+    if mask.any() and not mask.all():
+        x = np.arange(n)
+        sig[mask] = np.interp(x[mask], x[~mask], sig[~mask])
+
+    sig = bandpass_filter(sig, fs, low=0.5, high=20.0)
+    peaks, sigma = _adaptive_peaks(sig, fs, negate=True)
+
+    if len(peaks) == 0 or sigma == 0:
+        return np.array([], dtype=int)
+
+    # local dip sharpness: ±100ms 창에서 peak depth가 sigma × 0.5 이상인 것만 유지
+    win = int(0.10 * fs)
+    trusted = []
+    for p in peaks:
+        l = max(0, p - win)
+        r = min(n, p + win)
+        w = sig[l:r]
+        if len(w) == 0:
+            continue
+        local_depth = float(np.nanmax(w)) - float(sig[p])
+        if local_depth > 0.5 * sigma:
+            trusted.append(p)
+
+    return np.array(trusted, dtype=int)
+
+
+def _detect_hs_gyro(
+    ml_gyro: np.ndarray,
+    fs: int,
+) -> np.ndarray:
+    """ML Gyro 기반 힐스트라이크 후보 검출.
+
+    파일별 polarity를 자동 점검한다:
+    원신호와 부호반전 신호 중 swing-HS 구조(주기성)가 더 좋은 쪽을 선택.
+    """
+    n = len(ml_gyro)
+    sig_raw = ml_gyro.copy()
+    mask = np.isnan(sig_raw)
+    if mask.any() and not mask.all():
+        x = np.arange(n)
+        sig_raw[mask] = np.interp(x[mask], x[~mask], sig_raw[~mask])
+
+    sig_raw = bandpass_filter(sig_raw, fs, low=0.5, high=15.0)
+
+    def _score_polarity(sig: np.ndarray) -> tuple[np.ndarray, float]:
+        """swing 후보 검출 수 × prominence 합 / (1 + CV) — 주기성 보정."""
+        sigma = float(np.std(sig))
+        if sigma == 0:
+            return np.array([], dtype=int), 0.0
+        loose_dist = int(fs * 0.25)
+        swings, props = find_peaks(sig, prominence=0.2 * sigma, distance=loose_dist)
+        if len(swings) == 0:
+            return np.array([], dtype=int), 0.0
+        proms = props["prominences"]
+        if len(swings) >= 2:
+            ivs = np.diff(swings).astype(float)
+            cv = float(np.std(ivs)) / max(float(np.mean(ivs)), 1.0)
+        else:
+            cv = 1.0  # 피크 1개 → 주기성 낮음
+        score = float(np.sum(proms)) / (1.0 + cv)
+        return swings, score
+
+    swings_orig, score_orig = _score_polarity(sig_raw)
+    swings_flip, score_flip = _score_polarity(-sig_raw)
+
+    if score_flip > score_orig:
+        sig = -sig_raw
+        swing_peaks = swings_flip
+    else:
+        sig = sig_raw
+        swing_peaks = swings_orig
+
+    sigma = float(np.std(sig))
+    if sigma == 0:
+        return np.array([], dtype=int)
+
+    # HS 후보: 선택된 polarity 기준 음의 피크
+    hs_cands, _ = _adaptive_peaks(sig, fs, negate=True)
+    if len(hs_cands) == 0:
+        return np.array([], dtype=int)
+
+    # swing 인접 필터
+    half_win = fs // 2
+    if len(swing_peaks) == 0:
+        return hs_cands
+
+    peak_ref = float(np.percentile(sig[swing_peaks], 90))
+    thresh = config.HS_TRUSTED_SWING * peak_ref
+
+    trusted = []
+    for cand in hs_cands:
+        nearby = swing_peaks[np.abs(swing_peaks - cand) < half_win]
+        if len(nearby) > 0 and sig[nearby].max() > thresh:
+            trusted.append(cand)
+        elif len(nearby) == 0:
+            w = sig[max(0, cand - half_win): min(n, cand + half_win)]
+            if len(w) > 0 and float(np.percentile(w, 99)) > thresh:
+                trusted.append(cand)
+
+    return np.array(trusted, dtype=int)
+
+
+def _reconcile_candidates(
+    hs_acc: np.ndarray,
+    hs_gyro: np.ndarray,
+    tol_ms: float,
+    fs: int,
+) -> list[tuple[int, str]]:
+    """AP accel 후보와 ML gyro 후보를 합의(consensus)한다.
+
+    Args:
+        hs_acc:  AP accel 기반 후보 (sample index)
+        hs_gyro: ML gyro 기반 후보 (sample index)
+        tol_ms:  매칭 허용 오차 (ms)
+        fs:      샘플링 레이트
+
+    Returns:
+        list of (timestamp, support)
+        support ∈ {"both", "acc", "gyro"}
+        anchor는 AP accel 시점 우선 (충격 기반 정의)
+    """
+    tol = int(fs * tol_ms / 1000)
+    result: list[tuple[int, str]] = []
+    used_gyro: set[int] = set()
+
+    # AP 후보 기준으로 gyro 매칭
+    for a in hs_acc:
+        if len(hs_gyro) == 0:
+            result.append((int(a), "acc"))
+            continue
+        dists = np.abs(hs_gyro - a)
+        nearest_idx = int(np.argmin(dists))
+        if dists[nearest_idx] <= tol and nearest_idx not in used_gyro:
+            used_gyro.add(nearest_idx)
+            result.append((int(a), "both"))   # anchor = AP 시점
+        else:
+            result.append((int(a), "acc"))
+
+    # gyro 전용 후보 추가 (AP와 매칭 안 된 것)
+    for gi, g in enumerate(hs_gyro):
+        if gi not in used_gyro:
+            result.append((int(g), "gyro"))
+
+    result.sort(key=lambda x: x[0])
+    return result
+
+
+def _filewise_stride_filter(
+    candidates: list[tuple[int, str]],
+    fs: int,
+) -> list[tuple[int, str]]:
+    """파일 내 stride 통계 기반으로 이상 간격 후보를 제거한다."""
+    if len(candidates) < 2:
+        return candidates
+
+    times = np.array([t for t, _ in candidates], dtype=float)
+
+    # "both" 신뢰 후보 중심으로 interval 통계 추정, 부족하면 전체로 fallback
+    trusted_times = np.array([t for t, s in candidates if s == "both"], dtype=float)
+    ref_times = trusted_times if len(trusted_times) >= 4 else times
+    intervals = np.diff(ref_times)
+
+    if len(intervals) >= 4:
+        med = float(np.median(intervals))
+        mad = float(np.median(np.abs(intervals - med)))
+        k = 2.5
+        i_min = max(med - k * mad, config.HS_MIN_STRIDE_SAM)
+        i_max = min(med + k * mad, config.HS_MAX_STRIDE_SAM)
+        # p5/p95도 같이 사용
+        p5  = float(np.percentile(intervals, 5))
+        p95 = float(np.percentile(intervals, 95))
+        i_min = max(int(min(p5,  i_min)), config.HS_MIN_STRIDE_SAM)
+        i_max = min(int(max(p95, i_max)), config.HS_MAX_STRIDE_SAM)
+    else:
+        i_min = config.HS_MIN_STRIDE_SAM
+        i_max = config.HS_MAX_STRIDE_SAM
+
+    # 시작점은 항상 유지, interval 기준으로 end 후보 제거
+    kept: list[tuple[int, str]] = [candidates[0]]
+    for i in range(1, len(candidates)):
+        gap = candidates[i][0] - kept[-1][0]
+        if i_min <= gap <= i_max:
+            kept.append(candidates[i])
+        # 너무 짧으면 둘 중 support 높은 것 유지
+        elif gap < i_min:
+            sup_order = {"both": 2, "acc": 1, "gyro": 1, "norm": 0}
+            if sup_order.get(candidates[i][1], 0) > sup_order.get(kept[-1][1], 0):
+                kept[-1] = candidates[i]
+        # 너무 길면 그냥 추가 (중간 이벤트 누락 가능)
+        else:
+            kept.append(candidates[i])
+
+    return kept
+
+
 def detect_steps(
     ml_gyro: np.ndarray,
     ap_accel: np.ndarray,
     fs: int = config.SAMPLE_RATE,
-) -> list[tuple[int, int]]:
-    """ML Gyro + AP Accel 융합 힐스트라이크 검출 — 완전 파일 적응형.
+) -> tuple[list[tuple[int, int]], list[str]]:
+    """Dual-signal consensus 힐스트라이크 검출 — 완전 파일 적응형.
 
-    모든 검출 기준(피크 높이·prominence·stride 범위)을
-    이 파일 신호 자체의 통계에서만 계산한다.
-    terrain_params / cond 에 의존하지 않는다.
+    AP accel과 ML gyro 각각 독립 후보 생성 후 합의.
+    최종 anchor는 AP accel 시점 우선.
+
+    Returns:
+        (steps, supports)
+        steps:    [(start, end), ...]
+        supports: ["both"|"acc"|"gyro", ...]  — steps와 같은 길이
     """
     n = len(ml_gyro)
     if n < fs:
-        return []
+        return [], []
 
-    # ── NaN 비율 체크 ──
     nan_ratio = (np.isnan(ml_gyro).sum() + np.isnan(ap_accel).sum()) / (2 * n)
     if nan_ratio > config.HS_NAN_THRESHOLD:
-        return []
+        return [], []
 
-    # ── NaN 선형 보간 ──
-    for sig in [ml_gyro, ap_accel]:
-        mask = np.isnan(sig)
-        if mask.any() and not mask.all():
-            x = np.arange(n)
-            sig[mask] = np.interp(x[mask], x[~mask], sig[~mask])
+    tol_ms = 100.0  # AP/gyro 합의 허용 오차 100ms
 
-    ml_f = bandpass_filter(ml_gyro, fs, low=1.0, high=20.0)
-    ap_f = bandpass_filter(ap_accel, fs, low=1.0, high=20.0)
+    hs_acc  = _detect_hs_acc(ap_accel, fs)
+    hs_gyro = _detect_hs_gyro(ml_gyro, fs)
 
-    # ── 파일 신호 통계 ──
-    sigma_ml = float(np.std(ml_f))
-    if sigma_ml == 0:
-        return []
-    mean_ap  = float(np.mean(ap_f))
-    sigma_ap = float(np.std(ap_f))
+    # 둘 다 없으면 빈 결과
+    if len(hs_acc) == 0 and len(hs_gyro) == 0:
+        return [], []
 
-    # ── 최소 피크 간격: 이 파일 신호 IQR로 적응 추정 ──
-    # 초기 느슨한 거리로 후보 피크를 잡은 뒤, 그 간격 중앙값을 min_dist로 재설정
-    loose_dist = int(fs * 0.25)          # 250ms — 매우 빠른 보행도 커버
-    cand_raw, _ = find_peaks(-ml_f, prominence=0.2 * sigma_ml, distance=loose_dist)
-    if len(cand_raw) >= 4:
-        intervals_raw = np.diff(cand_raw).astype(float)
-        med_interval  = float(np.median(intervals_raw))
-        # 중앙값의 40% 이상은 항상 최소 거리로 허용 (너무 타이트하게 막지 않음)
-        min_dist_sam  = max(int(med_interval * 0.40), int(fs * 0.25))
-    else:
-        min_dist_sam  = int(fs * 0.35)   # 후보 부족 → 보수적 350ms
+    candidates = _reconcile_candidates(hs_acc, hs_gyro, tol_ms, fs)
+    candidates = _filewise_stride_filter(candidates, fs)
 
-    # ── Swing 피크 검출 (mid-swing: Gyro 양의 피크) ──
-    mid_swings, _ = find_peaks(
-        ml_f, prominence=0.3 * sigma_ml, distance=min_dist_sam,
-    )
-    if len(mid_swings) > 0:
-        peak_ref = float(np.percentile(ml_f[mid_swings], 99))
-    else:
-        peak_ref = sigma_ml
-    trusted_thresh = config.HS_TRUSTED_SWING * peak_ref
+    if len(candidates) < 2:
+        return [], []
 
-    # ── 힐스트라이크 후보: Gyro 음의 피크 ──
-    hs_cand, _ = find_peaks(
-        -ml_f, prominence=config.HS_GYRO_PROMINENCE * sigma_ml, distance=min_dist_sam,
-    )
-    if len(hs_cand) < 2:
-        return []
-
-    # ── Swing 인접성으로 신뢰도 필터 ──
-    hs_trusted: list[int] = []
-    for cand in hs_cand:
-        nearby = [p for p in mid_swings if abs(p - cand) < fs // 2]
-        if nearby:
-            nearest = min(nearby, key=lambda p: abs(p - cand))
-            if ml_f[nearest] > trusted_thresh:
-                hs_trusted.append(cand)
-        else:
-            w_s = max(0, cand - fs // 2)
-            w_e = min(n, cand + fs // 2)
-            if float(np.percentile(ml_f[w_s:w_e], 99)) > trusted_thresh:
-                hs_trusted.append(cand)
-
-    if len(hs_trusted) < 2:
-        return []
-
-    # ── AP Accel 검증: 힐스트라이크 시 AP 가속도 음의 피크 확인 ──
-    window = config.HS_FUSION_WINDOW_SAM
-    hs_final: list[int] = []
-    for cand in hs_trusted:
-        w_s = max(0, cand - window)
-        w_e = min(n, cand + window)
-        if np.min(ap_f[w_s:w_e]) < mean_ap - config.HS_ACCEL_THRESHOLD * sigma_ap:
-            hs_final.append(cand)
-
-    if len(hs_final) < 2:
-        return []
-
-    # ── 파일 적응형 stride 범위 ──
-    # 이 파일의 hs_final 간격 분포에서 직접 계산.
-    # 조건별 평균값을 쓰지 않으므로 보폭이 특이한 피험자도 처리됨.
-    file_intervals = np.diff(hs_final).astype(float)
-    if len(file_intervals) >= 4:
-        p5  = float(np.percentile(file_intervals, 5))
-        p95 = float(np.percentile(file_intervals, 95))
-        med = float(np.median(file_intervals))
-        stride_min = max(int(min(p5,  med * 0.50)), config.HS_MIN_STRIDE_SAM)
-        stride_max = min(int(max(p95, med * 1.50)), config.HS_MAX_STRIDE_SAM)
-    else:
-        stride_min = config.HS_MIN_STRIDE_SAM
-        stride_max = config.HS_MAX_STRIDE_SAM
-
-    # ── 유효 스텝 필터 ──
-    valid_steps: list[tuple[int, int]] = []
-    for i in range(len(hs_final) - 1):
-        start = hs_final[i]
-        end   = hs_final[i + 1]
+    # NaN 비율 체크 후 스텝 생성
+    steps: list[tuple[int, int]] = []
+    supports: list[str] = []
+    for i in range(len(candidates) - 1):
+        start, sup_start = candidates[i]
+        end,   sup_end   = candidates[i + 1]
         length = end - start
-        if length < stride_min or length > stride_max:
+        if length <= 0:
             continue
-        if np.isnan(ml_gyro[start:end]).sum() / length > config.HS_NAN_THRESHOLD:
+        nan_ml  = float(np.isnan(ml_gyro[start:end]).sum()) / length
+        nan_ap  = float(np.isnan(ap_accel[start:end]).sum()) / length
+        nan_seg = max(nan_ml, nan_ap)  # 어느 쪽이든 NaN이 많으면 제거
+        if nan_seg > config.HS_NAN_THRESHOLD:
             continue
-        valid_steps.append((start, end))
+        steps.append((start, end))
+        # step 신뢰도 = 시작·끝 중 낮은 쪽 (두 이벤트 모두 신뢰해야 구간 신뢰)
+        sup_order = {"both": 3, "acc": 2, "gyro": 1, "norm": 0}
+        step_sup = sup_start if sup_order.get(sup_start, 0) <= sup_order.get(sup_end, 0) \
+                   else sup_end
+        supports.append(step_sup)
 
-    return valid_steps
+    return steps, supports
+
+
+def _fallback_detect_steps(
+    norm_f: np.ndarray,
+    fs: int,
+) -> tuple[list[tuple[int, int]], list[str]]:
+    """폴백: 발 가속도 norm 기반 파일 적응형 검출.
+
+    ML gyro 또는 AP accel 중 하나가 없을 때 사용.
+    support는 모두 "norm"으로 표시.
+    """
+    valid = norm_f[~np.isnan(norm_f)]
+    if len(valid) == 0:
+        return [], []
+
+    mu    = float(np.mean(valid))
+    sigma = float(np.std(valid))
+
+    loose_peaks, _ = find_peaks(
+        norm_f, height=mu + 0.3 * sigma,
+        distance=int(fs * 0.25),
+    )
+    if len(loose_peaks) >= 4:
+        ivs = np.diff(loose_peaks).astype(float)
+        med = float(np.median(ivs))
+        s_min = max(int(med * 0.50), config.HS_MIN_STRIDE_SAM)
+        s_max = min(int(med * 1.50), config.HS_MAX_STRIDE_SAM)
+        min_d = int(np.clip(med * 0.40, fs * 0.25, fs * 0.80))  # 상한 clamp
+    else:
+        s_min = config.HS_MIN_STRIDE_SAM
+        s_max = config.HS_MAX_STRIDE_SAM
+        min_d = config.HS_MIN_STRIDE_SAM
+
+    peaks, _ = find_peaks(
+        norm_f, height=mu + 0.5 * sigma, distance=min_d,
+    )
+    steps = [
+        (int(peaks[j]), int(peaks[j + 1]))
+        for j in range(len(peaks) - 1)
+        if s_min <= peaks[j + 1] - peaks[j] <= s_max
+    ]
+    supports = ["norm"] * len(steps)   # foot accel norm 기반 폴백임을 명시
+    return steps, supports
 
 
 # ──────────────────────────────────────────────────────────────
@@ -616,8 +837,17 @@ def estimate_stride_params_from_steps(
 
 
 # ──────────────────────────────────────────────────────────────
-# 7. LT/RT 중복 스텝 병합 (side별 신호 기반 품질 평가)  ← ①③④
+# 7. 품질 점수화 + 병합 + bilateral sanity check
 # ──────────────────────────────────────────────────────────────
+
+# support → q_support 가중치
+_SUPPORT_WEIGHT: dict[str, float] = {
+    "both": 1.00,   # AP + gyro 둘 다 확인
+    "acc":  0.80,   # AP accel만
+    "gyro": 0.75,   # ML gyro만
+    "norm": 0.65,   # foot accel norm 폴백 (ML gyro / AP accel 없을 때)
+}
+
 
 def _step_quality(
     start: int,
@@ -626,73 +856,73 @@ def _step_quality(
     stride_mean_sam: float,
     stride_min_sam: float,
     stride_max_sam: float,
+    support: str = "both",
 ) -> float:
-    """스텝의 품질 점수를 계산한다 (높을수록 좋음).
-
-    품질 = (1 - NaN 비율) × stride 중심 근접도  ← ③
-    stride 중심 근접도 = 1 / (1 + |length - stride_center| / stride_range)
-    """
+    """스텝 품질 점수 = q_nan × q_interval × q_support"""
     length = end - start
     if length <= 0:
         return 0.0
 
+    # q_nan
     nan_ratio = float(np.isnan(signal[start:end]).sum()) / length
-    quality_nan = 1.0 - nan_ratio
+    q_nan = 1.0 - nan_ratio
 
-    # ③ stride_mean 대신 stride range 중심과 범위를 모두 활용
+    # q_interval (stride 중심 근접도)
     if stride_mean_sam > 0:
         stride_center = stride_mean_sam
-        stride_range = max(stride_max_sam - stride_min_sam, 1.0)
-        proximity = 1.0 / (1.0 + abs(length - stride_center) / stride_range)
+        stride_range  = max(stride_max_sam - stride_min_sam, 1.0)
     elif stride_min_sam > 0 and stride_max_sam > stride_min_sam:
-        # ④ stride_mean=0(불안정) 시 min/max 중앙값으로 폴백
         stride_center = (stride_min_sam + stride_max_sam) / 2.0
-        stride_range = max(stride_max_sam - stride_min_sam, 1.0)
-        proximity = 1.0 / (1.0 + abs(length - stride_center) / stride_range)
+        stride_range  = max(stride_max_sam - stride_min_sam, 1.0)
     else:
-        proximity = 1.0
+        stride_center = length
+        stride_range  = 1.0
+    q_interval = 1.0 / (1.0 + abs(length - stride_center) / stride_range)
 
-    return quality_nan * proximity
+    # q_support
+    q_support = _SUPPORT_WEIGHT.get(support, 0.75)
+
+    return q_nan * q_interval * q_support
 
 
-# ④ ScoredStep: NamedTuple로 필드 명시 (가독성·유지보수성 향상)
+# ScoredStep: NamedTuple
 from typing import NamedTuple
 
 class ScoredStep(NamedTuple):
-    start: int
-    end: int
-    side: str       # "LT" 또는 "RT"
-    score: float    # 품질 점수 (높을수록 좋음)
+    start:   int
+    end:     int
+    side:    str    # "LT" 또는 "RT"
+    score:   float  # 품질 점수
+    support: str    # "both" / "acc" / "gyro" / "norm"
 
 
 def score_steps_by_side(
     steps: list[tuple[int, int]],
+    supports: list[str],
     side: str,
     signal: np.ndarray,
     stride_mean_sam: float,
     stride_min_sam: float,
     stride_max_sam: float,
 ) -> list[ScoredStep]:
-    """각 발의 스텝에 해당 발 신호 기준 품질 점수를 부여한다.  ← ①
-
-    Args:
-        steps: (start, end) 스텝 목록
-        side: "LT" 또는 "RT"
-        signal: 해당 발의 기준 신호 (LT면 LT 신호, RT면 RT 신호)
-        stride_mean_sam: 기대 stride 길이 (samples)
-        stride_min_sam: stride 최솟값
-        stride_max_sam: stride 최댓값
-
-    Returns:
-        (start, end, side, score) 목록
-    """
+    """각 스텝에 dual-signal support 포함 품질 점수를 부여한다."""
     scored: list[ScoredStep] = []
-    for start, end in steps:
+    for i, (start, end) in enumerate(steps):
+        if i >= len(supports):
+            log(
+                f"  ⚠ score_steps_by_side [{side}]: supports 길이 불일치 "
+                f"(steps={len(steps)}, supports={len(supports)}) "
+                f"— 이후 {len(steps)-i}개 스텝 스킵"
+            )
+            break
+        sup = supports[i]
         score = _step_quality(
             start, end, signal,
             stride_mean_sam, stride_min_sam, stride_max_sam,
+            support=sup,
         )
-        scored.append(ScoredStep(start=start, end=end, side=side, score=score))
+        scored.append(ScoredStep(start=start, end=end, side=side,
+                                 score=score, support=sup))
     return scored
 
 
@@ -701,42 +931,77 @@ def merge_bilateral_steps(
     rt_scored: list[ScoredStep],
     overlap_threshold: float = 0.5,
 ) -> list[ScoredStep]:
-    """LT/RT 사전 점수화된 스텝을 시간순으로 병합하고 겹침을 정리한다.  ← ①
+    """LT/RT 스텝을 병합한다.
 
-    Args:
-        lt_scored: (start, end, "LT", score) 목록
-        rt_scored: (start, end, "RT", score) 목록
-        overlap_threshold: 허용 최대 겹침 비율 (0~1)
-
-    Returns:
-        최종 (start, end, side, score) 목록, 시간순 정렬
+    겹침 제거는 같은 발(same-side) 내에서만 적용.
+    LT↔RT 교차는 정상 보행 패턴이므로 허용.
     """
-    tagged = lt_scored + rt_scored
-    tagged.sort(key=lambda x: x[0])
+    def _dedup_same_side(steps: list[ScoredStep]) -> list[ScoredStep]:
+        if len(steps) < 2:
+            return steps
+        steps = sorted(steps, key=lambda x: x.start)
+        kept: list[int] = [0]
+        for ci in range(1, len(steps)):
+            pi = kept[-1]
+            overlap = max(0, min(steps[pi].end, steps[ci].end)
+                             - max(steps[pi].start, steps[ci].start))
+            if overlap == 0:
+                kept.append(ci)
+                continue
+            shorter = min(steps[pi].end - steps[pi].start,
+                          steps[ci].end  - steps[ci].start)
+            if shorter == 0 or overlap / shorter > overlap_threshold:
+                if steps[ci].score >= steps[pi].score:
+                    kept[-1] = ci
+            else:
+                kept.append(ci)
+        return [steps[i] for i in kept]
 
-    if len(tagged) < 2:
-        return tagged
+    lt_clean = _dedup_same_side(lt_scored)
+    rt_clean = _dedup_same_side(rt_scored)
+    merged = lt_clean + rt_clean
+    merged.sort(key=lambda x: x.start)
+    return merged
 
-    merged_indices: list[int] = [0]
-    for curr_idx in range(1, len(tagged)):
-        prev_idx = merged_indices[-1]
-        prev_start, prev_end = tagged[prev_idx].start, tagged[prev_idx].end
-        curr_start, curr_end = tagged[curr_idx].start, tagged[curr_idx].end
 
-        overlap_len = max(0, min(prev_end, curr_end) - max(prev_start, curr_start))
-        if overlap_len == 0:
-            merged_indices.append(curr_idx)
-            continue
+def bilateral_sanity_check(
+    steps: list[ScoredStep],
+    fs: int = config.SAMPLE_RATE,
+) -> list[ScoredStep]:
+    """LT/RT 교차 패턴 검증.
 
-        shorter_len = min(prev_end - prev_start, curr_end - curr_start)
-        if shorter_len == 0 or overlap_len / shorter_len > overlap_threshold:
-            # 겹침 심하면 품질(score) 높은 쪽 보존
-            if tagged[curr_idx].score >= tagged[prev_idx].score:
-                merged_indices[-1] = curr_idx
+    체크 1. 동시 이벤트: LT-RT가 50ms 이내 → 낮은 점수 쪽 제거
+    체크 2. side balance: 한 발이 70% 이상이면 경고 (제거 안 함)
+    """
+    if len(steps) < 2:
+        return steps
+
+    simultaneous_tol = int(fs * 0.05)  # 50ms
+
+    # 체크 1: 동시 LT-RT 제거
+    cleaned: list[ScoredStep] = [steps[0]]
+    for curr in steps[1:]:
+        prev = cleaned[-1]
+        if (prev.side != curr.side
+                and abs(curr.start - prev.start) <= simultaneous_tol):
+            # 동시 이벤트: 점수 낮은 것 버림
+            if curr.score > prev.score:
+                cleaned[-1] = curr
+            # else: prev 유지
         else:
-            merged_indices.append(curr_idx)
+            cleaned.append(curr)
 
-    return [tagged[i] for i in merged_indices]
+    # 체크 2: side balance 경고
+    lt_n = sum(1 for s in cleaned if s.side == "LT")
+    rt_n = sum(1 for s in cleaned if s.side == "RT")
+    total = lt_n + rt_n
+    if total > 0:
+        lt_ratio = lt_n / total
+        if lt_ratio > 0.70 or lt_ratio < 0.30:
+            log(f"    ⚠ bilateral balance 불균형: LT={lt_n} RT={rt_n} "
+                f"({lt_ratio:.0%}/{1-lt_ratio:.0%})")
+
+    return cleaned
 
 
 # ──────────────────────────────────────────────────────────────
@@ -941,86 +1206,70 @@ def main() -> None:
 
             lt_raw_steps: list[tuple[int, int]] = []
             rt_raw_steps: list[tuple[int, int]] = []
-            side_signals: dict[str, np.ndarray] = {}   # 검출에 실제 쓴 신호 보존
+            lt_supports:  list[str] = []
+            rt_supports:  list[str] = []
+            side_signals: dict[str, np.ndarray] = {}
             side_raw_counts: dict[str, int] = {"LT": 0, "RT": 0}
 
-            for side, raw_bucket in [("LT", lt_raw_steps), ("RT", rt_raw_steps)]:
+            for side, raw_bucket, sup_bucket in [
+                ("LT", lt_raw_steps, lt_supports),
+                ("RT", rt_raw_steps, rt_supports),
+            ]:
                 try:
-                    ml_gyro = extract_ml_gyro(df, side)
+                    ml_gyro  = extract_ml_gyro(df, side)
                     ap_accel = extract_ap_accel(df, side)
 
                     if ml_gyro is None or ap_accel is None:
-                        # 폴백: 발 가속도 norm으로 파일 적응형 검출
-                        norm = compute_foot_acc_norm(df, side)
+                        # 폴백: 발 가속도 norm
+                        norm   = compute_foot_acc_norm(df, side)
                         norm_f = bandpass_filter(norm)
-                        valid = norm_f[~np.isnan(norm_f)]
-                        if len(valid) == 0:
-                            raw_steps = []
-                        else:
-                            mu    = float(np.mean(valid))
-                            sigma = float(np.std(valid))
-                            loose_peaks, _ = find_peaks(
-                                norm_f,
-                                height=mu + 0.3 * sigma,
-                                distance=int(config.SAMPLE_RATE * 0.25),
-                            )
-                            if len(loose_peaks) >= 4:
-                                ivs = np.diff(loose_peaks).astype(float)
-                                med = float(np.median(ivs))
-                                s_min = max(int(med * 0.50), config.HS_MIN_STRIDE_SAM)
-                                s_max = min(int(med * 1.50), config.HS_MAX_STRIDE_SAM)
-                                min_d = max(int(med * 0.40),
-                                            int(config.SAMPLE_RATE * 0.25))
-                            else:
-                                s_min = config.HS_MIN_STRIDE_SAM
-                                s_max = config.HS_MAX_STRIDE_SAM
-                                min_d = config.HS_MIN_STRIDE_SAM
-                            peaks, _ = find_peaks(
-                                norm_f,
-                                height=mu + 0.5 * sigma,
-                                distance=min_d,
-                            )
-                            raw_steps = [
-                                (int(peaks[j]), int(peaks[j + 1]))
-                                for j in range(len(peaks) - 1)
-                                if s_min <= peaks[j + 1] - peaks[j] <= s_max
-                            ]
-                        sig_q = norm_f   # 폴백: norm_f 기준 품질 평가
+                        raw_steps, supports = _fallback_detect_steps(
+                            norm_f, config.SAMPLE_RATE
+                        )
+                        sig_q = norm_f
                     else:
-                        raw_steps = detect_steps(ml_gyro.copy(), ap_accel.copy())
-                        sig_q = ml_gyro  # 정상: ML gyro 기준 품질 평가
+                        raw_steps, supports = detect_steps(
+                            ml_gyro.copy(), ap_accel.copy()
+                        )
+                        sig_q = ml_gyro
 
                     raw_bucket.extend(raw_steps)
-                    side_signals[side] = sig_q   # 검출에 쓴 신호 그대로 보존
+                    sup_bucket.extend(supports)
+                    side_signals[side] = sig_q
                     side_raw_counts[side] = len(raw_steps)
 
                 except (KeyError, ValueError):
-                    # 예외 시 NaN 배열로 폴백 → _step_quality NaN 비율 1.0 → 점수 0
                     side_signals[side] = np.full(len(data_np), np.nan, dtype=np.float32)
 
-            # LT+RT 합산으로 파일 기준 stride 파라미터 추정
+            # side별 stride 파라미터 (생리적으로 same-side 기준이 맞음)
+            lt_stride_mean, lt_stride_min, lt_stride_max = \
+                estimate_stride_params_from_steps(lt_raw_steps)
+            rt_stride_mean, rt_stride_min, rt_stride_max = \
+                estimate_stride_params_from_steps(rt_raw_steps)
+            # 파일 전체 통계는 bilateral sanity / 로그용
             file_stride_mean_sam, file_stride_min_sam, file_stride_max_sam = \
                 estimate_stride_params_from_steps(lt_raw_steps + rt_raw_steps)
 
-            # 검출에 실제 쓴 신호(side_signals)로 점수화.
-            # 정상/폴백 경로에서는 실제 신호가 저장되며,
-            # 예외로 side_signals에 키가 없을 때는 NaN 배열을 사용해
-            # _step_quality가 NaN 비율 1.0 → 점수 0으로 처리되도록 한다.
             nan_sig = np.full(len(data_np), np.nan, dtype=np.float32)
             lt_scored: list[ScoredStep] = score_steps_by_side(
-                lt_raw_steps, "LT", side_signals.get("LT", nan_sig),
-                file_stride_mean_sam, file_stride_min_sam, file_stride_max_sam,
+                lt_raw_steps, lt_supports, "LT",
+                side_signals.get("LT", nan_sig),
+                lt_stride_mean, lt_stride_min, lt_stride_max,
             )
             rt_scored: list[ScoredStep] = score_steps_by_side(
-                rt_raw_steps, "RT", side_signals.get("RT", nan_sig),
-                file_stride_mean_sam, file_stride_min_sam, file_stride_max_sam,
+                rt_raw_steps, rt_supports, "RT",
+                side_signals.get("RT", nan_sig),
+                rt_stride_mean, rt_stride_min, rt_stride_max,
             )
 
-            # ① side별 점수가 붙은 채로 병합
-            merged_steps = merge_bilateral_steps(lt_scored, rt_scored)
+            # same-side 중복 제거 → bilateral 병합 → sanity check
+            merged_steps = bilateral_sanity_check(
+                merge_bilateral_steps(lt_scored, rt_scored)
+            )
             file_steps = 0
 
-            for start, end, side, _score in merged_steps:
+            for step in merged_steps:
+                start, end, side, _score, _support = step
                 raw_len = end - start
                 if raw_len < config.MIN_STEP_LEN:
                     continue
@@ -1042,7 +1291,7 @@ def main() -> None:
                     "end": end,
                     "raw_len": raw_len,
                     "score": round(float(_score), 6),
-                    # 파일 기준 stride 파라미터 (디버깅 재현 가능)
+                    "support": _support,
                     "stride_mean_sam": round(file_stride_mean_sam, 1),
                     "stride_min_sam": int(file_stride_min_sam),
                     "stride_max_sam": int(file_stride_max_sam),
@@ -1052,7 +1301,19 @@ def main() -> None:
 
             del df, data_np
             gc.collect()
-            processed_now.add(file_key)  # 파일 읽기·채널 검증 성공 기준 (0-step 포함)
+
+            # 처리 상태 분류: "steps" / "zero_steps" (검출 실패와 원래 없는 것 구분 가능)
+            proc_status = "steps" if file_steps > 0 else "zero_steps"
+            processed_now.add(file_key)  # 파일 읽기·채널 검증 성공 기준
+
+            if proc_status == "zero_steps":
+                step_logger.write({
+                    "file": rec["path"].name,
+                    "sid": sid, "cond": cond, "label": label,
+                    "status": "zero_steps",
+                    "lt_raw_n": side_raw_counts["LT"],
+                    "rt_raw_n": side_raw_counts["RT"],
+                })
 
             if (i + 1) % 20 == 0 or (i + 1) == len(target_records):
                 log(
@@ -1119,7 +1380,7 @@ def main() -> None:
         hf.attrs["format"] = "subject_group_v9"
         hf.attrs["label_base"] = 0
         hf.attrs["label_semantics"] = "terrain_condition"
-        hf.attrs["step_definition"] = "bilateral_merged_quality_based_per_side"
+        hf.attrs["step_definition"] = "filewise_dual_signal_consensus_bilateral_merge"
         hf.attrs["label_mapping"] = json.dumps(
             {f"C{i+1}": i for i in range(config.NUM_CLASSES)},
             ensure_ascii=False,
