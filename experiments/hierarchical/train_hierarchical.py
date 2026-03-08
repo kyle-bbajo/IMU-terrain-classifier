@@ -1,15 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-train_hierarchical.py — v11.2 (SuperFusion + TCN Refiner)
+train_hierarchical.py — v11.3 (SuperFusion + TCN Refiner)
 ═══════════════════════════════════════════════════════
-v11.1 → v11.2 변경:
-  [A] BioMech N_BIO 38→44: Kurtosis/Skewness/ZCR 6개 추가
-      - Kurtosis LT/RT: C1 미끄러운 → 충격 분포 뾰족함↑
-      - Skewness LT/RT: C4 흙길 → 비대칭 충격 패턴
-      - ZCR LT/RT:      C5 잔디 → 진동 방향 전환 빈도↑
-  [B] W&B git commit 해시 자동 기록 (GitHub 연동)
-  [C] version 문자열 v11.2 정합화
-목표: 90%+ (기존 3-Stage 80% 상한 돌파)
+v11.2 → v11.3 변경:
+  [A] Macro F1 기반 Early Stopping (Phase1/Phase2/TCN 전체)
+      · 기존: val accuracy 기준 → 다수 클래스(C2/C3)에 유리
+      · 변경: val_score = 0.4*acc + 0.6*macro_f1
+      · 효과: C1/C4/C5 소수 클래스 recall 보호
+  [B] TCN sliding window 조밀화 (step=1 overlap)
+      · 기존: 중심 기준 패딩 방식 (N개 시퀀스)
+      · 변경: stride=1 완전 overlap (N-seq_len+1개)
+      · 효과: 훈련 시퀀스 수 증가, 경계 노이즈 제거
+  [C] BioMech N_BIO 38→44 (v11.2 유지)
+  [D] W&B git commit 해시 자동 기록 (v11.2 유지)
+목표: 90%+
 ═══════════════════════════════════════════════════════"""
 
 from __future__ import annotations
@@ -1391,34 +1395,44 @@ def train_superfusion(backbone, tr_dl, val_dl, te_dl, tag: str = "",
             opt.zero_grad(set_to_none=True)
         sch.step()
 
-        # validation
+        # validation — Macro F1 기반 early stopping
         model.eval()
-        va_c = va_n = 0
+        va_preds_list, va_labels_list = [], []
         with torch.inference_mode():
             for bi, bio_f, yb in val_dl:
                 bi, bio_f, yb = _to_device(bi, bio_f, yb)
                 with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
                     logits = model.predict(bi, bio_f)
-                va_c += (logits.argmax(1) == yb).sum().item()
-                va_n += len(yb)
-        va = va_c / max(va_n, 1)
-        curve.record(acc=va)
+                va_preds_list.append(logits.argmax(1).cpu())
+                va_labels_list.append(yb.cpu())
+        va_p = torch.cat(va_preds_list).numpy()
+        va_l = torch.cat(va_labels_list).numpy()
+        va_acc = accuracy_score(va_l, va_p)
+        va_f1  = f1_score(va_l, va_p, average="macro", zero_division=0)
+        # 0.4*acc + 0.6*f1 → C1/C4/C5 소수 클래스 recall 보호
+        va_score = 0.4 * va_acc + 0.6 * va_f1
+        va = va_acc   # 로그 표시용
+        curve.record(acc=va_score)
 
-        if va > best_va:
-            best_va = va; best_state = _clone_state(model); patience = 0
+        if va_score > best_va:
+            best_va = va_score; best_state = _clone_state(model); patience = 0
         else:
             patience += 1
             if patience >= SF_PATIENCE and ep > 20:
-                log(f"  {tag} SF EarlyStop ep{ep}  best={best_va:.4f}"); break
+                log(f"  {tag} SF EarlyStop ep{ep}"
+                    f"  best_score={best_va:.4f}"); break
 
         if ep % 15 == 0 or ep == 1:
             log(f"  {tag} SF ep{ep:03d}/{SF_EPOCHS}"
-                f"  val={va:.4f}  best={best_va:.4f}"
+                f"  acc={va_acc:.4f}  f1={va_f1:.4f}"
+                f"  score={va_score:.4f}  best={best_va:.4f}"
                 f"  lr={opt.param_groups[0]['lr']:.1e}  ({time.time()-t0:.0f}s)")
             if _WANDB_OK and wandb.run is not None:
                 wandb.log({
-                    f"{tag}/sf_p1_val_acc": va,
-                    f"{tag}/sf_p1_lr":      opt.param_groups[0]['lr'],
+                    f"{tag}/sf_p1_val_acc":   va_acc,
+                    f"{tag}/sf_p1_val_f1":    va_f1,
+                    f"{tag}/sf_p1_val_score": va_score,
+                    f"{tag}/sf_p1_lr":        opt.param_groups[0]['lr'],
                 }, step=ep)
 
     if best_state: model.load_state_dict(best_state); model.to(DEVICE)
@@ -1448,15 +1462,19 @@ def train_superfusion(backbone, tr_dl, val_dl, te_dl, tag: str = "",
             scaler.step(opt2); scaler.update()
 
         model.eval()
-        va_c = va_n = 0
+        va_p2_list, va_l2_list = [], []
         with torch.inference_mode():
             for bi, bio_f, yb in val_dl:
                 bi, bio_f, yb = _to_device(bi, bio_f, yb)
                 with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
                     logits = model.predict(bi, bio_f)
-                va_c += (logits.argmax(1) == yb).sum().item()
-                va_n += len(yb)
-        va2 = va_c / max(va_n, 1)
+                va_p2_list.append(logits.argmax(1).cpu())
+                va_l2_list.append(yb.cpu())
+        va_p2 = torch.cat(va_p2_list).numpy()
+        va_l2 = torch.cat(va_l2_list).numpy()
+        va2_acc = accuracy_score(va_l2, va_p2)
+        va2_f1  = f1_score(va_l2, va_p2, average="macro", zero_division=0)
+        va2     = 0.4 * va2_acc + 0.6 * va2_f1
         if va2 > best_va2:
             best_va2 = va2; best_st2 = _clone_state(model); pat2 = 0
         else:
@@ -1519,24 +1537,33 @@ def train_tcn_refiner(sf_model, tr_all_ds, va_all_ds, te_all_ds,
     # ── Subject-aware sequence dataset ───────────
     def _make_seq_ds(emb: torch.Tensor, lbl: torch.Tensor,
                      grp: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
-        """Subject 경계를 넘지 않는 슬라이딩 윈도우 생성."""
-        half = TCN_SEQ_LEN // 2
+        """Subject 경계를 넘지 않는 stride=1 완전 overlap 슬라이딩 윈도우.
+
+        기존: 중심 기준 패딩 방식 (경계 샘플에 zero-pad)
+        변경: stride=1 sliding → N-seq_len+1개 시퀀스
+          - 경계 패딩 제거 → 노이즈 없음
+          - 시퀀스 수 증가 → TCN 학습 데이터 풍부
+          - 라벨: 윈도우 중앙 샘플 (seq_len//2)
+        """
         seqs, tgts = [], []
+        half = TCN_SEQ_LEN // 2
         for sbj in np.unique(grp):
-            idx = np.where(grp == sbj)[0]          # subject 내 인덱스 (오름차순)
-            se  = emb[idx]                          # (N_sbj, 256)
+            idx = np.where(grp == sbj)[0]
+            se  = emb[idx]       # (N_sbj, 256)
             sl  = lbl[idx]
             N   = len(idx)
-            for i in range(N):
-                start = max(0, i - half)
-                end   = min(N, i + half + 1)
-                win   = se[start:end]               # (<=TCN_SEQ_LEN, 256)
-                # 좌우 zero-padding으로 고정 길이 맞춤
-                pad_l = half - (i - start)
-                pad_r = TCN_SEQ_LEN - win.shape[0] - pad_l
-                win_p = F.pad(win.T, (pad_l, pad_r)).T  # (TCN_SEQ_LEN, 256)
+            if N < TCN_SEQ_LEN:
+                # subject 샘플 수가 seq_len보다 작으면 zero-pad 1개만
+                pad_r = TCN_SEQ_LEN - N
+                win_p = F.pad(se.T, (0, pad_r)).T
                 seqs.append(win_p)
-                tgts.append(int(sl[i]))
+                tgts.append(int(sl[N // 2]))
+                continue
+            # stride=1 sliding window (경계 패딩 없음)
+            for i in range(N - TCN_SEQ_LEN + 1):
+                win = se[i: i + TCN_SEQ_LEN]   # (TCN_SEQ_LEN, 256)
+                seqs.append(win)
+                tgts.append(int(sl[i + half]))  # 중앙 샘플 라벨
         return torch.stack(seqs), torch.tensor(tgts, dtype=torch.long)
 
     log(f"  {tag} TCN: subject-aware sequence 생성...")
@@ -1571,14 +1598,18 @@ def train_tcn_refiner(sf_model, tr_all_ds, va_all_ds, te_all_ds,
             opt.step()
 
         tcn.eval()
-        va_c = va_n = 0
+        tcn_vp, tcn_vl = [], []
         with torch.inference_mode():
             for xb, yb in va_loader:
                 xb = xb.to(DEVICE); yb = yb.to(DEVICE)
                 out = tcn(xb)[:, half, :]
-                va_c += (out.argmax(1) == yb).sum().item()
-                va_n += len(yb)
-        va = va_c / max(va_n, 1)
+                tcn_vp.append(out.argmax(1).cpu())
+                tcn_vl.append(yb.cpu())
+        tcn_vp = torch.cat(tcn_vp).numpy()
+        tcn_vl = torch.cat(tcn_vl).numpy()
+        va_acc = accuracy_score(tcn_vl, tcn_vp)
+        va_f1  = f1_score(tcn_vl, tcn_vp, average="macro", zero_division=0)
+        va     = 0.4 * va_acc + 0.6 * va_f1
         if va > best_va:
             best_va = va
             best_st = {k: v.clone() for k, v in tcn.state_dict().items()}
@@ -1588,7 +1619,8 @@ def train_tcn_refiner(sf_model, tr_all_ds, va_all_ds, te_all_ds,
             if pat >= TCN_PATIENCE: break
         if ep % 10 == 0:
             log(f"  {tag} TCN ep{ep:02d}/{TCN_EPOCHS}"
-                f"  val={va:.4f}  best={best_va:.4f}")
+                f"  acc={va_acc:.4f}  f1={va_f1:.4f}"
+                f"  score={va:.4f}  best={best_va:.4f}")
 
     if best_st: tcn.load_state_dict(best_st)
     log(f"  {tag} TCN 완료  best_val={best_va:.4f}")
@@ -1632,9 +1664,9 @@ def main() -> None:
 
         wandb.init(
             project=args.wandb_project,
-            name=args.run_name or f"v11.2-N{getattr(args,'n_subjects','?')}",
+            name=args.run_name or f"v11.3-N{getattr(args,'n_subjects','?')}",
             config={
-                "version":      "v11.2",
+                "version":      "v11.3",
                 "git_commit":   git_hash,
                 "sf_epochs":    SF_EPOCHS,
                 "sf_ft_epochs": SF_FT_EPOCHS,
@@ -1656,7 +1688,7 @@ def main() -> None:
 
     config.print_config()
     log(
-        f"  ★ v11.2  SuperFusion + TCN Refiner\n"
+        f"  ★ v11.3  SuperFusion + TCN Refiner\n"
         f"  SF: {SF_EPOCHS}ep Phase1 + {SF_FT_EPOCHS}ep Phase2"
         f"  LR={SF_LR:.0e}  Focal(γ=1.5)+cls_w\n"
         f"  Loss: 6cls + {SF_AUX_W3}x3cls + {SF_AUX_WFLAT}xflat3"
@@ -1837,7 +1869,7 @@ def main() -> None:
     total_min  = (time.time() - t_total) / 60
 
     print(f"\n{'='*60}")
-    print(f"  ★ v11.0 SuperFusion+TCN  {config.KFOLD}-Fold")
+    print(f"  ★ v11.3 SuperFusion+TCN  {config.KFOLD}-Fold")
     print(f"  총 소요: {total_min:.1f}분")
     print(f"  Acc={acc_all:.4f}  MacroF1={f1_all:.4f}")
     print(f"{'='*60}")
@@ -1848,16 +1880,16 @@ def main() -> None:
     rep = classification_report(
         labels_all, preds_all,
         target_names=[f"C{c}" for c in le.classes_], digits=4, zero_division=0)
-    (out / "report_v110.txt").write_text(
-        f"v11.0 SuperFusion+TCN\nAcc={acc_all:.4f}  F1={f1_all:.4f}\n\n{rep}")
+    (out / "report_v113.txt").write_text(
+        f"v11.3 SuperFusion+TCN\nAcc={acc_all:.4f}  F1={f1_all:.4f}\n\n{rep}")
 
     le_out = LabelEncoder()
     le_out.fit(sorted(set(labels_all.tolist())))
-    save_cm(preds_all, labels_all, le_out, "SuperFusion_TCN_v110_KFold", out)
+    save_cm(preds_all, labels_all, le_out, "SuperFusion_TCN_v113_KFold", out)
 
     summary = {
-        "experiment":  "hierarchical_kfold_v110",
-        "version":     "v11.0",
+        "experiment":  "hierarchical_kfold_v113",
+        "version":     "v11.3",
         "method":      "SuperFusion (4-head) + TCN Sequence Refiner",
         "n_bio":       BioMechFeatures.N_BIO,
         "total_minutes": round(total_min, 1),
@@ -1868,7 +1900,7 @@ def main() -> None:
         },
         "fold_meta": fold_meta,
     }
-    path_json = out / "summary_v110.json"
+    path_json = out / "summary_v113.json"
     path_json.write_text(json.dumps(summary, indent=2, ensure_ascii=False))
     log(f"  ✅ {path_json}")
 
