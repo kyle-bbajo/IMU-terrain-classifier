@@ -21,3 +21,4 @@ out_*/
 logs/
 logs/
 out_N*/
+wandb/
