@@ -330,7 +330,7 @@ def fit_bsc_on_train(h5data: H5Data, tr_idx: np.ndarray) -> StandardScaler:
 # 2b. PCA/BSC 디스크 캐시 (v8: fold별 변환 결과 재사용)
 # ═══════════════════════════════════════════════
 
-CACHE_DIR = Path(os.environ.get("CACHE_DIR", "cache"))
+CACHE_DIR = Path(os.environ.get("CACHE_DIR", str(Path(__file__).resolve().parent.parent / "cache")))
 
 
 def _cache_path(fold_tag: str | int, split: str, kind: str) -> Path:

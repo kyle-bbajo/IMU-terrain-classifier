@@ -335,7 +335,7 @@ def augment(x: torch.Tensor, training: bool) -> torch.Tensor:
     x = x * s
     if config.AUG_SHIFT > 0:
         sh = random.randint(-config.AUG_SHIFT, config.AUG_SHIFT)
-        x = torch.roll(x, sh, dims=-1)
+        x = torch.roll(x, int(sh), dims=-1)
     if config.AUG_MASK_RATIO > 0:
         n_mask = max(1, int(C * config.AUG_MASK_RATIO))
         # 벡터화: batch 루프 제거 → GPU-friendly 한 번에 처리
