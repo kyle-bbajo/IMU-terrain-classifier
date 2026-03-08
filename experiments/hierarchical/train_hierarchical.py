@@ -2,7 +2,7 @@
 """
 train_hierarchical.py — v11.5 (Subject-Relative Learning)
 ═══════════════════════════════════════════════════════
-v11.4 → v11.5 핵심 변경
+v11.4 → v11.5 핵심 변경:
 
   [A] Subject-Wise BioMech Normalization ★★★
       · 문제: Subject A의 C6(평지)=150, Subject B의 C1(미끄)=140
@@ -1353,7 +1353,7 @@ def _eval_flat_dl(model: nn.Module, loader: DataLoader,
     model.eval()
     vl_sum = va_c = va_n = 0
     with torch.inference_mode():
-        for bi, bio_f, yb in loader:
+        for bi, bio_f, yb, _ in loader:
             bi, bio_f, yb = _to_device(bi, bio_f, yb)
             with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
                 logits = model(bi, bio_f)
@@ -1541,7 +1541,7 @@ def train_superfusion(backbone, tr_dl, val_dl, te_dl, tag: str = "",
     params   = list(model.parameters())
 
     # ── 클래스 가중치 ──────────────────────────
-    all_y = np.concatenate([yb.numpy() for _, _, yb in tr_dl])
+    all_y = np.concatenate([yb.numpy() for _, _, yb, __ in tr_dl])
     cls_w = auto_class_weights(all_y).to(DEVICE)
     log(f"  {tag} class_weights: {[f'{w:.2f}' for w in cls_w.tolist()]}")
 
@@ -1746,7 +1746,7 @@ def train_tcn_refiner(sf_model, tr_all_ds, va_all_ds, te_all_ds,
         embs, lbls = [], []
         model.eval()
         with torch.inference_mode():
-            for bi, bio_f, yb in dl:
+            for bi, bio_f, yb, _ in dl:
                 bi, bio_f, _ = _to_device(bi, bio_f, yb)
                 with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
                     embs.append(sf_model.embed(bi, bio_f).cpu())
