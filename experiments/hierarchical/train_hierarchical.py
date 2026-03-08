@@ -1578,11 +1578,11 @@ def main() -> None:
         inner_tr_idx, inner_va_idx = _inner_val_split(tr_idx, groups)
         bsc    = fit_bsc_on_train(h5data, inner_tr_idx)
         tr_ds  = make_branch_dataset(h5data, y, inner_tr_idx, bsc,
-                                     branch_idx, fold_tag=f"HC{fi}",  split="train")
+                                     branch_idx, fold_tag=f"HC{fi}_N{config.N_SUBJECTS}",  split="train")
         val_ds = make_branch_dataset(h5data, y, inner_va_idx, bsc,
-                                     branch_idx, fold_tag=f"HC{fi}v", split="val")
+                                     branch_idx, fold_tag=f"HC{fi}v_N{config.N_SUBJECTS}", split="val")
         te_ds  = make_branch_dataset(h5data, y, te_idx, bsc,
-                                     branch_idx, fold_tag=f"HC{fi}",  split="test")
+                                     branch_idx, fold_tag=f"HC{fi}_N{config.N_SUBJECTS}",  split="test")
         tr_dl  = make_loader(tr_ds,  True,  branch=True)
         val_dl = make_loader(val_ds, False, branch=True)
         te_dl  = make_loader(te_ds,  False, branch=True)
@@ -1707,7 +1707,7 @@ def main() -> None:
         del tr_ds, val_ds, te_ds
         gc.collect()
         if config.USE_GPU: torch.cuda.empty_cache()
-        clear_fold_cache(f"HC{fi}"); clear_fold_cache(f"HC{fi}v")
+        clear_fold_cache(f"HC{fi}_N{config.N_SUBJECTS}"); clear_fold_cache(f"HC{fi}v_N{config.N_SUBJECTS}")
 
     # ── 전체 결과 ─────────────────────────────────
     preds_all  = np.concatenate(all_preds)
