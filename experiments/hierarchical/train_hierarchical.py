@@ -1,40 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-train_hierarchical.py — v11.0 (SuperFusion + TCN Refiner)
+train_hierarchical.py — v11.2 (SuperFusion + TCN Refiner)
 ═══════════════════════════════════════════════════════
-v10.1 → v11.0 변경 (리뷰어 피드백 전면 반영):
-
-[A] SuperFusionModel (E2EHierModel 대체)
-    · Hard routing 완전 제거, single model 직접 6cls 예측
-    · 4 heads: 6cls (main) + 3cls + flat3cls + binary (보조)
-    · Gradient interference 방지: GELU + 256차원 shared layer
-    · head_flat: C1/C4C5/C6 flat 세분화 → C1 vs C6 식별 강화
-
-[B] BioMech N_BIO 24→38 (전 센서 자이로 추가)
-    · Shank LT/RT 자이로 분산+피크 (4개)
-    · Thigh LT/RT 자이로 분산+피크 (4개)
-    · LT/RT 가속도 비대칭 (2개): C1 미끄러움 → 좌우 비대칭↑
-    · LT/RT 자이로 비대칭 (2개): C5 잔디 → 발목 비대칭↑
-    · Foot-Shank 위상차 LT/RT (2개): C4 흙길 → 진동 전달 비정상
-    · BioMech forward 시그니처: (bi: dict) 통합 인터페이스
-
-[C] Consistency KL Loss
-    · 6cls→3cls 파생 분포 vs 3cls head → KL divergence
-    · 계층 구조를 hard routing 없이 regularization으로 활용
-
-[D] SuperFusion 학습 안정화
-    · Focal(γ=1.5) + auto_class_weights (E2E 61% 실패 재발 방지)
-    · LR=1e-4, phase2 LR=5e-5 (phase1 LR 절반)
-    · 로그 15ep마다
-
-[E] TCN Sequence Refiner (리뷰어 2 공통: sequence modeling 필요)
-    · window 독립 예측 한계 극복
-    · Subject 단위 연속 window→TCN→정제 예측
-    · 학습: 주모델 완료 후 embedding 추출 → TCN fine-tune
-    · seq_len=9 (중심 window 예측)
-
+v11.1 → v11.2 변경:
+  [A] BioMech N_BIO 38→44: Kurtosis/Skewness/ZCR 6개 추가
+      - Kurtosis LT/RT: C1 미끄러운 → 충격 분포 뾰족함↑
+      - Skewness LT/RT: C4 흙길 → 비대칭 충격 패턴
+      - ZCR LT/RT:      C5 잔디 → 진동 방향 전환 빈도↑
+  [B] W&B git commit 해시 자동 기록 (GitHub 연동)
+  [C] version 문자열 v11.2 정합화
 목표: 90%+ (기존 3-Stage 80% 상한 돌파)
 ═══════════════════════════════════════════════════════"""
+
 from __future__ import annotations
 
 import sys, time, json, gc, warnings, math, argparse
@@ -374,9 +351,9 @@ def majority_vote_smooth(preds: np.ndarray, window: int = 5) -> np.ndarray:
 
 
 class BioMechFeatures(nn.Module):
-    """생체역학 충격 피처 추출기 v11.0.
+    """생체역학 충격 피처 추출기 v11.2.
 
-    피처 38개:
+    피처 44개:
       [Accel 기반 — 기존 20개]
       0~3  : Foot/Shank LT/RT 충격 피크값
       4~5  : Foot/Shank 충격비 (log1p)
@@ -388,20 +365,25 @@ class BioMechFeatures(nn.Module):
       16~17: Spectral Centroid LT/RT (C4 흙길 → centroid↑)
       18~19: Impact Duration LT/RT (C5 잔디 → duration↑)
 
-      [자이로 기반 — 추가 18개]
-      20~21: Foot LT/RT 자이로 분산 (log1p) — C1 미끄러움/발목 불안정
+      [자이로 기반 — 18개]
+      20~21: Foot LT/RT 자이로 분산 (log1p)
       22~23: Foot LT/RT 자이로 피크 각속도
-      24~25: Shank LT/RT 자이로 분산 — C4 흙길 → 정강이 회전↑
+      24~25: Shank LT/RT 자이로 분산
       26~27: Shank LT/RT 자이로 피크
-      28~29: Thigh LT/RT 자이로 분산 — 상체 전달 충격
+      28~29: Thigh LT/RT 자이로 분산
       30~31: Thigh LT/RT 자이로 피크
 
-      [비대칭/전달 기반 — 추가 8개]
-      32~33: LT/RT 가속도 피크 비대칭 (|L-R|) — C1 미끄러움 → 좌우 차이↑
-      34~35: LT/RT 자이로 에너지 비대칭 — C5 잔디 → 발목 비대칭↑
-      36~37: Foot→Shank 진동 전달비 LT/RT — C4 흙길 → 비정상 전달↑
+      [비대칭/전달 기반 — 8개]
+      32~33: LT/RT 가속도 피크 비대칭 (|L-R|)
+      34~35: LT/RT 자이로 에너지 비대칭
+      36~37: Foot→Shank 진동 전달비 LT/RT
+
+      [통계 기반 — v11.2 추가 6개]
+      38~39: Foot LT/RT Kurtosis — C1 미끄러운 → 충격 분포 뾰족함↑
+      40~41: Foot LT/RT Skewness — C4 흙길 → 비대칭 충격 패턴
+      42~43: Foot LT/RT ZCR      — C5 잔디 → 진동 방향 전환 빈도↑
     """
-    N_BIO = 38
+    N_BIO = 44  # v11.2: 38→44
 
     def __init__(self) -> None:
         super().__init__()
@@ -518,6 +500,18 @@ class BioMechFeatures(nn.Module):
         trans_lt = torch.log1p(shank_rms_lt / (foot_rms_lt + eps))
         trans_rt = torch.log1p(shank_rms_rt / (foot_rms_rt + eps))
 
+        # ── 38~39: Kurtosis LT/RT (C1 미끄러운 → 충격 뾰족함↑) ──
+        kurt_lt = self._kurtosis(fz_lt)
+        kurt_rt = self._kurtosis(fz_rt)
+
+        # ── 40~41: Skewness LT/RT (C4 흙길 → 비대칭 충격) ──────
+        skew_lt = self._skewness(fz_lt)
+        skew_rt = self._skewness(fz_rt)
+
+        # ── 42~43: ZCR LT/RT (C5 잔디 → 진동 방향 전환↑) ───────
+        zcr_lt = self._zcr(fz_lt)
+        zcr_rt = self._zcr(fz_rt)
+
         return torch.stack([
             f_pk_lt, f_pk_rt, s_pk_lt, s_pk_rt,
             ratio_lt, ratio_rt, hf_lt, hf_rt,
@@ -530,7 +524,39 @@ class BioMechFeatures(nn.Module):
             asym_acc_lt, asym_acc_rt,
             asym_gy_lt, asym_gy_rt,
             trans_lt, trans_rt,
-        ], dim=1)   # (B, 38)
+            kurt_lt, kurt_rt,
+            skew_lt, skew_rt,
+            zcr_lt,  zcr_rt,
+        ], dim=1)   # (B, 44)
+
+    def _kurtosis(self, x: torch.Tensor) -> torch.Tensor:
+        """첨도 (Kurtosis) — 충격 분포 뾰족함.
+        C1 미끄러운 → 불규칙 충격 → kurtosis↑
+        정규분포 기준값=3, clamp로 폭발 방지.
+        """
+        mu  = x.mean(dim=1, keepdim=True)
+        std = x.std(dim=1, keepdim=True).clamp(min=1e-6)
+        return ((x - mu) / std).pow(4).mean(dim=1).clamp(-10, 30)
+
+    def _skewness(self, x: torch.Tensor) -> torch.Tensor:
+        """비대칭도 (Skewness) — 충격 방향 편향.
+        C4 흙길 → 불규칙 충격 → 비대칭 분포
+        """
+        mu  = x.mean(dim=1, keepdim=True)
+        std = x.std(dim=1, keepdim=True).clamp(min=1e-6)
+        return ((x - mu) / std).pow(3).mean(dim=1).clamp(-10, 10)
+
+    def _zcr(self, x: torch.Tensor) -> torch.Tensor:
+        """영교차율 (Zero Crossing Rate) — 진동 방향 전환 빈도.
+        C5 잔디 → 불규칙 지면 반발 → ZCR↑
+        C6 평지 → 규칙적 진동 → ZCR 낮음
+        """
+        signs   = torch.sign(x)
+        # 부호가 바뀌는 지점 카운트 (0은 이전 부호 유지로 처리)
+        signs   = torch.where(signs == 0,
+                              torch.ones_like(signs), signs)
+        crosses = (signs[:, 1:] * signs[:, :-1] < 0).float()
+        return crosses.mean(dim=1)
 
     def _hf_ratio(self, x: torch.Tensor) -> torch.Tensor:
         fft_mag = torch.fft.rfft(x, dim=1).abs()
@@ -1595,37 +1621,48 @@ def main() -> None:
     if args.wandb and not _WANDB_OK:
         log("  [W&B] wandb 미설치 — pip install wandb 후 재실행. 로컬 로그만 기록.")
     if use_wandb:
+        import subprocess
+        try:
+            git_hash = subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=Path(__file__).parent,
+            ).decode().strip()
+        except Exception:
+            git_hash = "unknown"
+
         wandb.init(
             project=args.wandb_project,
-            name=args.run_name or f"v11-N{getattr(args,'n_subjects','?')}",
+            name=args.run_name or f"v11.2-N{getattr(args,'n_subjects','?')}",
             config={
-                "version":     "v11.1",
-                "sf_epochs":   SF_EPOCHS,
-                "sf_ft_epochs":SF_FT_EPOCHS,
-                "sf_lr":       SF_LR,
-                "sf_patience": SF_PATIENCE,
-                "focal_gamma": FOCAL_GAMMA,
-                "tcn_seq_len": TCN_SEQ_LEN,
-                "tcn_epochs":  TCN_EPOCHS,
-                "n_bio":       BioMechFeatures.N_BIO,
-                "vote_window": args.vote_window,
-                "aux_w3":      SF_AUX_W3,
-                "aux_wflat":   SF_AUX_WFLAT,
-                "aux_wbin":    SF_AUX_WBIN,
-                "cons_w":      SF_WCONS,
+                "version":      "v11.2",
+                "git_commit":   git_hash,
+                "sf_epochs":    SF_EPOCHS,
+                "sf_ft_epochs": SF_FT_EPOCHS,
+                "sf_lr":        SF_LR,
+                "sf_patience":  SF_PATIENCE,
+                "focal_gamma":  FOCAL_GAMMA,
+                "tcn_seq_len":  TCN_SEQ_LEN,
+                "tcn_epochs":   TCN_EPOCHS,
+                "n_bio":        BioMechFeatures.N_BIO,
+                "vote_window":  args.vote_window,
+                "aux_w3":       SF_AUX_W3,
+                "aux_wflat":    SF_AUX_WFLAT,
+                "aux_wbin":     SF_AUX_WBIN,
+                "cons_w":       SF_WCONS,
             },
         )
-        log(f"  [W&B] project={args.wandb_project}  run={wandb.run.name}")
+        log(f"  [W&B] project={args.wandb_project}"
+            f"  run={wandb.run.name}  git={git_hash}")
 
     config.print_config()
     log(
-        f"  ★ v11.0  SuperFusion + TCN Refiner\n"
+        f"  ★ v11.2  SuperFusion + TCN Refiner\n"
         f"  SF: {SF_EPOCHS}ep Phase1 + {SF_FT_EPOCHS}ep Phase2"
         f"  LR={SF_LR:.0e}  Focal(γ=1.5)+cls_w\n"
-        f"  Loss: 6cls + {SF_AUX_W3}×3cls + {SF_AUX_WFLAT}×flat3"
-        f" + {SF_AUX_WBIN}×bin + {SF_WCONS}×KL_cons\n"
-        f"  BioMech N_BIO={BioMechFeatures.N_BIO}  TCN seq={TCN_SEQ_LEN}"
-        f"  Vote window={args.vote_window}\n"
+        f"  Loss: 6cls + {SF_AUX_W3}x3cls + {SF_AUX_WFLAT}xflat3"
+        f" + {SF_AUX_WBIN}xbin + {SF_WCONS}xKL_cons\n"
+        f"  BioMech N_BIO={BioMechFeatures.N_BIO} (Kurt/Skew/ZCR 추가)"
+        f"  TCN seq={TCN_SEQ_LEN}  Vote window={args.vote_window}\n"
     )
 
     out       = config.RESULT_KFOLD / "hierarchical"
