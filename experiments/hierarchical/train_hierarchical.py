@@ -2065,10 +2065,10 @@ def main() -> None:
         sf_preds_vote  = sf_preds.copy()
         tcn_preds_vote = tcn_preds.copy()
         if args.vote_window > 0:
-            sf_preds_vote  = majority_vote_by_subject(
-                sf_preds, te_idx=te_idx, groups=groups, window=args.vote_window)
-            tcn_preds_vote = majority_vote_by_subject(
-                tcn_preds, te_idx=te_idx, groups=groups, window=args.vote_window)
+            sf_preds_vote  = majority_vote_smooth(
+                sf_preds,  window=args.vote_window)
+            tcn_preds_vote = majority_vote_smooth(
+                tcn_preds, window=args.vote_window)
 
         acc_sf  = accuracy_score(sf_labels, sf_preds_vote)
         f1_sf   = f1_score(sf_labels, sf_preds_vote, average="macro", zero_division=0)
