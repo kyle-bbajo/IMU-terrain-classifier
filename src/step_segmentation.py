@@ -528,7 +528,7 @@ def _detect_hs_acc(
         if len(w) == 0:
             continue
         local_depth = float(np.nanmax(w)) - float(sig[p])
-        if local_depth > 0.5 * sigma:
+        if local_depth > 0.3 * sigma:  # 0.5→0.3: acc 후보 과탈락 방지
             trusted.append(p)
 
     return np.array(trusted, dtype=int)
@@ -537,11 +537,16 @@ def _detect_hs_acc(
 def _detect_hs_gyro(
     ml_gyro: np.ndarray,
     fs: int,
+    force_flip: bool = False,
 ) -> np.ndarray:
     """ML Gyro 기반 힐스트라이크 후보 검출.
 
     파일별 polarity를 자동 점검한다:
     원신호와 부호반전 신호 중 swing-HS 구조(주기성)가 더 좋은 쪽을 선택.
+
+    Args:
+        force_flip: True면 자동 선택 결과를 강제로 반전.
+                    한 발 스텝 수가 반대 발보다 현저히 적을 때 외부 재시도용.
     """
     n = len(ml_gyro)
     sig_raw = ml_gyro.copy()
@@ -566,14 +571,18 @@ def _detect_hs_gyro(
             ivs = np.diff(swings).astype(float)
             cv = float(np.std(ivs)) / max(float(np.mean(ivs)), 1.0)
         else:
-            cv = 1.0  # 피크 1개 → 주기성 낮음
+            cv = 1.0
         score = float(np.sum(proms)) / (1.0 + cv)
         return swings, score
 
     swings_orig, score_orig = _score_polarity(sig_raw)
     swings_flip, score_flip = _score_polarity(-sig_raw)
 
-    if score_flip > score_orig:
+    # 자동 선택 후 force_flip이면 반전
+    auto_flip = score_flip > score_orig
+    use_flip  = auto_flip ^ force_flip  # XOR: force_flip이면 반대 선택
+
+    if use_flip:
         sig = -sig_raw
         swing_peaks = swings_flip
     else:
@@ -584,12 +593,10 @@ def _detect_hs_gyro(
     if sigma == 0:
         return np.array([], dtype=int)
 
-    # HS 후보: 선택된 polarity 기준 음의 피크
     hs_cands, _ = _adaptive_peaks(sig, fs, negate=True)
     if len(hs_cands) == 0:
         return np.array([], dtype=int)
 
-    # swing 인접 필터
     half_win = fs // 2
     if len(swing_peaks) == 0:
         return hs_cands
@@ -707,11 +714,16 @@ def detect_steps(
     ml_gyro: np.ndarray,
     ap_accel: np.ndarray,
     fs: int = config.SAMPLE_RATE,
+    force_flip: bool = False,
 ) -> tuple[list[tuple[int, int]], list[str]]:
     """Dual-signal consensus 힐스트라이크 검출 — 완전 파일 적응형.
 
     AP accel과 ML gyro 각각 독립 후보 생성 후 합의.
     최종 anchor는 AP accel 시점 우선.
+
+    Args:
+        force_flip: True면 ML gyro polarity 자동 선택을 강제 반전.
+                    한 발 스텝이 반대 발보다 현저히 적을 때 외부 재시도용.
 
     Returns:
         (steps, supports)
@@ -726,12 +738,11 @@ def detect_steps(
     if nan_ratio > config.HS_NAN_THRESHOLD:
         return [], []
 
-    tol_ms = 100.0  # AP/gyro 합의 허용 오차 100ms
+    tol_ms = 100.0
 
     hs_acc  = _detect_hs_acc(ap_accel, fs)
-    hs_gyro = _detect_hs_gyro(ml_gyro, fs)
+    hs_gyro = _detect_hs_gyro(ml_gyro, fs, force_flip=force_flip)
 
-    # 둘 다 없으면 빈 결과
     if len(hs_acc) == 0 and len(hs_gyro) == 0:
         return [], []
 
@@ -741,7 +752,6 @@ def detect_steps(
     if len(candidates) < 2:
         return [], []
 
-    # NaN 비율 체크 후 스텝 생성
     steps: list[tuple[int, int]] = []
     supports: list[str] = []
     for i in range(len(candidates) - 1):
@@ -752,11 +762,10 @@ def detect_steps(
             continue
         nan_ml  = float(np.isnan(ml_gyro[start:end]).sum()) / length
         nan_ap  = float(np.isnan(ap_accel[start:end]).sum()) / length
-        nan_seg = max(nan_ml, nan_ap)  # 어느 쪽이든 NaN이 많으면 제거
+        nan_seg = max(nan_ml, nan_ap)
         if nan_seg > config.HS_NAN_THRESHOLD:
             continue
         steps.append((start, end))
-        # step 신뢰도 = 시작·끝 중 낮은 쪽 (두 이벤트 모두 신뢰해야 구간 신뢰)
         sup_order = {"both": 3, "acc": 2, "gyro": 1, "norm": 0}
         step_sup = sup_start if sup_order.get(sup_start, 0) <= sup_order.get(sup_end, 0) \
                    else sup_end
@@ -1240,6 +1249,37 @@ def main() -> None:
 
                 except (KeyError, ValueError):
                     side_signals[side] = np.full(len(data_np), np.nan, dtype=np.float32)
+
+            # ── polarity 재시도: 한 발이 반대 발보다 현저히 적으면 flip ──
+            # 기준: 한 발이 다른 발의 30% 미만이고, 둘 다 최소 2스텝 이상
+            _FLIP_RATIO = 0.30
+            _flip_tried: set[str] = set()
+            for side, raw_bucket, sup_bucket, other_side in [
+                ("LT", lt_raw_steps, lt_supports, "RT"),
+                ("RT", rt_raw_steps, rt_supports, "LT"),
+            ]:
+                other_n = side_raw_counts[other_side]
+                this_n  = side_raw_counts[side]
+                if other_n >= 2 and this_n < other_n * _FLIP_RATIO:
+                    try:
+                        ml_g = extract_ml_gyro(df, side)
+                        ap_a = extract_ap_accel(df, side)
+                        if ml_g is not None and ap_a is not None:
+                            retry_steps, retry_sups = detect_steps(
+                                ml_g.copy(), ap_a.copy(), force_flip=True
+                            )
+                            if len(retry_steps) > this_n:
+                                log(f"    ↺ polarity flip [{side}]: "
+                                    f"{this_n} → {len(retry_steps)}스텝 (flip 적용)")
+                                raw_bucket.clear()
+                                sup_bucket.clear()
+                                raw_bucket.extend(retry_steps)
+                                sup_bucket.extend(retry_sups)
+                                side_signals[side] = ml_g
+                                side_raw_counts[side] = len(retry_steps)
+                                _flip_tried.add(side)
+                    except (KeyError, ValueError):
+                        pass
 
             # side별 stride 파라미터 (생리적으로 same-side 기준이 맞음)
             lt_stride_mean, lt_stride_min, lt_stride_max = \
