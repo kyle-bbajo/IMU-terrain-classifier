@@ -984,7 +984,7 @@ def main() -> None:
         log("  ⚠ 검출된 스텝이 없습니다!")
 
     log_path = config.BATCH_DIR / "step_log.json"
-    log_path.write_text(json.dumps(step_log[:2000], indent=1, ensure_ascii=False))
+    log_path.write_text(json.dumps(step_log[:2000], indent=1, ensure_ascii=False, default=int))
     log(f"  스텝 로그 → {log_path}")
     log(f"\n  총 소요: {time.time()-t0:.1f}s\n")
 
