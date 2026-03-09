@@ -124,3 +124,13 @@ def build_branch_idx(
             print(f"    {nm:<12}: {branch_ch[nm]:3d}ch")
 
     return branch_idx, branch_ch
+def get_foot_accel_idx(channels: list[str]) -> list[int]:
+    """Foot 센서의 Accelerometer 채널 인덱스만 반환한다."""
+    idx = []
+    for i, col in enumerate(channels):
+        part = get_sensor_part(col)
+        if part in ("foot lt", "foot rt"):
+            cl = col.lower()
+            if "accel" in cl or "acceleration" in cl:
+                idx.append(i)
+    return sorted(idx)

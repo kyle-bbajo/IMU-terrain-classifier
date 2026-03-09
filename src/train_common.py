@@ -1402,3 +1402,34 @@ def save_history(all_hist: dict[str, list[dict]], out_dir: Path) -> None:
         plt.tight_layout()
         plt.savefig(out_dir / f"history_{mname}.png", dpi=150)
         plt.close()
+fit_model = train_model
+
+
+def save_summary_table(results: list[dict], out_dir) -> None:
+    import pandas as pd
+    from pathlib import Path
+    df = pd.DataFrame(results)
+    out = Path(out_dir) / "summary_table.csv"
+    df.to_csv(out, index=False)
+    print(f"  📊 Summary table saved → {out}")
+
+import json, time
+from pathlib import Path
+
+def ensure_dir(path) -> Path:
+    p = Path(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+def save_json(obj: dict, path) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+
+class Timer:
+    def __enter__(self):
+        self.start = time.time()
+        return self
+    def __exit__(self, *args):
+        self.elapsed = time.time() - self.start
+    def __str__(self):
+        return f"{self.elapsed:.1f}s"
