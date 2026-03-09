@@ -1,278 +1,230 @@
-# IMU Terrain Classifier
+# IMU 지형 분류 실험 파이프라인
 
-보행 중 지면 유형을 IMU(관성측정장치) 신호만으로 실시간 분류하는 시스템.
-
-하지 보조기·의족·재활 로봇의 보행 제어를 위한 **downstream task 전제**: 지형 인식 → 보조기 강성/댐핑 자동 조절 → 낙상 예방 및 에너지 효율 개선.
+> 9센서 216-피처 도메인 특화 확장 | v2.0 | 2026.03
 
 ---
 
-## Background & Motivation
-
-하지 절단 환자가 착용하는 로봇 보조기는 지면 상태(평지/오르막/계단/잔디 등)에 따라 능동적으로 제어 파라미터를 바꿔야 한다. 기존 시스템은 visual sensor(카메라)와 IMU를 함께 사용하지만, **IMU 단독으로 지형 분류가 가능한지** 검증하는 것이 이 프로젝트의 핵심 질문이다.
-
-- 참고: Niswander et al. (2021) — IMU 기반 발 충격 생체역학 분석
-- 참고: Ordóñez & Roggen (2016) — 계층적 HAR (Hierarchical Activity Recognition)
-
----
-
-## 분류 대상 지형 (6 Classes)
-
-| 레이블 | 지형 | 특징 |
-|--------|------|------|
-| C1 | 미끄러운 지면 | 보행 불안정, Foot 신호 변동성↑ |
-| C2 | 오르막 | 경사각 양수, Shank 전방 기울기↑ |
-| C3 | 내리막 | 경사각 음수, 충격 피크↑ |
-| C4 | 흙길 | 불규칙 진동, Shank 고주파↑ |
-| C5 | 잔디 | 충격 감쇠 빠름 |
-| C6 | 평지 | 기준 클래스 |
+## 목차
+1. [프로젝트 개요](#1-프로젝트-개요)
+2. [피처 추출](#2-피처-추출-featurespy)
+3. [모델 구성](#3-모델-구성)
+4. [실험 파이프라인](#4-실험-파이프라인)
+5. [주요 수정 이력](#5-주요-수정-이력-v20)
+6. [실험 결과 출력 구조](#6-실험-결과-출력-구조)
 
 ---
 
-## Dataset
+## 1. 프로젝트 개요
 
-| 항목 | 내용 |
-|------|------|
-| 수집 장비 | Noraxon MyoMotion 전신 IMU |
-| 피험자 | 40명 |
-| 센서 위치 | Foot, Shank, Thigh, Pelvis, Hand (양측, 54채널) |
-| 샘플링 | 200 Hz |
-| 총 스텝 수 | ~45,073 스텝 |
-| 클래스 불균형 | C2(오르막), C3(내리막) 소수 → balanced sampler + class weight 대응 |
+9개 IMU 센서(가속도계 + 자이로스코프)로부터 수집한 신호를 기반으로 보행 지형(6종)을 분류하는 딥러닝 실험 파이프라인입니다.
 
-### 데이터 전처리 파이프라인
+### 1.1 센서 구성
+
+총 9개 센서 × 6채널(Accel 3축 + Gyro 3축) = **54채널**
+
+| 센서 위치 | 채널 인덱스 | 채널 수 | 설명 |
+|-----------|------------|--------|------|
+| Pelvis (골반) | 0 – 5 | 6ch | 몸통 안정성, tilt |
+| Hand LT (왼손) | 6 – 11 | 6ch | 팔 스윙 리듬 |
+| Thigh LT (왼허벅지) | 12 – 17 | 6ch | 고관절 ROM |
+| Shank LT (왼정강이) | 18 – 23 | 6ch | 무릎 충격 |
+| Foot LT (왼발) | 24 – 29 | 6ch | 착지 패턴 |
+| Hand RT (오른손) | 30 – 35 | 6ch | 팔 스윙 리듬 |
+| Thigh RT (오른허벅지) | 36 – 41 | 6ch | 고관절 ROM |
+| Shank RT (오른정강이) | 42 – 47 | 6ch | 무릎 충격 |
+| Foot RT (오른발) | 48 – 53 | 6ch | 착지 패턴 |
+
+### 1.2 데이터셋
+
+| 항목 | 값 |
+|------|----|
+| 피험자 | 50명 |
+| 클래스 | 6종 지형 (C1~C6) |
+| 샘플링 레이트 | 200Hz |
+| 윈도우 크기 | 256 포인트 (1.28초) |
+| 총 샘플 | 65,331개 |
+| 포맷 | HDF5 — `subjects/S{id}/X`, `y` |
+
+---
+
+## 2. 피처 추출 (features.py)
+
+기존 44개(Foot Accel 전용) → **9센서 전체 216개** 도메인 특화 피처로 확장
+
+### 2.1 피처 구성 요약
+
+| 센서 그룹 | 피처 수 | 핵심 피처 |
+|-----------|--------|----------|
+| Pelvis | 22개 | jerk RMS, tilt 불안정성, 지배 주파수, 벡터 크기 |
+| Hand LT + RT | 38개 | 팔 스윙 리듬, 좌우 대칭 상관계수 |
+| Thigh LT + RT | 36개 | 고관절 ROM(max-min), 평균 각속도 |
+| Shank LT + RT | 40개 | 무릎 충격 피크 통계, 정강이 진동 |
+| Foot LT + RT | 80개 | 착지 패턴, 보행 주파수, heel-strike 피크 |
+| **합계** | **216개** | 기존 44개 대비 약 5배 확장 |
+
+### 2.2 센서별 피처 상세
+
+#### Pelvis (22개) — 몸통 안정성
+- time stats (mean, RMS) × 6축 = 12개
+- 벡터 크기 (accel / gyro) = 6개
+- jerk RMS (accel Z) = 1개
+- tilt 불안정성 (gyro std 평균) = 1개
+- 지배 주파수 (accel Z, gyro Y) = 2개
+
+#### Hand LT/RT (38개) — 팔 스윙 리듬
+- time stats (mean, std, RMS) × 3ax × 2side = 18개
+- 벡터 크기 × 2side = 6개
+- 지배 주파수, 스펙트럼 엔트로피 × 2side = 4개
+- gyro RMS × 3ax × 2side = 6개
+- 좌우 대칭 상관계수 (accel 3ax + gyro Y) = 4개
+
+#### Thigh LT/RT (36개) — 고관절
+- accel time stats (mean, RMS) × 3ax × 2side = 12개
+- accel 벡터 크기 × 2side = 6개
+- gyro ROM (max-min) × 3ax × 2side = 6개
+- gyro 평균 각속도 × 3ax × 2side = 6개
+- 지배 주파수 (accel Z) × 2side = 2개
+- 좌우 대칭 상관계수 = 4개
+
+#### Shank LT/RT (40개) — 무릎 충격
+- accel 피크 통계 (개수, 높이, 간격) × 3ax × 2side = 18개
+- gyro time stats (mean, std, RMS) × 3ax × 2side = 18개
+- 좌우 대칭 상관계수 = 4개
+
+#### Foot LT/RT (80개) — 착지 패턴
+- accel time stats × 3ax × 2side = 42개
+- accel 교차축 (SMA, var_ratio, peak_ratio) × 2side = 6개
+- 지배 주파수 × 3ax × 2side = 6개
+- 주파수 대역 파워 (band_low/mid/high/hf) × 2side = 8개
+- gyro RMS × 3ax × 2side = 6개
+- gyro Y 지배 주파수 (시상면 리듬) × 2side = 2개
+- heel-strike 피크 통계 (개수, 높이, 간격) × 2side = 6개
+- 좌우 대칭 상관계수 = 4개
+
+---
+
+## 3. 모델 구성
+
+7개 모델을 K-Fold로 비교합니다. Hybrid 모델(M7, Hierarchical)은 CNN/ResNetTCN과 216-feat FeatureMLP를 융합합니다.
+
+| 모델 | 유형 | 특징 |
+|------|------|------|
+| M2 | CNN | 경량 2-block CNN |
+| M4 | CNN | 4-block CNN + SE |
+| M6 | CNN | 6-block CNN + CBAM |
+| ResNet1D | ResNet | 1D Residual Network |
+| CNNTCN | CNN+TCN | CNN + Temporal Convolutional Network |
+| ResNetTCN | ResNet+TCN | ResNet + TCN 결합 |
+| M7 (Hybrid) | CNN+Feature | M6 + 216-feat FeatureMLP 융합 (`IS_HYBRID=True`) |
+
+### 3.1 FeatureMLP 구조
 
 ```
-Raw CSV (200Hz)
-    │
-    ▼
-[1] Heel-Strike 검출
-    · Foot Z-축 가속도 피크 기반 보행 이벤트 검출
-    · 스텝 경계 추출 → 가변 길이 시퀀스를 고정 길이(TS=256)로 정규화
-    │
-    ▼
-[2] BSC (Batch Standardization & Calibration)
-    · 피험자별 센서 바이어스 보정
-    · train fold 기준 StandardScaler fit → val/test에 동일 적용
-    · subject leakage 방지
-    │
-    ▼
-[3] HDF5 저장
-    · dataset.h5: (N, 54, 256) 형태
-    · subject ID / label 별도 저장
-    │
-    ▼
-[4] Branch 분리
-    · Foot, Shank, Thigh, Pelvis, Hand 5개 그룹으로 채널 분리
-    · 부위별 독립 CNN branch 입력
+BatchNorm1d(216)
+→ Linear(216, 128) → ReLU → Dropout(0.3)
+→ Linear(128, feat_dim) → ReLU → Dropout(0.3)
 ```
 
 ---
 
-## Project Structure
+## 4. 실험 파이프라인
 
-```
-project/
-├── data/
-│   ├── raw_csv/                    # 원본 CSV
-│   └── processed/batches/
-│       └── dataset.h5              # 전처리 완료 HDF5
-│
-└── repo/
-    ├── src/                        # 공용 모듈
-    │   ├── config.py               # 전역 설정 (경로, 하이퍼파라미터)
-    │   ├── models.py               # M1~M6 모델 정의
-    │   ├── train_common.py         # 공통 학습 유틸
-    │   ├── channel_groups.py       # IMU 채널 그룹 정의
-    │   └── step_segmentation.py    # Heel-Strike 분절 및 HDF5 생성
-    │
-    ├── experiments/
-    │   ├── baseline/
-    │   │   ├── train_kfold.py      # M1~M6 K-Fold 비교
-    │   │   └── train_loso.py       # LOSO (Leave-One-Subject-Out)
-    │   ├── supcon/
-    │   │   └── train_supcon.py     # Supervised Contrastive Learning
-    │   └── hierarchical/
-    │       └── train_hierarchical.py  # Hierarchical SupCon ← 권장
-    │
-    ├── logs/                       # 학습 로그
-    ├── out_N40/                    # 실험 결과
-    │   └── kfold/hierarchical/
-    │       ├── summary_v88.json
-    │       ├── report_v88.txt
-    │       ├── confusion_matrix.png
-    │       └── curves/             # 훈련 곡선 (loss/acc PNG + JSON)
-    └── tests.py
-```
-
----
-
-## Requirements
+### 4.1 전체 실행
 
 ```bash
-pip install -r requirements.txt
+chmod +x run_all_experiments.sh
+mkdir -p experiments/logs
+
+# 전체 실행
+nohup ./run_all_experiments.sh all > experiments/logs/run.log 2>&1 &
+
+# 개별 실행
+./run_all_experiments.sh kfold
+./run_all_experiments.sh loso
+./run_all_experiments.sh hierarchical
 ```
 
-- Python 3.10+
-- PyTorch 2.1.0 (CUDA 11.8+ 권장)
-- 전체 패키지 버전은 `requirements.txt` 참조
+| 단계 | 스크립트 | 내용 |
+|------|---------|------|
+| 1/3 | `train_kfold.py` | 7개 모델 × 5-Fold StratifiedGroupKFold 비교 |
+| 2/3 | `train_loso.py` | 상위 4개 모델 × LOSO (피험자 독립 검증) |
+| 3/3 | `train_hierarchical.py` | HierarchicalFusionNet 최종 실험 |
 
----
+### 4.2 K-Fold 설정
 
-## Usage
+- 분할: `StratifiedGroupKFold` (n_splits=5)
+- 그룹 기준: 피험자 ID (피험자 간 데이터 누출 방지)
+- 클래스 불균형: `BalancedSampler` + `FocalLoss(γ=2.0)`
+- 정규화: `LabelSmoothing=0.1`, `Mixup=0.2`
+- 조기 종료: `patience=7`
 
-### Step 1. 데이터 전처리 (최초 1회)
+### 4.3 학습 설정
 
-```bash
-python src/step_segmentation.py
-```
+| 하이퍼파라미터 | 값 |
+|--------------|-----|
+| 배치 크기 | 512 |
+| 에폭 | 50 |
+| 학습률 | 0.001 → 1e-6 (CosineAnnealing) |
+| Weight Decay | 0.001 |
+| Dropout (clf/feat) | 0.5 / 0.3 |
+| AMP | BF16 (NVIDIA L4) |
+| TTA | ×5 |
 
-`data/raw_csv/` → `data/processed/batches/dataset.h5` 생성.
-
-### Step 2. 학습
-
-#### Hierarchical SupCon (권장)
-
-```bash
-cd experiments/hierarchical
-python train_hierarchical.py
-```
-
-**CLI 옵션으로 하이퍼파라미터 오버라이드:**
-
-```bash
-# 기본 실행
-python train_hierarchical.py
-
-# 에포크 조정
-python train_hierarchical.py --s1_epochs 80 --s2_warmup 80
-
-# temperature 실험
-python train_hierarchical.py --temperature 0.05
-
-# majority vote 비활성
-python train_hierarchical.py --vote_window 0
-
-# 전체 옵션 확인
-python train_hierarchical.py --help
-```
-
-**백그라운드 실행:**
+### 4.4 모니터링
 
 ```bash
-nohup python train_hierarchical.py > ~/project/repo/logs/hierarchical.log 2>&1 &
-tail -f ~/project/repo/logs/hierarchical.log
-```
+# 로그 실시간 확인
+tail -f experiments/logs/kfold_run.log
 
-#### Baseline 비교
+# 프로세스 확인
+ps aux | grep train_kfold | grep -v grep
 
-```bash
-python experiments/baseline/train_kfold.py   # K-Fold
-python experiments/baseline/train_loso.py    # LOSO (논문 제출 기준)
-```
-
-#### SupCon
-
-```bash
-python experiments/supcon/train_supcon.py
+# 프로세스 종료
+kill <PID>
 ```
 
 ---
 
-## Model Architecture
+## 5. 주요 수정 이력 (v2.0)
 
-### Hierarchical Hard-Routing (v8.8)
-
-```
-IMU 신호 (54ch, 256 samples)
-    │
-    ├─ [Stage 1] 3cls CE
-    │   Backbone: M6 (Branch CNN + CBAM + Cross-Attention)
-    │   Output: 평탄(0) / 오르막(1) / 내리막(2)
-    │   Acc: ~99%
-    │
-    └─ [Stage 2] 4cls (평탄 클래스만)
-        Backbone: M6 (독립 학습, S2_INIT_FROM_S1=False)
-        + BioMech 16-dim 피처 결합
-        학습 4단계:
-          Step1: CE Warmup   (60ep, LR=1e-4)
-          Step2: SupCon      (100ep, T=0.07, balanced sampler)
-          Step3: Focal Loss  (100ep, γ=2.0, fc 레이어 부분 해제)
-          Step4: CE 마무리   (50ep)
-        Output: C1 / C4 / C5 / C6
-    │
-    └─ Hard Routing 결합 + Majority Vote (window=5)
-```
-
-### BioMech 16 Features (생체역학 피처)
-
-Heel-Strike 기반 스텝 분절에서 추출하는 16개 도메인 특징:
-
-| 피처 | 설명 | 관련 클래스 |
-|------|------|-------------|
-| 0~3 | Foot/Shank LT/RT 충격 피크값 | 전체 |
-| 4~5 | Foot/Shank 충격비 | 지면 흡수량 |
-| 6~7 | 상대 고주파 에너지 비율 (FFT) | C4 흙길 |
-| 8~9 | Foot 신호 표준편차 | C1 미끄러운 |
-| 10~11 | 피크 후 감쇠율 | C5 잔디 |
-| 12~13 | Shank 진동 (∣diff∣.mean) | C4 흙길 |
-| 14~15 | Foot/Shank 분산비 | C1 불안정 |
+| 파일 | 수정 내용 |
+|------|----------|
+| `features.py` | 44개(Foot 전용) → 216개(9센서 도메인 특화)로 전면 확장 |
+| `datasets.py` | HDF5 v9 구조(`subjects/S{id}/X,y`) 대응 파싱 수정 |
+| `train_kfold.py` | `feat44` → `feat`(N_FEATURES 동적 참조), config 속성명 수정 |
+| `train_common.py` | `ensure_dir`, `save_json`, `Timer`, `save_summary_table`, `fit_model` alias 추가 |
+| `channel_groups.py` | `get_foot_accel_idx` 함수 추가 |
+| `config.py` | `models_kfold`, `result_tables` 미존재 → 하드코딩/경로 수정 |
 
 ---
 
-## Validation Protocol
-
-| 항목 | 내용 |
-|------|------|
-| K-Fold | StratifiedGroupKFold (K=5), 피험자 단위 분할 |
-| LOSO | Leave-One-Subject-Out (논문 기준) |
-| Inner val | 각 fold 내 15% subject → early stopping |
-| Subject leakage | 완전 방지 (train/val/test 피험자 분리) |
-| 보고 방식 | Oracle acc (정답 라우팅) / Pipeline acc (실제 예측) 분리 |
-
----
-
-## Experiment Results
-
-| 모델 | Acc | 비고 |
-|------|-----|------|
-| M6 Branch+CBAM+Cross+Aug | 75.6% | Baseline |
-| SupCon v2 | 80.6% | Contrastive |
-| Hierarchical v8.5 (Stage1) | 83.2% | 최초 계층 구조 |
-| Hierarchical v8.8 | 진행중 | 4단계 학습 + MajorityVote |
-
-### Ablation (v8.7 → v8.8)
-
-| 변경 | 이유 |
-|------|------|
-| S2_INIT_FROM_S1: True → False | Stage1은 slope 최적화 → flat 4cls에 역효과 확인 |
-| S2_LR: 3e-5 → 1e-4 | warmup 56.6% 수렴 부족 |
-| S2_WARMUP_EP: 30 → 60 | 워밍업 기간 연장 |
-| T: 0.12 → 0.07 | SupCon 수렴 안정화 |
-| Focal patience: 7 → 25 | ep9 조기종료 방지 |
-| S2_WEIGHTS: 수동 → auto | compute_class_weight, fold별 자동 최적화 |
-| Majority Vote 추가 | 보행 연속성 기반 노이즈 제거 |
-
----
-
-## Output Files
+## 6. 실험 결과 출력 구조
 
 ```
-out_N40/kfold/hierarchical/
-├── summary_v88.json          # 전체 결과 + fold별 메타
-├── report_v88.txt            # per-class precision/recall/F1
-├── confusion_matrix.png      # 혼동 행렬
-└── curves/
-    ├── curve_S1_F1Hier.png   # Stage1 훈련 곡선
-    ├── curve_S2W_F1Hier.png  # Stage2 Warmup 곡선
-    ├── curve_S2FT_F1Hier.png # Stage2 Finetune 곡선
-    └── *.json                # 곡선 원본 데이터
+experiments/
+├── kfold/
+│   ├── M2/
+│   ├── M4/
+│   ├── M6/
+│   ├── ResNet1D/
+│   ├── CNNTCN/
+│   ├── ResNetTCN/
+│   ├── M7/
+│   │   ├── fold1_best.pt
+│   │   ├── ...
+│   │   ├── fold5_best.pt
+│   │   └── kfold_results.json   ← fold별 acc, f1, confusion matrix
+│   └── tables/
+│       └── comparison_table.csv
+├── loso/
+│   └── (동일 구조)
+├── hierarchical/
+└── logs/
+    ├── kfold_YYYYMMDD_HHMMSS.log
+    ├── loso_YYYYMMDD_HHMMSS.log
+    └── hierarchical_YYYYMMDD_HHMMSS.log
 ```
 
 ---
 
-## References
-
-1. Niswander et al. (2021) — Foot IMU biomechanics & impact analysis
-2. Ordóñez & Roggen (2016) IEEE TNNLS — Hierarchical HAR
-3. Khosla et al. (2020) NeurIPS — Supervised Contrastive Learning
-4. Lin et al. (2017) ICCV — Focal Loss for Dense Object Detection
+*IMU 지형 분류 파이프라인 v2.0*
