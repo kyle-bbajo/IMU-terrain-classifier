@@ -10,8 +10,9 @@
 #   ./run_all_experiments.sh hierarchical
 # ══════════════════════════════════════════════════════════════
 
-set -e
+set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="${SCRIPT_DIR}/src:${PYTHONPATH}"
 LOG_DIR="${SCRIPT_DIR}/experiments/logs"
 mkdir -p "${LOG_DIR}"
 TS=$(date +%Y%m%d_%H%M%S)

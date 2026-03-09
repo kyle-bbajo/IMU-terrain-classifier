@@ -34,7 +34,6 @@ GROUPS: dict[str, list[str]] = {
 }
 
 # 채널 타입 키워드 (이 키워드를 포함하는 채널만 사용)
-# "Accel Sensor" = 짧은 이름, "Acceleration" = Noraxon 긴 이름
 RAW_CHANNEL_KEYWORDS: list[str] = ["accel sensor", "acceleration", "gyroscope"]
 
 
@@ -51,17 +50,14 @@ def get_sensor_part(col: str) -> str | None:
     """
     cl = col.lower()
 
-    # 부위 키워드
     body_parts = ["hand", "thigh", "shank", "foot"]
     sides = ["lt", "rt"]
 
     for part in body_parts:
         if part in cl:
             for side in sides:
-                # "hand ... lt" 또는 "hand-lt" 모두 매칭
                 if side in cl:
                     return f"{part} {side}"
-            # 좌우 구분 없이 부위만 있으면 (예외 케이스)
             return None
 
     if "pelvis" in cl:
@@ -76,7 +72,7 @@ def filter_raw_channels(all_channels: list[str]) -> list[str]:
     형태가 모두 있을 경우 먼저 나오는 것만 유지.
     """
     raw_channels: list[str] = []
-    seen_parts: set[str] = set()  # "pelvis_accel_x" 형태로 중복 체크
+    seen_parts: set[str] = set()
 
     for c in all_channels:
         if not is_raw_imu_channel(c):
@@ -85,7 +81,6 @@ def filter_raw_channels(all_channels: list[str]) -> list[str]:
         if part is None:
             continue
 
-        # 축(x/y/z) + 타입(accel/gyro) 키 생성
         cl = c.lower()
         axis = "x" if "x" in cl.split("(")[0].split("-")[-1] else (
                "y" if "y" in cl.split("(")[0].split("-")[-1] else "z")
@@ -124,6 +119,8 @@ def build_branch_idx(
             print(f"    {nm:<12}: {branch_ch[nm]:3d}ch")
 
     return branch_idx, branch_ch
+
+
 def get_foot_accel_idx(channels: list[str]) -> list[int]:
     """Foot 센서의 Accelerometer 채널 인덱스만 반환한다."""
     idx = []

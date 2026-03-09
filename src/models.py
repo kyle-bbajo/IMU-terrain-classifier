@@ -3,8 +3,8 @@
 MODEL_REGISTRY 키:
     baseline    : "M2", "M4", "M6"
     comparison  : "ResNet1D", "CNNTCN", "ResNetTCN"
-    hybrid      : "M7"             (CNN + 44-feat, IS_HYBRID=True)
-    advanced    : "Hierarchical"   (ResNetTCN + 44-feat, IS_HYBRID=True)
+    hybrid      : "M7"             (CNN + N_FEATURES-feat, IS_HYBRID=True)
+    advanced    : "Hierarchical"   (ResNetTCN + N_FEATURES-feat, IS_HYBRID=True)
     flat        : "M1"             (PCA + flat CNN, 별도 run_M1)
 """
 from __future__ import annotations
@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import CFG
+from features import N_FEATURES   # 하드코딩 금지 — 항상 동적 참조
 
 
 # ─────────────────────────────────────────────
@@ -211,7 +212,7 @@ class ResNetBranch(nn.Module):
         self.layer3 = nn.Sequential(ResBlock1D(128, out_dim, 2, 3, "none"), ResBlock1D(out_dim, out_dim, 1, 3, "cbam"))
         self.drop   = nn.Dropout(d)
     def forward(self, x):
-        return self.drop(self.layer3(self.layer2(self.layer1(self.stem(x)))))  # (B, out_dim, T')
+        return self.drop(self.layer3(self.layer2(self.layer1(self.stem(x)))))
 
 
 class CNNTCNBranch(nn.Module):
@@ -223,8 +224,13 @@ class CNNTCNBranch(nn.Module):
             ConvBNReLU(64, 128, 5, 2),   nn.MaxPool1d(2),
             ConvBNReLU(128, out_dim, 3, 1),
         )
-        self.tcn  = nn.Sequential(DilatedTCN(out_dim,1,d), DilatedTCN(out_dim,2,d), DilatedTCN(out_dim,4,d))
-        self.attn: nn.Module = CBAM(out_dim) if mode == "cbam" else SEBlock(out_dim) if mode == "se" else nn.Identity()
+        self.tcn  = nn.Sequential(
+            DilatedTCN(out_dim, 1, d), DilatedTCN(out_dim, 2, d), DilatedTCN(out_dim, 4, d),
+        )
+        self.attn: nn.Module = (
+            CBAM(out_dim) if mode == "cbam" else
+            SEBlock(out_dim) if mode == "se" else nn.Identity()
+        )
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.drop = nn.Dropout(d)
     def forward(self, x):
@@ -266,14 +272,16 @@ class _BranchBase(nn.Module):
         self.names    = list(branch_channels.keys())
         self.n        = len(self.names)
         self.cross    = cross
-        self.branches = nn.ModuleDict({nm: branch_ctor(ch, feat, mode) for nm, ch in branch_channels.items()})
+        self.branches = nn.ModuleDict({
+            nm: branch_ctor(ch, feat, mode) for nm, ch in branch_channels.items()
+        })
         self.use_fft  = CFG.use_fft_branch and CFG.fft_source_group in branch_channels
         if self.use_fft:
             self.fft_src     = CFG.fft_source_group
             self.freq_branch = FreqBranch(branch_channels[self.fft_src], feat)
         if cross:
             self.cross_attn = CrossGroupAttn(feat)
-        n_f   = self.n + (1 if self.use_fft else 0)
+        n_f = self.n + (1 if self.use_fft else 0)
         self.clf = nn.Sequential(
             nn.Linear(feat * n_f, 256), nn.ReLU(inplace=True), nn.Dropout(drop),
             nn.Linear(256, 128),        nn.ReLU(inplace=True), nn.Dropout(drop),
@@ -298,10 +306,11 @@ class _BranchBase(nn.Module):
 # M2–M6 팩토리
 # ─────────────────────────────────────────────
 
-def M2_BranchCNN(bc):    return _BranchBase(bc, Branch, "plain", False)
-def M3_BranchSE(bc):     return _BranchBase(bc, Branch, "se",    False)
-def M4_BranchCBAM(bc):   return _BranchBase(bc, Branch, "cbam",  False)
-def M5_BranchCBAMCross(bc): return _BranchBase(bc, Branch, "cbam", True)
+def M2_BranchCNN(bc):       return _BranchBase(bc, Branch, "plain", False)
+def M3_BranchSE(bc):        return _BranchBase(bc, Branch, "se",    False)
+def M4_BranchCBAM(bc):      return _BranchBase(bc, Branch, "cbam",  False)
+def M5_BranchCBAMCross(bc): return _BranchBase(bc, Branch, "cbam",  True)
+
 
 class M6_BranchCBAMCrossAug(_BranchBase):
     def __init__(self, bc):
@@ -322,11 +331,10 @@ def BranchResNet1D(bc):
             self.names    = list(bc.keys())
             self.branches = nn.ModuleDict({nm: ResNetBranch(ch, feat) for nm, ch in bc.items()})
             self.cross    = CrossGroupAttn(feat)
-            n_f   = len(self.names)
-            self.pool = nn.AdaptiveAvgPool1d(1)
-            self.clf  = nn.Sequential(
-                nn.Linear(feat * n_f, 256), nn.ReLU(inplace=True), nn.Dropout(CFG.dropout_clf),
-                nn.Linear(256, 128),        nn.ReLU(inplace=True), nn.Dropout(CFG.dropout_clf),
+            self.pool     = nn.AdaptiveAvgPool1d(1)
+            self.clf      = nn.Sequential(
+                nn.Linear(feat * len(self.names), 256), nn.ReLU(inplace=True), nn.Dropout(CFG.dropout_clf),
+                nn.Linear(256, 128),                    nn.ReLU(inplace=True), nn.Dropout(CFG.dropout_clf),
                 nn.Linear(128, CFG.num_classes),
             )
             self.apply(_init)
@@ -352,13 +360,13 @@ def ResNetTCN(bc: dict) -> nn.Module:
     class _M(nn.Module):
         def __init__(self):
             super().__init__()
-            feat = CFG.feat_dim; d = CFG.dropout_feat; dc = CFG.dropout_clf
+            feat  = CFG.feat_dim; d = CFG.dropout_feat; dc = CFG.dropout_clf
             self.names    = list(bc.keys())
             self.branches = nn.ModuleDict({nm: ResNetBranch(ch, feat) for nm, ch in bc.items()})
             total         = feat * len(self.names)
             self.tcn      = nn.Sequential(
-                DilatedTCN(total,1,d), DilatedTCN(total,2,d),
-                DilatedTCN(total,4,d), DilatedTCN(total,8,d),
+                DilatedTCN(total, 1, d), DilatedTCN(total, 2, d),
+                DilatedTCN(total, 4, d), DilatedTCN(total, 8, d),
             )
             self.pool = AttnPool1D(total)
             self.clf  = nn.Sequential(
@@ -368,19 +376,23 @@ def ResNetTCN(bc: dict) -> nn.Module:
             )
             self.apply(_init)
         def _encode(self, bi):
-            feats = [self.branches[nm](bi[nm]) for nm in self.names]  # list (B,feat,T')
-            return self.pool(self.tcn(torch.cat(feats, dim=1)))         # (B, total)
+            feats = [self.branches[nm](bi[nm]) for nm in self.names]
+            return self.pool(self.tcn(torch.cat(feats, dim=1)))
         def forward(self, bi): return self.clf(self._encode(bi))
         def extract(self, bi): return self._encode(bi)
     return _M()
 
 
 # ─────────────────────────────────────────────
-# FeatureMLP (44-feat 스트림)
+# FeatureMLP — N_FEATURES 동적 참조 (하드코딩 금지)
 # ─────────────────────────────────────────────
 
 class FeatureMLP(nn.Module):
-    def __init__(self, n_feat=44, out_dim=None):
+    """핸드크래프트 피처 스트림 MLP.
+
+    n_feat 기본값은 features.N_FEATURES (현재 216) 를 동적으로 참조한다.
+    """
+    def __init__(self, n_feat: int = N_FEATURES, out_dim: int = None):
         super().__init__()
         out_dim = out_dim or CFG.feat_dim
         d = CFG.dropout_feat
@@ -393,7 +405,7 @@ class FeatureMLP(nn.Module):
 
 
 # ─────────────────────────────────────────────
-# M7: CNN(M6) + 44-feat Hybrid
+# M7: CNN(M6) + N_FEATURES-feat Hybrid
 # ─────────────────────────────────────────────
 
 class M7_HybridModel(nn.Module):
@@ -410,9 +422,9 @@ class M7_HybridModel(nn.Module):
         if self.use_fft:
             self.fft_src     = CFG.fft_source_group
             self.freq_branch = FreqBranch(bc[self.fft_src], feat)
-        n_f       = self.n + (1 if self.use_fft else 0)
-        cnn_dim   = feat * n_f
-        self.feat_mlp  = FeatureMLP(44)
+        n_f        = self.n + (1 if self.use_fft else 0)
+        cnn_dim    = feat * n_f
+        self.feat_mlp  = FeatureMLP(N_FEATURES)   # ← 동적 참조
         fusion_dim     = cnn_dim + CFG.feat_dim
         self.bn_fuse   = nn.BatchNorm1d(fusion_dim)
         self.clf       = nn.Sequential(
@@ -430,21 +442,22 @@ class M7_HybridModel(nn.Module):
             feats.append(self.freq_branch(bi[self.fft_src]))
         return torch.cat(feats, dim=1)
 
-    def forward(self, bi, feat44):
+    def forward(self, bi, feat):
+        """feat: (B, N_FEATURES) — 하이브리드 피처 스트림."""
         if self.training:
             bi = {k: augment(v, True) for k, v in bi.items()}
-        fused = self.bn_fuse(torch.cat([self._cnn_encode(bi), self.feat_mlp(feat44)], dim=1))
+        fused = self.bn_fuse(torch.cat([self._cnn_encode(bi), self.feat_mlp(feat)], dim=1))
         return self.clf(fused)
 
-    def extract(self, bi, feat44):
-        return self.bn_fuse(torch.cat([self._cnn_encode(bi), self.feat_mlp(feat44)], dim=1))
+    def extract(self, bi, feat):
+        return self.bn_fuse(torch.cat([self._cnn_encode(bi), self.feat_mlp(feat)], dim=1))
 
 
 def M7_Hybrid(bc): return M7_HybridModel(bc)
 
 
 # ─────────────────────────────────────────────
-# HierarchicalFusionNet: ResNetTCN + 44-feat
+# HierarchicalFusionNet: ResNetTCN + N_FEATURES-feat
 # ─────────────────────────────────────────────
 
 class HierarchicalFusionNet(nn.Module):
@@ -457,11 +470,11 @@ class HierarchicalFusionNet(nn.Module):
         self.branches = nn.ModuleDict({nm: ResNetBranch(ch, feat) for nm, ch in bc.items()})
         total         = feat * len(self.names)
         self.tcn      = nn.Sequential(
-            DilatedTCN(total,1,d), DilatedTCN(total,2,d),
-            DilatedTCN(total,4,d), DilatedTCN(total,8,d),
+            DilatedTCN(total, 1, d), DilatedTCN(total, 2, d),
+            DilatedTCN(total, 4, d), DilatedTCN(total, 8, d),
         )
         self.pool      = AttnPool1D(total)
-        self.feat_mlp  = FeatureMLP(44)
+        self.feat_mlp  = FeatureMLP(N_FEATURES)   # ← 동적 참조
         fusion_dim     = total + CFG.feat_dim
         self.bn_fuse   = nn.BatchNorm1d(fusion_dim)
         self.clf       = nn.Sequential(
@@ -475,14 +488,15 @@ class HierarchicalFusionNet(nn.Module):
         feats = [self.branches[nm](bi[nm]) for nm in self.names]
         return self.pool(self.tcn(torch.cat(feats, dim=1)))
 
-    def forward(self, bi, feat44):
+    def forward(self, bi, feat):
+        """feat: (B, N_FEATURES) — 하이브리드 피처 스트림."""
         if self.training:
             bi = {k: augment(v, True) for k, v in bi.items()}
-        fused = self.bn_fuse(torch.cat([self._deep(bi), self.feat_mlp(feat44)], dim=1))
+        fused = self.bn_fuse(torch.cat([self._deep(bi), self.feat_mlp(feat)], dim=1))
         return self.clf(fused)
 
-    def extract(self, bi, feat44):
-        return self.bn_fuse(torch.cat([self._deep(bi), self.feat_mlp(feat44)], dim=1))
+    def extract(self, bi, feat):
+        return self.bn_fuse(torch.cat([self._deep(bi), self.feat_mlp(feat)], dim=1))
 
 
 def Hierarchical(bc): return HierarchicalFusionNet(bc)
@@ -493,15 +507,15 @@ def Hierarchical(bc): return HierarchicalFusionNet(bc)
 # ─────────────────────────────────────────────
 
 MODEL_REGISTRY: Dict[str, object] = {
-    "M2":          M2_BranchCNN,
-    "M3":          M3_BranchSE,
-    "M4":          M4_BranchCBAM,
-    "M5":          M5_BranchCBAMCross,
-    "M6":          M6_BranchCBAMCrossAug,
-    "M7":          M7_Hybrid,
-    "ResNet1D":    BranchResNet1D,
-    "CNNTCN":      BranchCNNTCN,
-    "ResNetTCN":   ResNetTCN,
+    "M2":           M2_BranchCNN,
+    "M3":           M3_BranchSE,
+    "M4":           M4_BranchCBAM,
+    "M5":           M5_BranchCBAMCross,
+    "M6":           M6_BranchCBAMCrossAug,
+    "M7":           M7_Hybrid,
+    "ResNet1D":     BranchResNet1D,
+    "CNNTCN":       BranchCNNTCN,
+    "ResNetTCN":    ResNetTCN,
     "Hierarchical": Hierarchical,
 }
 
