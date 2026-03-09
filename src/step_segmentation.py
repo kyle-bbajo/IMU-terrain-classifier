@@ -56,14 +56,14 @@ BOUT_MIN_WALK_SEC  = 2.0
 BOUT_MAX_GAP_SEC   = 0.60
 BOUT_PAD_SEC       = 0.20
 BOUT_ENERGY_Z      = -0.2
-TURN_Z_THR         = 0.55
+TURN_Z_THR         = 2.0
 TURN_MIN_SEC       = 0.25
 MIN_STEPS_PER_BOUT = 2
 
 # C1: 4회 왕복, C6: 중간 방향 전환 1회 → 2 bout
 COND_EXPECTED_BOUTS: dict[int, int] = {1: 4, 6: 2}
 
-_FLIP_RATIO = 0.30
+_FLIP_RATIO = 0.60
 
 
 # ──────────────────────────────────────────────────────────────
@@ -193,6 +193,22 @@ def rename_columns(df: pd.DataFrame) -> pd.DataFrame:
 # ──────────────────────────────────────────────────────────────
 # 파일 탐색
 # ──────────────────────────────────────────────────────────────
+
+
+def interpolate_sensor_gaps(df, max_gap=100):
+    """센서 NaN 구간을 linear interpolation으로 복구 (max_gap 샘플 이하만)."""
+    import pandas as pd
+    for col in df.select_dtypes(include=["float64","float32","int64","int32"]).columns:
+        if df[col].isna().any():
+            s = df[col]
+            nan_mask = s.isna()
+            groups = nan_mask != nan_mask.shift()
+            group_id = groups.cumsum()
+            group_sizes = nan_mask.groupby(group_id).transform("sum")
+            interp_mask = nan_mask & (group_sizes <= max_gap)
+            if interp_mask.any():
+                df[col] = df[col].where(~interp_mask, s.interpolate(method="linear", limit_direction="both"))
+    return df
 
 def parse_filename(fname: str) -> tuple[Optional[int], Optional[int], Optional[int]]:
     m = re.search(r"S(\d+)C(\d+)T(\d+)", fname, re.IGNORECASE)
@@ -417,7 +433,7 @@ def _find_pelvis_gyro_col(columns: list[str]) -> str | None:
     z(yaw) 우선, 없으면 y(pitch) — 루프를 axis별로 분리해 순서 보장.
     signal_type은 _SIGNAL_TYPE_SYNONYMS["gyroscope"]와 동일 기준 적용."""
     gyro_tokens = _SIGNAL_TYPE_SYNONYMS["gyroscope"]
-    for axis in ("z", "y"):
+    for axis in ("x", "z", "y"):  # Noraxon pelvis: yaw=x
         for c in columns:
             cl = c.lower()
             if "pelvis" not in cl:
@@ -512,6 +528,7 @@ def _run_bout_detection(
     turn_runs = [(s, e) for s, e in find_true_runs(turn_mask) if (e - s) >= min_turn]
 
     walk_runs = find_true_runs(walk_mask)
+    walk_runs = merge_close_runs(walk_runs, max_gap=int(fs * max_gap_sec))
     walk_runs = subtract_runs(walk_runs, turn_runs)
 
     min_walk = int(fs * min_walk_sec)
@@ -551,7 +568,7 @@ def detect_walking_bouts(
 
     # bout 수 부족 → turn threshold 낮춰서 더 잘게 자름
     if len(bouts) < expected:
-        for thr in (0.45, 0.35, 0.25):
+        for thr in (1.5, 1.0, 0.75):
             retry = _run_bout_detection(df, fs, BOUT_ENERGY_Z, thr,
                                          BOUT_MIN_WALK_SEC, BOUT_MAX_GAP_SEC)
             if len(retry) >= expected:
@@ -765,7 +782,7 @@ def detect_steps(
     if len(hs_acc) == 0 and len(hs_gyro) == 0:
         return [], []
 
-    candidates = _reconcile_candidates(hs_acc, hs_gyro, 100.0, fs)
+    candidates = _reconcile_candidates(hs_acc, hs_gyro, 250.0, fs)
     candidates = _boutwise_stride_filter(candidates, fs)  # bout 내부 stride 필터
     if len(candidates) < 2:
         return [], []
@@ -1119,6 +1136,7 @@ def main() -> None:
             try:
                 df = read_csv_with_retry(rec["path"])
                 df = rename_columns(df)
+                df = interpolate_sensor_gaps(df)
             except Exception as e:
                 log(f"  ⚠ read fail: {rec['path'].name} ({e})")
                 zero_retries[file_key] = zero_retries.get(file_key, 0) + 1
@@ -1208,7 +1226,9 @@ def main() -> None:
                         cv_orig  = _stride_cv([(s, e) for s, e in s_steps])
                         cv_retry = _stride_cv([(s, e) for s, e in retry])
                         # CV가 나빠지면서 개수만 늘어난 경우 거부
-                        if cv_retry > cv_orig * 1.3 and len(retry) < this_n * 2:
+                        # 불균형 심할수록 CV 허용 완화 (this_n이 other_n의 절반 미만이면 2.0까지 허용)
+                        cv_tolerance = 2.0 if this_n < other_n * 0.5 else 1.3
+                        if cv_retry > cv_orig * cv_tolerance and len(retry) < this_n * 2:
                             log(f"    ✗ flip [{side}] 거부 (CV 악화 {cv_orig:.2f}→{cv_retry:.2f})")
                             continue
 
@@ -1264,7 +1284,7 @@ def main() -> None:
                 total_raw = lt_n_raw + rt_n_raw
                 if total_raw >= MIN_STEPS_PER_BOUT:
                     lt_ratio = lt_n_raw / total_raw
-                    if lt_ratio > 0.80 or lt_ratio < 0.20:
+                    if lt_ratio > 0.70 or lt_ratio < 0.30:
                         log(f"    ✗ bout{local_trial_id} skip: "
                             f"LT/RT={lt_n_raw}/{rt_n_raw} ({lt_ratio:.0%}/{1-lt_ratio:.0%}) — 극단 불균형")
                         continue
@@ -1407,4 +1427,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main()# 이미 중간에 있어야 함 - 확인 필요
