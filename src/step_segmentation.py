@@ -1,20 +1,26 @@
+# -*- coding: utf-8 -*-
 """
-step_segmentation.py — 힐스트라이크 스텝 분할 (v9.4-filewise)
-═══════════════════════════════════════════════════════════════
-아키텍처:
-    Pass 0 : 공통 채널 (기존 HDF5 있으면 재사용)
-    Pass 2 : 파일별 적응형 스텝 검출 → HDF5 추가
+step_segmentation.py — heel-strike step segmentation  (v10.0-trialwise)
+════════════════════════════════════════════════════════════════════════════
+핵심 구조:
+  [1] 파일 전체 → walking bout(trial) 분할
+      - stop / turn 구간 자동 제거
+      - C1(4 bout), C6(2 bout) 구조 인식
+      - bout 수 미달 시 파라미터 자동 재시도
 
-완전 파일 적응형 (v9.4-filewise):
-  - detect_steps()     : 이 파일 신호 통계만으로 피크·stride 기준 결정
-  - score_steps_by_side: 이 파일 raw_steps 간격으로 stride 파라미터 추정
-  - 증분 판정         : processed_files.json (파일 키 기반)
-  - terrain_params / Pass 1 완전 제거
+  [2] 각 bout 안에서만 HS 검출
+      - LT/RT dual-signal consensus
+      - polarity flip 자동 재시도
+      - trial 경계 오염 방지
 
-사용법:
-    python3 step_segmentation.py           # 증분 (미처리 파일만)
-    python3 step_segmentation.py --force   # 전체 재생성
-═══════════════════════════════════════════════════════════════
+  [3] HDF5 메타 저장
+      source_file / trial_id / bout_start / bout_end /
+      step_start / step_end / side / support
+
+사용:
+    python3 step_segmentation.py
+    python3 step_segmentation.py --force
+════════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
 
@@ -25,8 +31,7 @@ import json
 import gc
 import argparse
 from pathlib import Path
-from types import TracebackType                     # ⑤
-from typing import Optional
+from typing import Optional, NamedTuple
 from collections import defaultdict
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -42,113 +47,154 @@ from scipy.signal import find_peaks, resample, butter, filtfilt
 # 상수
 # ──────────────────────────────────────────────────────────────
 
-SEGMENTATION_VERSION   = "v9.4-filewise-consensus-2"  # processed_files 버전 — 로직 변경 시 올림
-_SUPPORTED_H5_FORMATS = {
-    "subject_group_v9",
-    "subject_group_v8",
-}
+SEGMENTATION_VERSION   = "v10.0-trialwise-bout-step"
+CSV_SKIPROWS = getattr(config, "CSV_SKIPROWS", 2)  # Noraxon export: 헤더 2줄 skip
+_SUPPORTED_H5_FORMATS  = {"subject_group_v10", "subject_group_v9", "subject_group_v8"}
+
+BOUT_SMOOTH_SEC    = 0.25
+BOUT_MIN_WALK_SEC  = 2.0
+BOUT_MAX_GAP_SEC   = 0.60
+BOUT_PAD_SEC       = 0.20
+BOUT_ENERGY_Z      = -0.2
+TURN_Z_THR         = 0.55
+TURN_MIN_SEC       = 0.25
+MIN_STEPS_PER_BOUT = 2
+
+# C1: 4회 왕복, C6: 중간 방향 전환 1회 → 2 bout
+COND_EXPECTED_BOUTS: dict[int, int] = {1: 4, 6: 2}
+
+_FLIP_RATIO = 0.30
 
 
 # ──────────────────────────────────────────────────────────────
-# 유틸리티
+# 유틸
 # ──────────────────────────────────────────────────────────────
 
 def log(msg: str) -> None:
-    """타임스탬프 포함 로그 출력."""
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def read_csv_with_retry(
-    path: Path,
-    skiprows: int = 2,
-    max_retries: int = 3,
-    **kwargs,
-) -> pd.DataFrame:
-    """일시적 I/O 오류에 대비한 재시도 CSV 읽기.
-
-    Args:
-        path: CSV 파일 경로
-        skiprows: 헤더 스킵 행 수
-        max_retries: 최대 재시도 횟수
-        **kwargs: pd.read_csv 에 그대로 전달 (예: nrows=0)
-
-    Returns:
-        읽어들인 DataFrame
-
-    Raises:
-        최종 시도까지 실패하면 마지막 예외를 재발생
-    """
-    last_exc: Exception = RuntimeError("알 수 없는 오류")
+def read_csv_with_retry(path: Path, skiprows: int = CSV_SKIPROWS, max_retries: int = 3, **kw) -> pd.DataFrame:
+    last: Exception = RuntimeError("unknown")
     for attempt in range(max_retries):
         try:
-            return pd.read_csv(path, skiprows=skiprows, low_memory=False, **kwargs)
-        except Exception as exc:
-            last_exc = exc
+            return pd.read_csv(path, skiprows=skiprows, low_memory=False, **kw)  # skiprows default=CSV_SKIPROWS
+        except Exception as e:
+            last = e
             if attempt < max_retries - 1:
                 time.sleep(0.5 * (attempt + 1))
-    raise last_exc
+    raise last
+
+
+def moving_average(x: np.ndarray, win: int) -> np.ndarray:
+    if win <= 1:
+        return x.copy()
+    return np.convolve(x, np.ones(win) / win, mode="same")
+
+
+def robust_zscore(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    med = np.nanmedian(x)
+    mad = np.nanmedian(np.abs(x - med))
+    return (x - med) / (1.4826 * mad + 1e-8)
+
+
+def find_true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    in_run = False
+    start = 0
+    for i, v in enumerate(mask):
+        if v and not in_run:
+            in_run, start = True, i
+        elif not v and in_run:
+            runs.append((start, i))
+            in_run = False
+    if in_run:
+        runs.append((start, len(mask)))
+    return runs
+
+
+def merge_close_runs(runs: list[tuple[int, int]], max_gap: int) -> list[tuple[int, int]]:
+    if not runs:
+        return []
+    merged = [runs[0]]
+    for s, e in runs[1:]:
+        ps, pe = merged[-1]
+        if s - pe <= max_gap:
+            merged[-1] = (ps, e)
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def subtract_runs(
+    base: list[tuple[int, int]], cuts: list[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    if not base:
+        return []
+    if not cuts:
+        return base[:]
+    out: list[tuple[int, int]] = []
+    for bs, be in base:
+        segs = [(bs, be)]
+        for cs, ce in cuts:
+            new_segs = []
+            for ss, se in segs:
+                if ce <= ss or cs >= se:
+                    new_segs.append((ss, se))
+                else:
+                    if ss < cs:
+                        new_segs.append((ss, cs))
+                    if ce < se:
+                        new_segs.append((ce, se))
+            segs = new_segs
+            if not segs:
+                break
+        out.extend((s, e) for s, e in segs if e > s)
+    return out
 
 
 # ──────────────────────────────────────────────────────────────
-# 컬럼명 통일 (Noraxon 버전/내보내기 설정 차이 보정)
+# 컬럼 정규화
 # ──────────────────────────────────────────────────────────────
 
 RENAME_MAP: dict[str, str] = {
-    "Noraxon MyoMotion-Joints-Knee LT-Rotation Ext (deg)":
-        "Knee Rotation Ext LT (deg)",
-    "Noraxon MyoMotion-Joints-Knee RT-Rotation Ext (deg)":
-        "Knee Rotation Ext RT (deg)",
+    "Noraxon MyoMotion-Joints-Knee LT-Rotation Ext (deg)": "Knee Rotation Ext LT (deg)",
+    "Noraxon MyoMotion-Joints-Knee RT-Rotation Ext (deg)": "Knee Rotation Ext RT (deg)",
 }
-
-_COL_NORMALIZE_RULES: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"^Noraxon\s+MyoMotion[-\s]+Segments[-\s]+"), ""),
-    (re.compile(r"^Noraxon\s+MyoMotion[-\s]+Joints[-\s]+"), ""),
+_COL_RULES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"^Noraxon\s+MyoMotion[-\s]+Segments[-\s]+"),     ""),
+    (re.compile(r"^Noraxon\s+MyoMotion[-\s]+Joints[-\s]+"),       ""),
     (re.compile(r"^Noraxon\s+MyoMotion[-\s]+Trajectories[-\s]+"), "Trajectories "),
-    (re.compile(r"^Noraxon\s+MyoMotion[-\s]+"), ""),
-    (re.compile(r"Acceleration\b"), "Accel Sensor"),
+    (re.compile(r"^Noraxon\s+MyoMotion[-\s]+"),                   ""),
+    (re.compile(r"Acceleration\b"),                                "Accel Sensor"),
 ]
 
 
 def rename_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Noraxon export 버전 간 컬럼명 차이를 통일한다."""
     renames = {k: v for k, v in RENAME_MAP.items() if k in df.columns}
     if renames:
         df = df.rename(columns=renames)
-
-    new_names: dict[str, str] = {}
+    new: dict[str, str] = {}
     for c in df.columns:
-        new_c = c
-        for pat, repl in _COL_NORMALIZE_RULES:
-            new_c = pat.sub(repl, new_c)
-        if new_c != c:
-            new_names[c] = new_c
-
-    if new_names:
+        nc = c
+        for pat, repl in _COL_RULES:
+            nc = pat.sub(repl, nc)
+        if nc != c:
+            new[c] = nc
+    if new:
         existing = set(df.columns)
-        collisions = [
-            (k, v) for k, v in new_names.items() if v in existing and v != k
-        ]
-        if collisions:
-            for old, new in collisions[:5]:
-                log(f"    ⚠ 컬럼 rename 충돌: '{old}' -> '{new}' (스킵)")
-            if len(collisions) > 5:
-                log(f"    ⚠ 추가 rename 충돌 {len(collisions) - 5}건")
-        safe_renames = {
-            k: v for k, v in new_names.items()
-            if v not in existing or v == k
-        }
-        if safe_renames:
-            df = df.rename(columns=safe_renames)
-
+        safe = {k: v for k, v in new.items() if v not in existing or v == k}
+        if safe:
+            df = df.rename(columns=safe)
     return df
 
 
 # ──────────────────────────────────────────────────────────────
-# 1. 파일 탐색
+# 파일 탐색
 # ──────────────────────────────────────────────────────────────
 
 def parse_filename(fname: str) -> tuple[Optional[int], Optional[int], Optional[int]]:
-    """파일명에서 피험자·지형·시행 번호를 추출한다."""
     m = re.search(r"S(\d+)C(\d+)T(\d+)", fname, re.IGNORECASE)
     if m:
         return int(m.group(1)), int(m.group(2)), int(m.group(3))
@@ -159,10 +205,8 @@ def parse_filename(fname: str) -> tuple[Optional[int], Optional[int], Optional[i
 
 
 def discover_csvs(data_dir: Path, n_subjects: int) -> list[dict]:
-    """데이터 디렉토리에서 유효한 CSV 레코드를 수집한다."""
     if not data_dir.exists():
-        raise FileNotFoundError(f"데이터 디렉토리 없음: {data_dir}")
-
+        raise FileNotFoundError(f"data dir not found: {data_dir}")
     records: list[dict] = []
     for csv_path in sorted(data_dir.glob("*.csv")):
         sid, cond, trial = parse_filename(csv_path.name)
@@ -170,153 +214,86 @@ def discover_csvs(data_dir: Path, n_subjects: int) -> list[dict]:
             continue
         if cond is None or cond < 1 or cond > config.NUM_CLASSES:
             continue
-        records.append({
-            "path": csv_path,
-            "sid": sid,
-            "cond": cond,
-            "trial": trial,
-            "label": cond - 1,    # 학습용 class label: 0-based
-        })
+        records.append({"path": csv_path, "sid": sid, "cond": cond,
+                         "trial": trial, "label": cond - 1})
     return records
 
 
 # ──────────────────────────────────────────────────────────────
-# 2. 기존 HDF5 상태 확인
+# 기존 HDF5 / processed_files
 # ──────────────────────────────────────────────────────────────
 
-def load_existing_h5_info(
-    h5_path: Path,
-) -> tuple[Optional[list[str]], int]:
-    """기존 HDF5에서 채널 목록과 총 스텝 수를 읽는다.
-
-    역할: 채널 일관성 검증 + step 수 집계 + format/step_definition 검증.
-    완료 파일 판정은 processed_files.json 에서 담당하므로 done_sids 반환 없음.
-    """
+def load_existing_h5_info(h5_path: Path) -> tuple[Optional[list[str]], int]:
     if not h5_path.exists():
         return None, 0
-
     try:
         with h5py.File(h5_path, "r") as f:
-            h5_format = f.attrs.get("format", "unknown")
-            if h5_format == "unknown":
-                log(
-                    "  ℹ HDF5 format attr 없음: flat v7 이전 구조로 추정. "
-                    "하위 호환으로 읽지만 step_definition 의미가 다를 수 있습니다."
-                )
-            elif h5_format not in _SUPPORTED_H5_FORMATS:
-                log(
-                    f"  ⚠ HDF5 포맷 비호환: '{h5_format}' "
-                    f"(지원={_SUPPORTED_H5_FORMATS}). 데이터 구조가 다를 수 있습니다."
-                )
-            elif h5_format == "subject_group_v8":
-                log(
-                    "  ⚠ HDF5 포맷 v8 감지: 구조 확인용 읽기만 허용됩니다. "
-                    "step_definition이 현재 버전과 다르면 append는 차단되므로 "
-                    "--force로 전체 재생성을 권장합니다."
-                )
-
+            # format 호환성 검증
+            fmt = f.attrs.get("format", "")
+            if fmt and fmt not in _SUPPORTED_H5_FORMATS:
+                raise ValueError(f"unsupported HDF5 format: '{fmt}'. Use --force.")
             step_def = f.attrs.get("step_definition", "")
-            if step_def and step_def != "filewise_dual_signal_consensus_bilateral_merge":
-                log(
-                    f"  ℹ step_definition='{step_def}' "
-                    f"(현재 버전은 'filewise_dual_signal_consensus_bilateral_merge'). "
-                    f"병합 로직이 다른 버전으로 생성된 데이터입니다."
-                )
-                raise ValueError(
-                    f"step_definition 불일치 (저장='{step_def}'). "
-                    f"--force 로 전체 재생성하거나 기존 HDF5를 백업 후 삭제하세요."
-                )
-
+            expected = "trialwise_dual_signal_consensus_bilateral_merge"
+            if step_def and step_def != expected:
+                raise ValueError(f"step_definition mismatch (saved='{step_def}'). Use --force.")
             if "subjects" in f and "channels" in f:
-                n_existing = sum(
-                    f[f"subjects/{sk}/X"].shape[0] for sk in f["subjects"]
-                )
-                channels = [
-                    c.decode() if isinstance(c, bytes) else c
-                    for c in f["channels"][:]
-                ]
+                n_existing = sum(f[f"subjects/{sk}/X"].shape[0] for sk in f["subjects"])
+                channels = [c.decode() if isinstance(c, bytes) else c for c in f["channels"][:]]
                 return channels, n_existing
-
-            for key in ("X", "y", "subject_id", "channels"):
-                if key not in f:
-                    log(f"  ⚠ 기존 HDF5에 '{key}' 없음, 처음부터 생성")
-                    return None, 0
-
-            raise ValueError(
-                "flat v7 HDF5가 감지되었습니다. "
-                "v9 group 구조와 혼용하면 파일이 손상됩니다. "
-                "--force로 전체 재생성하세요."
-            )
-
+            return None, 0
     except ValueError:
         raise
     except Exception as e:
-        log(f"  ⚠ 기존 HDF5 읽기 실패: {e}")
+        log(f"  ⚠ failed reading HDF5: {e}")
         return None, 0
 
 
-# ──────────────────────────────────────────────────────────────
-# 2b. 파일별 증분 처리 — processed_files.json
-# ──────────────────────────────────────────────────────────────
-
 def make_file_key(rec: dict) -> str:
-    """CSV 레코드를 고유 파일 키로 변환한다.
-
-    형식: S{sid:04d}|C{cond:02d}|T{trial:02d}|{filename}
-    동일 피험자의 동일 조건 동일 trial 이라도 파일명이 다르면 다른 키.
-    """
     return f"S{rec['sid']:04d}|C{rec['cond']:02d}|T{rec['trial']:02d}|{rec['path'].name}"
 
 
-def load_processed_files(path: Path) -> tuple[set[str], str]:
-    """processed_files.json 에서 완료된 파일 키 집합을 읽는다.
+_ZERO_STEP_MAX_RETRIES = 3   # 이 횟수 초과 시 해당 파일 영구 skip
 
-    Returns:
-        (files, status)  status ∈ {"valid", "invalid", "missing"}
-        "valid"   : 정상 로드
-        "missing" : 파일 없음 (첫 실행)
-        "invalid" : 버전 불일치 또는 파싱 실패
+
+def load_processed_files(path: Path) -> tuple[set[str], str, dict[str, int]]:
+    """(done_files, status, zero_retries) 반환.
+    zero_retries: {file_key: 누적 실패 횟수}
     """
     if not path.exists():
-        return set(), "missing"
+        return set(), "missing", {}
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
         version = raw.get("version", "unknown")
         if version != SEGMENTATION_VERSION:
-            log(
-                f"  ⚠ processed_files 버전 불일치 "
-                f"(저장={version}, 현재={SEGMENTATION_VERSION}) "
-                f"→ 기존 처리 이력 무효"
-            )
-            return set(), "invalid"
-        return set(raw.get("files", [])), "valid"
+            log(f"  ⚠ processed_files version mismatch ({version} vs {SEGMENTATION_VERSION})")
+            return set(), "invalid", {}
+        zr_raw = raw.get("zero_retries", {})
+        zr = {str(k): int(v) for k, v in zr_raw.items()
+              if isinstance(v, (int, float, str))}
+        return set(raw.get("files", [])), "valid", zr
     except Exception as e:
-        log(f"  ⚠ processed_files 로드 실패: {e}")
-        return set(), "invalid"
+        log(f"  ⚠ failed loading processed_files: {e}")
+        return set(), "invalid", {}
 
 
-def save_processed_files(path: Path, files: set[str]) -> None:
-    """완료된 파일 키 집합을 processed_files.json 에 저장한다."""
-    payload = {
-        "version": SEGMENTATION_VERSION,
-        "files": sorted(files),
-    }
-    path.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+def save_processed_files(
+    path: Path, files: set[str], zero_retries: dict[str, int]
+) -> None:
+    path.write_text(json.dumps({
+        "version":      SEGMENTATION_VERSION,
+        "files":        sorted(files),
+        "zero_retries": zero_retries,
+    }, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 # ──────────────────────────────────────────────────────────────
-# 3. 공통 채널 교집합 계산
+# 공통 채널
 # ──────────────────────────────────────────────────────────────
 
 def find_common_channels(records: list[dict]) -> list[str]:
-    """모든 CSV의 컬럼 교집합을 구한다 (첫 파일 순서 보존)."""
-    log("  [Pass 0] 전 파일 공통 채널 계산...")
+    log("  [Pass 0] scanning common channels...")
     common: Optional[set[str]] = None
-    first_cols_ordered: Optional[list[str]] = None
-
+    first_ordered: Optional[list[str]] = None
     for i, rec in enumerate(records):
         try:
             cols_df = read_csv_with_retry(rec["path"], nrows=0)
@@ -324,59 +301,49 @@ def find_common_channels(records: list[dict]) -> list[str]:
             cols = cols_df.columns.tolist()
             drop = set(config.resolve_drop_cols(cols))
             data_cols = set(c for c in cols if c not in drop)
-
             if common is None:
                 common = data_cols
-                first_cols_ordered = [c for c in cols if c not in drop]
+                first_ordered = [c for c in cols if c not in drop]
             else:
-                common = common & data_cols
+                common &= data_cols
         except Exception as e:
-            log(f"    ⚠ 스캔 실패: {rec['path'].name} ({e})")
-            continue
-
+            log(f"    ⚠ scan failed: {rec['path'].name} ({e})")
         if (i + 1) % 100 == 0:
-            log(f"    {i+1}/{len(records)} 파일 스캔")
-
-    if common is None or first_cols_ordered is None or len(common) == 0:
-        raise ValueError("공통 채널이 없습니다. CSV 파일을 확인하세요.")
-
-    channels = [c for c in first_cols_ordered if c in common]
-    log(f"  공통 채널: {len(channels)}개")
+            log(f"    scanned {i+1}/{len(records)}")
+    if not common or not first_ordered:
+        raise ValueError("no common channels")
+    channels = [c for c in first_ordered if c in common]
+    log(f"  common channels: {len(channels)}")
     return channels
 
 
-def verify_channels(records: list[dict], required_channels: list[str]) -> None:
-    """신규 CSV들이 기존 채널을 모두 포함하는지 검증한다."""
+def _verify_channels(records: list[dict], required_channels: list[str]) -> None:
+    """채널 호환성 사전 점검. 누락 채널이 있는 파일을 조기에 경고한다."""
     req_set = set(required_channels)
     warn_count = 0
-
     for rec in records:
         try:
             cols_df = read_csv_with_retry(rec["path"], nrows=0)
             cols_df = rename_columns(cols_df)
-            cols = cols_df.columns.tolist()
-            flex_drop = set(config.resolve_drop_cols(cols))
-            available = set(c for c in cols if c not in flex_drop)
-            missing = req_set - available
+            cols = set(c for c in cols_df.columns if c not in set(config.resolve_drop_cols(cols_df.columns.tolist())))
+            missing = req_set - cols
             if missing:
                 warn_count += 1
                 if warn_count <= 5:
-                    log(f"    ⚠ 채널 부족: {rec['path'].name} (누락 {len(missing)}개)")
+                    log(f"    ⚠ channel missing: {rec['path'].name} ({len(missing)} channels)")
         except Exception:
             continue
-
-    if warn_count > 0:
-        log(f"    ⚠ 총 {warn_count}개 파일 채널 부족 (Pass 2에서 스킵됨)")
+    if warn_count == 0:
+        log(f"    ✅ channel check OK ({len(records)} files)")
     else:
-        log(f"    ✅ 신규 {len(records)}개 CSV 채널 호환 확인")
+        log(f"    ⚠ channel shortage: {warn_count} files")
 
 
 # ──────────────────────────────────────────────────────────────
-# 4. 신호 추출 + 대역통과 필터
+# 신호 추출
 # ──────────────────────────────────────────────────────────────
 
 def compute_foot_acc_norm(df: pd.DataFrame, side: str = "LT") -> np.ndarray:
-    """발 가속도 센서의 3축 norm을 계산한다 (폴백용)."""
     cols = config.resolve_foot_acc_cols(df.columns.tolist(), side)
     ax = df[cols["x"]].values.astype(np.float64)
     ay = df[cols["y"]].values.astype(np.float64)
@@ -384,71 +351,112 @@ def compute_foot_acc_norm(df: pd.DataFrame, side: str = "LT") -> np.ndarray:
     return np.sqrt(ax**2 + ay**2 + az**2)
 
 
-def _resolve_sensor_axis(
-    columns: list[str],
-    sensor: str,
-    axis: str,
-    side: str,
-    signal_type: str = "gyroscope",
-) -> str | None:
-    """특정 센서의 특정 축 채널명을 찾는다."""
-    sensor_l = sensor.lower()
-    axis_l = axis.lower()
-    side_l = side.lower()
-    type_l = signal_type.lower()
+# signal_type 동의어 맵 — 장비별 표기 변형 허용
+_SIGNAL_TYPE_SYNONYMS: dict[str, list[str]] = {
+    "gyroscope": ["gyro", "gyroscope"],
+    "accel":     ["accel", "acceleration"],
+}
+# side 토큰 구분자 — substring 오매칭 방지 (예: "lt"가 "delta"에 걸리는 것 방지)
+
+
+def _resolve_sensor_axis(columns: list[str], sensor: str, axis: str,
+                          side: str, signal_type: str = "gyroscope") -> str | None:
+    """센서/축/side를 기준으로 컬럼명 매칭.
+    - signal_type 동의어 허용 (gyro/gyroscope, accel/acceleration)
+    - side는 토큰 경계 기반으로 확인 (substring 오매칭 방지)
+    - 축 표기: -x, _x, (x), 공백+x 등 변형 허용
+    """
+    sl  = sensor.lower()
+    xl  = axis.lower()
+    sdl = side.lower()
+    type_tokens = _SIGNAL_TYPE_SYNONYMS.get(signal_type.lower(),
+                                             [signal_type.lower()])
 
     for c in columns:
         cl = c.lower()
-        has_sensor = sensor_l in cl
-        has_side = side_l in cl or sensor_l == "pelvis"
-        has_type = type_l in cl or ("accel" in type_l and "accel" in cl)
-        has_axis = (
-            cl.endswith(f"-{axis_l}") or
-            cl.endswith(f"_{axis_l}") or
-            f" {axis_l} " in cl or
-            f"-{axis_l} " in cl or
-            f" {axis_l} {side_l}" in cl
-        )
-        if has_sensor and has_side and has_type and has_axis:
+
+        # 1) 센서명 포함
+        if sl not in cl:
+            continue
+
+        # 2) side 토큰 확인 — pelvis는 side 무관
+        if sl != "pelvis":
+            # 구분자로 둘러싸인 side 토큰이어야 함
+            parts = re.split(r"[\s\-_()\[\]/]", cl)
+            if sdl not in parts:
+                continue
+
+        # 3) signal_type 동의어 매칭
+        if not any(tok in cl for tok in type_tokens):
+            continue
+
+        # 4) 축 매칭 — 구분자+축 또는 (축) 형태
+        axis_ok = (cl.endswith(f"-{xl}") or cl.endswith(f"_{xl}")
+                   or f" {xl} " in cl or f"-{xl} " in cl
+                   or f"_{xl} " in cl or f"({xl})" in cl
+                   or cl.endswith(f" {xl}"))
+        if axis_ok:
             return c
     return None
 
 
 def extract_ml_gyro(df: pd.DataFrame, side: str) -> np.ndarray | None:
-    """ML(Mediolateral) Gyroscope 신호를 추출한다."""
-    col = _resolve_sensor_axis(
-        df.columns.tolist(), config.HS_GYRO_SENSOR,
-        config.HS_GYRO_AXIS, side, "gyroscope",
-    )
-    if col is None:
-        return None
-    return df[col].values.astype(np.float64)
+    col = _resolve_sensor_axis(df.columns.tolist(), config.HS_GYRO_SENSOR,
+                                config.HS_GYRO_AXIS, side, "gyroscope")
+    return None if col is None else df[col].values.astype(np.float64)
 
 
 def extract_ap_accel(df: pd.DataFrame, side: str) -> np.ndarray | None:
-    """AP(Anteroposterior) Accelerometer 신호를 추출한다."""
-    col = _resolve_sensor_axis(
-        df.columns.tolist(), config.HS_ACCEL_SENSOR,
-        config.HS_ACCEL_AXIS, side, "accel",
-    )
-    if col is None:
-        return None
-    return df[col].values.astype(np.float64)
+    col = _resolve_sensor_axis(df.columns.tolist(), config.HS_ACCEL_SENSOR,
+                                config.HS_ACCEL_AXIS, side, "accel")
+    return None if col is None else df[col].values.astype(np.float64)
+
+
+def _find_pelvis_gyro_col(columns: list[str]) -> str | None:
+    """pelvis yaw gyro 컬럼 탐색. side 조건 없이 직접 매칭.
+    z(yaw) 우선, 없으면 y(pitch) — 루프를 axis별로 분리해 순서 보장.
+    signal_type은 _SIGNAL_TYPE_SYNONYMS["gyroscope"]와 동일 기준 적용."""
+    gyro_tokens = _SIGNAL_TYPE_SYNONYMS["gyroscope"]
+    for axis in ("z", "y"):
+        for c in columns:
+            cl = c.lower()
+            if "pelvis" not in cl:
+                continue
+            if not any(tok in cl for tok in gyro_tokens):
+                continue
+            if (cl.endswith(f"-{axis}") or cl.endswith(f"_{axis}")
+                    or f" {axis} " in cl or f"-{axis} " in cl
+                    or f"({axis})" in cl):
+                return c
+    return None
+
+
+def extract_turn_signal(df: pd.DataFrame) -> np.ndarray:
+    """Turn proxy: pelvis yaw gyro 우선, 없으면 LT/RT ML gyro 절댓값 평균.
+    pelvis는 side 개념이 없으므로 _find_pelvis_gyro_col()로 직접 탐색."""
+    col = _find_pelvis_gyro_col(df.columns.tolist())
+    if col is not None:
+        return np.abs(df[col].values.astype(np.float64))
+    lt = extract_ml_gyro(df, "LT")
+    rt = extract_ml_gyro(df, "RT")
+    if lt is not None and rt is not None:
+        return 0.5 * (np.abs(lt) + np.abs(rt))
+    for sig in (lt, rt):
+        if sig is not None:
+            return np.abs(sig)
+    return np.zeros(len(df), dtype=np.float64)
 
 
 def bandpass_filter(
-    signal: np.ndarray,
-    fs: int = config.SAMPLE_RATE,
-    low: float = config.BANDPASS_LOW,
-    high: float = config.BANDPASS_HIGH,
+    signal: np.ndarray, fs: int = config.SAMPLE_RATE,
+    low: float = config.BANDPASS_LOW, high: float = config.BANDPASS_HIGH,
     order: int = config.BANDPASS_ORDER,
 ) -> np.ndarray:
-    """Butterworth 대역통과 필터를 적용한다."""
     nyq = fs / 2
     b, a = butter(order, [low / nyq, high / nyq], btype="band")
     mask = np.isnan(signal)
     if mask.all():
-        return signal
+        return signal.copy()
     sig_clean = signal.copy()
     sig_clean[mask] = np.nanmean(signal)
     try:
@@ -460,150 +468,216 @@ def bandpass_filter(
 
 
 # ──────────────────────────────────────────────────────────────
-# 6. 힐스트라이크 검출 (완전 파일 적응형)
+# Walking bout 검출
 # ──────────────────────────────────────────────────────────────
 
+def compute_motion_energy(df: pd.DataFrame, fs: int) -> np.ndarray:
+    feats: list[np.ndarray] = []
+    for side in ("LT", "RT"):
+        try:
+            feats.append(compute_foot_acc_norm(df, side))
+        except Exception:
+            pass
+        try:
+            g = extract_ml_gyro(df, side)
+            if g is not None:
+                feats.append(np.abs(g))
+        except Exception:
+            pass
+    if not feats:
+        return np.zeros(len(df), dtype=np.float64)
+    arr = np.vstack([
+        np.nan_to_num(x, nan=float(np.nanmedian(x)) if np.any(~np.isnan(x)) else 0.0)
+        for x in feats
+    ])
+    return moving_average(np.mean(arr, axis=0), max(3, int(fs * BOUT_SMOOTH_SEC)))
+
+
+def _run_bout_detection(
+    df: pd.DataFrame, fs: int,
+    energy_z_thr: float, turn_z_thr: float,
+    min_walk_sec: float, max_gap_sec: float,
+) -> list[tuple[int, int]]:
+    n = len(df)
+    energy   = compute_motion_energy(df, fs)
+    turn_sig = extract_turn_signal(df)
+
+    ez = robust_zscore(energy)
+    tz = robust_zscore(moving_average(turn_sig, max(3, int(fs * 0.15))))
+
+    walk_mask = ez > energy_z_thr
+    turn_mask = tz > turn_z_thr
+
+    min_turn = int(fs * TURN_MIN_SEC)
+    turn_runs = [(s, e) for s, e in find_true_runs(turn_mask) if (e - s) >= min_turn]
+
+    walk_runs = find_true_runs(walk_mask)
+    walk_runs = subtract_runs(walk_runs, turn_runs)
+
+    min_walk = int(fs * min_walk_sec)
+    walk_runs = [(s, e) for s, e in walk_runs if (e - s) >= min_walk]
+    walk_runs = merge_close_runs(walk_runs, max_gap=int(fs * max_gap_sec))
+    walk_runs = [(s, e) for s, e in walk_runs if (e - s) >= min_walk]
+
+    pad = int(fs * BOUT_PAD_SEC)
+    padded = [(max(0, s - pad), min(n, e + pad)) for s, e in walk_runs]
+    padded = merge_close_runs(sorted(padded), max_gap=int(fs * max_gap_sec))
+
+    return padded if padded else [(0, n)]
+
+
+def detect_walking_bouts(
+    df: pd.DataFrame,
+    fs: int = config.SAMPLE_RATE,
+    cond: Optional[int] = None,
+) -> list[tuple[int, int]]:
+    """
+    파일 → walking bout 목록.
+
+    C1(4 bout), C6(2 bout) 구조를 인식:
+    - bout 수 < expected → turn_z_thr 완화로 재시도 (더 잘게 자름)
+    - bout 수 > expected → max_gap 확대로 재시도 (더 합침)
+    """
+    n = len(df)
+    if n < int(fs * BOUT_MIN_WALK_SEC):
+        return [(0, n)]
+
+    expected = COND_EXPECTED_BOUTS.get(cond)
+    bouts = _run_bout_detection(df, fs, BOUT_ENERGY_Z, TURN_Z_THR,
+                                 BOUT_MIN_WALK_SEC, BOUT_MAX_GAP_SEC)
+
+    if expected is None:
+        return bouts
+
+    # bout 수 부족 → turn threshold 낮춰서 더 잘게 자름
+    if len(bouts) < expected:
+        for thr in (0.45, 0.35, 0.25):
+            retry = _run_bout_detection(df, fs, BOUT_ENERGY_Z, thr,
+                                         BOUT_MIN_WALK_SEC, BOUT_MAX_GAP_SEC)
+            if len(retry) >= expected:
+                log(f"    ↺ bout↑ (turn_thr={thr:.2f}): {len(bouts)}→{len(retry)} (exp={expected})")
+                bouts = retry
+                break
+
+    # bout 수 초과 → gap 확대해서 합침
+    elif len(bouts) > expected:
+        for gap in (1.5, 3.0, 5.0):
+            retry = _run_bout_detection(df, fs, BOUT_ENERGY_Z, TURN_Z_THR,
+                                         BOUT_MIN_WALK_SEC, gap)
+            if len(retry) <= expected:
+                log(f"    ↺ bout↓ (max_gap={gap:.1f}s): {len(bouts)}→{len(retry)} (exp={expected})")
+                bouts = retry
+                break
+
+    if len(bouts) != expected:
+        log(f"    ⚠ C{cond} bout={len(bouts)} (expected={expected})")
+
+    return bouts
+
+
+def _log_bout_mismatch(step_logger, rec: dict, n_detected: int, n_expected: int) -> None:
+    """bout 수 불일치를 step_log에 기록 (QC 추적용).
+    delta = detected - expected, severity: minor(±1) / major(±2+)."""
+    delta = n_detected - n_expected
+    if delta == 0:
+        severity = "none"
+    elif abs(delta) == 1:
+        severity = "minor"
+    else:
+        severity = "major"
+    step_logger.write({
+        "type": "bout_mismatch",
+        "file": rec["path"].name,
+        "sid": rec["sid"],
+        "cond": rec["cond"],
+        "bout_detected": n_detected,
+        "bout_expected": n_expected,
+        "delta": delta,
+        "severity": severity,
+    })
+
+
 # ──────────────────────────────────────────────────────────────
-# 6. 힐스트라이크 검출 — dual-signal consensus (파일 적응형)
+# HS 검출 — dual-signal consensus
 # ──────────────────────────────────────────────────────────────
 
 def _adaptive_peaks(
-    sig: np.ndarray,
-    fs: int,
-    negate: bool = False,
-    loose_dist_ms: float = 250.0,
+    sig: np.ndarray, fs: int, negate: bool = False, loose_dist_ms: float = 250.0,
 ) -> tuple[np.ndarray, float]:
-    """파일 신호 통계로 prominence·min_dist를 자동 결정하고 피크를 반환한다.
-
-    Returns:
-        (peaks, sigma)
-    """
     src = -sig if negate else sig
     sigma = float(np.std(src))
     if sigma == 0:
         return np.array([], dtype=int), 0.0
-
     loose_dist = int(fs * loose_dist_ms / 1000)
     cands, _ = find_peaks(src, prominence=0.2 * sigma, distance=loose_dist)
-
     if len(cands) >= 4:
         med = float(np.median(np.diff(cands).astype(float)))
         min_dist = int(np.clip(med * 0.40, fs * 0.25, fs * 0.80))
     else:
         min_dist = int(fs * 0.35)
-
     peaks, _ = find_peaks(src, prominence=0.3 * sigma, distance=min_dist)
     return peaks, sigma
 
 
-def _detect_hs_acc(
-    ap_accel: np.ndarray,
-    fs: int,
-) -> np.ndarray:
-    """AP Accel 기반 힐스트라이크 후보 검출.
-
-    HS 시점에서 AP 가속도가 감속(음의 피크)하는 것을 검출.
-    local dip sharpness 필터로 단순 노이즈성 dip을 제거한다.
-    """
+def _detect_hs_acc(ap_accel: np.ndarray, fs: int) -> np.ndarray:
     n = len(ap_accel)
     sig = ap_accel.copy()
     mask = np.isnan(sig)
     if mask.any() and not mask.all():
         x = np.arange(n)
         sig[mask] = np.interp(x[mask], x[~mask], sig[~mask])
-
     sig = bandpass_filter(sig, fs, low=0.5, high=20.0)
     peaks, sigma = _adaptive_peaks(sig, fs, negate=True)
-
     if len(peaks) == 0 or sigma == 0:
         return np.array([], dtype=int)
-
-    # local dip sharpness: ±100ms 창에서 peak depth가 sigma × 0.5 이상인 것만 유지
     win = int(0.10 * fs)
     trusted = []
     for p in peaks:
-        l = max(0, p - win)
-        r = min(n, p + win)
-        w = sig[l:r]
-        if len(w) == 0:
-            continue
-        local_depth = float(np.nanmax(w)) - float(sig[p])
-        if local_depth > 0.3 * sigma:  # 0.5→0.3: acc 후보 과탈락 방지
+        w = sig[max(0, p - win): min(n, p + win)]
+        if len(w) > 0 and float(np.nanmax(w)) - float(sig[p]) > 0.3 * sigma:
             trusted.append(p)
-
     return np.array(trusted, dtype=int)
 
 
 def _detect_hs_gyro(
-    ml_gyro: np.ndarray,
-    fs: int,
-    force_flip: bool = False,
+    ml_gyro: np.ndarray, fs: int, force_flip: bool = False,
 ) -> np.ndarray:
-    """ML Gyro 기반 힐스트라이크 후보 검출.
-
-    파일별 polarity를 자동 점검한다:
-    원신호와 부호반전 신호 중 swing-HS 구조(주기성)가 더 좋은 쪽을 선택.
-
-    Args:
-        force_flip: True면 자동 선택 결과를 강제로 반전.
-                    한 발 스텝 수가 반대 발보다 현저히 적을 때 외부 재시도용.
-    """
     n = len(ml_gyro)
     sig_raw = ml_gyro.copy()
     mask = np.isnan(sig_raw)
     if mask.any() and not mask.all():
         x = np.arange(n)
         sig_raw[mask] = np.interp(x[mask], x[~mask], sig_raw[~mask])
-
     sig_raw = bandpass_filter(sig_raw, fs, low=0.5, high=15.0)
 
-    def _score_polarity(sig: np.ndarray) -> tuple[np.ndarray, float]:
-        """swing 후보 검출 수 × prominence 합 / (1 + CV) — 주기성 보정."""
-        sigma = float(np.std(sig))
+    def _score(s: np.ndarray) -> tuple[np.ndarray, float]:
+        sigma = float(np.std(s))
         if sigma == 0:
             return np.array([], dtype=int), 0.0
-        loose_dist = int(fs * 0.25)
-        swings, props = find_peaks(sig, prominence=0.2 * sigma, distance=loose_dist)
+        swings, props = find_peaks(s, prominence=0.2 * sigma, distance=int(fs * 0.25))
         if len(swings) == 0:
             return np.array([], dtype=int), 0.0
-        proms = props["prominences"]
-        if len(swings) >= 2:
-            ivs = np.diff(swings).astype(float)
-            cv = float(np.std(ivs)) / max(float(np.mean(ivs)), 1.0)
-        else:
-            cv = 1.0
-        score = float(np.sum(proms)) / (1.0 + cv)
-        return swings, score
+        cv = (float(np.std(np.diff(swings).astype(float))) /
+              max(float(np.mean(np.diff(swings))), 1.0)) if len(swings) >= 2 else 1.0
+        return swings, float(np.sum(props["prominences"])) / (1.0 + cv)
 
-    swings_orig, score_orig = _score_polarity(sig_raw)
-    swings_flip, score_flip = _score_polarity(-sig_raw)
+    sw_orig, sc_orig = _score(sig_raw)
+    sw_flip, sc_flip = _score(-sig_raw)
 
-    # 자동 선택 후 force_flip이면 반전
-    auto_flip = score_flip > score_orig
-    use_flip  = auto_flip ^ force_flip  # XOR: force_flip이면 반대 선택
-
-    if use_flip:
-        sig = -sig_raw
-        swing_peaks = swings_flip
-    else:
-        sig = sig_raw
-        swing_peaks = swings_orig
+    use_flip = (sc_flip > sc_orig) ^ force_flip
+    sig = -sig_raw if use_flip else sig_raw
+    swing_peaks = sw_flip if use_flip else sw_orig
 
     sigma = float(np.std(sig))
     if sigma == 0:
         return np.array([], dtype=int)
 
     hs_cands, _ = _adaptive_peaks(sig, fs, negate=True)
-    if len(hs_cands) == 0:
-        return np.array([], dtype=int)
-
-    half_win = fs // 2
-    if len(swing_peaks) == 0:
+    if len(hs_cands) == 0 or len(swing_peaks) == 0:
         return hs_cands
 
-    peak_ref = float(np.percentile(sig[swing_peaks], 90))
-    thresh = config.HS_TRUSTED_SWING * peak_ref
-
+    half_win = fs // 2
+    thresh = config.HS_TRUSTED_SWING * float(np.percentile(sig[swing_peaks], 90))
     trusted = []
     for cand in hs_cands:
         nearby = swing_peaks[np.abs(swing_peaks - cand) < half_win]
@@ -613,419 +687,242 @@ def _detect_hs_gyro(
             w = sig[max(0, cand - half_win): min(n, cand + half_win)]
             if len(w) > 0 and float(np.percentile(w, 99)) > thresh:
                 trusted.append(cand)
-
     return np.array(trusted, dtype=int)
 
 
 def _reconcile_candidates(
-    hs_acc: np.ndarray,
-    hs_gyro: np.ndarray,
-    tol_ms: float,
-    fs: int,
+    hs_acc: np.ndarray, hs_gyro: np.ndarray, tol_ms: float, fs: int,
 ) -> list[tuple[int, str]]:
-    """AP accel 후보와 ML gyro 후보를 합의(consensus)한다.
-
-    Args:
-        hs_acc:  AP accel 기반 후보 (sample index)
-        hs_gyro: ML gyro 기반 후보 (sample index)
-        tol_ms:  매칭 허용 오차 (ms)
-        fs:      샘플링 레이트
-
-    Returns:
-        list of (timestamp, support)
-        support ∈ {"both", "acc", "gyro"}
-        anchor는 AP accel 시점 우선 (충격 기반 정의)
-    """
     tol = int(fs * tol_ms / 1000)
     result: list[tuple[int, str]] = []
     used_gyro: set[int] = set()
-
-    # AP 후보 기준으로 gyro 매칭
     for a in hs_acc:
         if len(hs_gyro) == 0:
             result.append((int(a), "acc"))
             continue
         dists = np.abs(hs_gyro - a)
-        nearest_idx = int(np.argmin(dists))
-        if dists[nearest_idx] <= tol and nearest_idx not in used_gyro:
-            used_gyro.add(nearest_idx)
-            result.append((int(a), "both"))   # anchor = AP 시점
+        ni = int(np.argmin(dists))
+        if dists[ni] <= tol and ni not in used_gyro:
+            used_gyro.add(ni)
+            result.append((int(a), "both"))
         else:
             result.append((int(a), "acc"))
-
-    # gyro 전용 후보 추가 (AP와 매칭 안 된 것)
     for gi, g in enumerate(hs_gyro):
         if gi not in used_gyro:
             result.append((int(g), "gyro"))
-
     result.sort(key=lambda x: x[0])
     return result
 
 
-def _filewise_stride_filter(
-    candidates: list[tuple[int, str]],
-    fs: int,
+def _boutwise_stride_filter(
+    candidates: list[tuple[int, str]], fs: int,
 ) -> list[tuple[int, str]]:
-    """파일 내 stride 통계 기반으로 이상 간격 후보를 제거한다."""
     if len(candidates) < 2:
         return candidates
-
     times = np.array([t for t, _ in candidates], dtype=float)
-
-    # "both" 신뢰 후보 중심으로 interval 통계 추정, 부족하면 전체로 fallback
     trusted_times = np.array([t for t, s in candidates if s == "both"], dtype=float)
-    ref_times = trusted_times if len(trusted_times) >= 4 else times
-    intervals = np.diff(ref_times)
-
+    ref = trusted_times if len(trusted_times) >= 4 else times
+    intervals = np.diff(ref)
     if len(intervals) >= 4:
         med = float(np.median(intervals))
         mad = float(np.median(np.abs(intervals - med)))
         k = 2.5
         i_min = max(med - k * mad, config.HS_MIN_STRIDE_SAM)
         i_max = min(med + k * mad, config.HS_MAX_STRIDE_SAM)
-        # p5/p95도 같이 사용
-        p5  = float(np.percentile(intervals, 5))
-        p95 = float(np.percentile(intervals, 95))
+        p5, p95 = float(np.percentile(intervals, 5)), float(np.percentile(intervals, 95))
         i_min = max(int(min(p5,  i_min)), config.HS_MIN_STRIDE_SAM)
         i_max = min(int(max(p95, i_max)), config.HS_MAX_STRIDE_SAM)
     else:
-        i_min = config.HS_MIN_STRIDE_SAM
-        i_max = config.HS_MAX_STRIDE_SAM
+        i_min, i_max = config.HS_MIN_STRIDE_SAM, config.HS_MAX_STRIDE_SAM
 
-    # 시작점은 항상 유지, interval 기준으로 end 후보 제거
+    _ord = {"both": 2, "acc": 1, "gyro": 1, "norm": 0}
     kept: list[tuple[int, str]] = [candidates[0]]
-    for i in range(1, len(candidates)):
-        gap = candidates[i][0] - kept[-1][0]
+    for cand in candidates[1:]:
+        gap = cand[0] - kept[-1][0]
         if i_min <= gap <= i_max:
-            kept.append(candidates[i])
-        # 너무 짧으면 둘 중 support 높은 것 유지
+            kept.append(cand)
         elif gap < i_min:
-            sup_order = {"both": 2, "acc": 1, "gyro": 1, "norm": 0}
-            if sup_order.get(candidates[i][1], 0) > sup_order.get(kept[-1][1], 0):
-                kept[-1] = candidates[i]
-        # 너무 길면 그냥 추가 (중간 이벤트 누락 가능)
+            if _ord.get(cand[1], 0) > _ord.get(kept[-1][1], 0):
+                kept[-1] = cand
         else:
-            kept.append(candidates[i])
-
+            kept.append(cand)
     return kept
 
 
 def detect_steps(
-    ml_gyro: np.ndarray,
-    ap_accel: np.ndarray,
-    fs: int = config.SAMPLE_RATE,
-    force_flip: bool = False,
+    ml_gyro: np.ndarray, ap_accel: np.ndarray,
+    fs: int = config.SAMPLE_RATE, force_flip: bool = False,
 ) -> tuple[list[tuple[int, int]], list[str]]:
-    """Dual-signal consensus 힐스트라이크 검출 — 완전 파일 적응형.
-
-    AP accel과 ML gyro 각각 독립 후보 생성 후 합의.
-    최종 anchor는 AP accel 시점 우선.
-
-    Args:
-        force_flip: True면 ML gyro polarity 자동 선택을 강제 반전.
-                    한 발 스텝이 반대 발보다 현저히 적을 때 외부 재시도용.
-
-    Returns:
-        (steps, supports)
-        steps:    [(start, end), ...]
-        supports: ["both"|"acc"|"gyro", ...]  — steps와 같은 길이
-    """
     n = len(ml_gyro)
     if n < fs:
         return [], []
-
     nan_ratio = (np.isnan(ml_gyro).sum() + np.isnan(ap_accel).sum()) / (2 * n)
     if nan_ratio > config.HS_NAN_THRESHOLD:
         return [], []
 
-    tol_ms = 100.0
-
     hs_acc  = _detect_hs_acc(ap_accel, fs)
     hs_gyro = _detect_hs_gyro(ml_gyro, fs, force_flip=force_flip)
-
     if len(hs_acc) == 0 and len(hs_gyro) == 0:
         return [], []
 
-    candidates = _reconcile_candidates(hs_acc, hs_gyro, tol_ms, fs)
-    candidates = _filewise_stride_filter(candidates, fs)
-
+    candidates = _reconcile_candidates(hs_acc, hs_gyro, 100.0, fs)
+    candidates = _boutwise_stride_filter(candidates, fs)  # bout 내부 stride 필터
     if len(candidates) < 2:
         return [], []
 
+    _ord = {"both": 3, "acc": 2, "gyro": 1, "norm": 0}
     steps: list[tuple[int, int]] = []
     supports: list[str] = []
     for i in range(len(candidates) - 1):
-        start, sup_start = candidates[i]
-        end,   sup_end   = candidates[i + 1]
-        length = end - start
+        s_t, s_sup = candidates[i]
+        e_t, e_sup = candidates[i + 1]
+        length = e_t - s_t
         if length <= 0:
             continue
-        nan_ml  = float(np.isnan(ml_gyro[start:end]).sum()) / length
-        nan_ap  = float(np.isnan(ap_accel[start:end]).sum()) / length
-        nan_seg = max(nan_ml, nan_ap)
-        if nan_seg > config.HS_NAN_THRESHOLD:
+        nan_ml = float(np.isnan(ml_gyro[s_t:e_t]).sum()) / length
+        nan_ap = float(np.isnan(ap_accel[s_t:e_t]).sum()) / length
+        if max(nan_ml, nan_ap) > config.HS_NAN_THRESHOLD:
             continue
-        steps.append((start, end))
-        sup_order = {"both": 3, "acc": 2, "gyro": 1, "norm": 0}
-        step_sup = sup_start if sup_order.get(sup_start, 0) <= sup_order.get(sup_end, 0) \
-                   else sup_end
-        supports.append(step_sup)
-
+        steps.append((s_t, e_t))
+        # 보수적 선택: start/end 중 신뢰도 낮은 쪽을 step support로 채택
+        supports.append(s_sup if _ord.get(s_sup, 0) <= _ord.get(e_sup, 0) else e_sup)
     return steps, supports
 
 
-def _fallback_detect_steps(
-    norm_f: np.ndarray,
-    fs: int,
-) -> tuple[list[tuple[int, int]], list[str]]:
-    """폴백: 발 가속도 norm 기반 파일 적응형 검출.
-
-    ML gyro 또는 AP accel 중 하나가 없을 때 사용.
-    support는 모두 "norm"으로 표시.
-    """
+def _fallback_detect_steps(norm_f: np.ndarray, fs: int) -> tuple[list[tuple[int, int]], list[str]]:
     valid = norm_f[~np.isnan(norm_f)]
     if len(valid) == 0:
         return [], []
-
-    mu    = float(np.mean(valid))
-    sigma = float(np.std(valid))
-
-    loose_peaks, _ = find_peaks(
-        norm_f, height=mu + 0.3 * sigma,
-        distance=int(fs * 0.25),
-    )
+    mu, sigma = float(np.mean(valid)), float(np.std(valid))
+    loose_peaks, _ = find_peaks(norm_f, height=mu + 0.3 * sigma, distance=int(fs * 0.25))
     if len(loose_peaks) >= 4:
-        ivs = np.diff(loose_peaks).astype(float)
-        med = float(np.median(ivs))
+        med   = float(np.median(np.diff(loose_peaks).astype(float)))
         s_min = max(int(med * 0.50), config.HS_MIN_STRIDE_SAM)
         s_max = min(int(med * 1.50), config.HS_MAX_STRIDE_SAM)
-        min_d = int(np.clip(med * 0.40, fs * 0.25, fs * 0.80))  # 상한 clamp
+        min_d = int(np.clip(med * 0.40, fs * 0.25, fs * 0.80))
     else:
-        s_min = config.HS_MIN_STRIDE_SAM
-        s_max = config.HS_MAX_STRIDE_SAM
+        s_min, s_max = config.HS_MIN_STRIDE_SAM, config.HS_MAX_STRIDE_SAM
         min_d = config.HS_MIN_STRIDE_SAM
-
-    peaks, _ = find_peaks(
-        norm_f, height=mu + 0.5 * sigma, distance=min_d,
-    )
-    steps = [
-        (int(peaks[j]), int(peaks[j + 1]))
-        for j in range(len(peaks) - 1)
-        if s_min <= peaks[j + 1] - peaks[j] <= s_max
-    ]
-    supports = ["norm"] * len(steps)   # foot accel norm 기반 폴백임을 명시
-    return steps, supports
+    peaks, _ = find_peaks(norm_f, height=mu + 0.5 * sigma, distance=min_d)
+    steps = [(int(peaks[j]), int(peaks[j + 1]))
+             for j in range(len(peaks) - 1)
+             if s_min <= peaks[j + 1] - peaks[j] <= s_max]
+    return steps, ["norm"] * len(steps)
 
 
 # ──────────────────────────────────────────────────────────────
-# 6b. 파일별 stride 파라미터 추정
+# 품질 점수 + 병합 + bilateral sanity
 # ──────────────────────────────────────────────────────────────
 
-def estimate_stride_params_from_steps(
-    steps: list[tuple[int, int]],
-) -> tuple[float, float, float]:
-    """raw_steps 간격에서 이 파일의 stride 통계를 직접 추정한다.
-
-    Returns:
-        (stride_mean, stride_min, stride_max) — 단위: samples
-    """
+def estimate_stride_params_from_steps(steps: list[tuple[int, int]]) -> tuple[float, float, float]:
     if not steps:
         return 0.0, float(config.HS_MIN_STRIDE_SAM), float(config.HS_MAX_STRIDE_SAM)
-
     lengths = np.array([e - s for s, e in steps], dtype=float)
-    stride_mean = float(np.mean(lengths))
-
-    if len(lengths) >= 4:
-        stride_min = float(max(np.percentile(lengths, 5),  config.HS_MIN_STRIDE_SAM))
-        stride_max = float(min(np.percentile(lengths, 95), config.HS_MAX_STRIDE_SAM))
-    else:
-        stride_min = float(config.HS_MIN_STRIDE_SAM)
-        stride_max = float(config.HS_MAX_STRIDE_SAM)
-
-    return stride_mean, stride_min, stride_max
+    mean = float(np.mean(lengths))
+    lo = float(max(np.percentile(lengths, 5),  config.HS_MIN_STRIDE_SAM)) if len(lengths) >= 4 else float(config.HS_MIN_STRIDE_SAM)
+    hi = float(min(np.percentile(lengths, 95), config.HS_MAX_STRIDE_SAM)) if len(lengths) >= 4 else float(config.HS_MAX_STRIDE_SAM)
+    return mean, lo, hi
 
 
-# ──────────────────────────────────────────────────────────────
-# 7. 품질 점수화 + 병합 + bilateral sanity check
-# ──────────────────────────────────────────────────────────────
+_SUPPORT_WEIGHT: dict[str, float] = {"both": 1.00, "acc": 0.80, "gyro": 0.75, "norm": 0.65}
 
-# support → q_support 가중치
-_SUPPORT_WEIGHT: dict[str, float] = {
-    "both": 1.00,   # AP + gyro 둘 다 확인
-    "acc":  0.80,   # AP accel만
-    "gyro": 0.75,   # ML gyro만
-    "norm": 0.65,   # foot accel norm 폴백 (ML gyro / AP accel 없을 때)
-}
-
-
-def _step_quality(
-    start: int,
-    end: int,
-    signal: np.ndarray,
-    stride_mean_sam: float,
-    stride_min_sam: float,
-    stride_max_sam: float,
-    support: str = "both",
-) -> float:
-    """스텝 품질 점수 = q_nan × q_interval × q_support"""
-    length = end - start
-    if length <= 0:
-        return 0.0
-
-    # q_nan
-    nan_ratio = float(np.isnan(signal[start:end]).sum()) / length
-    q_nan = 1.0 - nan_ratio
-
-    # q_interval (stride 중심 근접도)
-    if stride_mean_sam > 0:
-        stride_center = stride_mean_sam
-        stride_range  = max(stride_max_sam - stride_min_sam, 1.0)
-    elif stride_min_sam > 0 and stride_max_sam > stride_min_sam:
-        stride_center = (stride_min_sam + stride_max_sam) / 2.0
-        stride_range  = max(stride_max_sam - stride_min_sam, 1.0)
-    else:
-        stride_center = length
-        stride_range  = 1.0
-    q_interval = 1.0 / (1.0 + abs(length - stride_center) / stride_range)
-
-    # q_support
-    q_support = _SUPPORT_WEIGHT.get(support, 0.75)
-
-    return q_nan * q_interval * q_support
-
-
-# ScoredStep: NamedTuple
-from typing import NamedTuple
 
 class ScoredStep(NamedTuple):
     start:   int
     end:     int
-    side:    str    # "LT" 또는 "RT"
-    score:   float  # 품질 점수
+    side:    str    # "LT" / "RT"
+    score:   float
     support: str    # "both" / "acc" / "gyro" / "norm"
 
 
+def _step_quality(
+    start: int, end: int, signal: np.ndarray,
+    stride_mean: float, stride_min: float, stride_max: float, support: str,
+) -> float:
+    length = end - start
+    if length <= 0:
+        return 0.0
+    q_nan = 1.0 - float(np.isnan(signal[start:end]).sum()) / length
+    if stride_mean > 0:
+        center, rng = stride_mean, max(stride_max - stride_min, 1.0)
+    elif stride_min > 0 and stride_max > stride_min:
+        center, rng = (stride_min + stride_max) / 2.0, max(stride_max - stride_min, 1.0)
+    else:
+        center, rng = float(length), 1.0
+    q_int = 1.0 / (1.0 + abs(length - center) / rng)
+    return q_nan * q_int * _SUPPORT_WEIGHT.get(support, 0.75)
+
+
 def score_steps_by_side(
-    steps: list[tuple[int, int]],
-    supports: list[str],
-    side: str,
-    signal: np.ndarray,
-    stride_mean_sam: float,
-    stride_min_sam: float,
-    stride_max_sam: float,
+    steps: list[tuple[int, int]], supports: list[str], side: str,
+    signal: np.ndarray, stride_mean: float, stride_min: float, stride_max: float,
 ) -> list[ScoredStep]:
-    """각 스텝에 dual-signal support 포함 품질 점수를 부여한다."""
     scored: list[ScoredStep] = []
-    for i, (start, end) in enumerate(steps):
+    for i, (s, e) in enumerate(steps):
         if i >= len(supports):
-            log(
-                f"  ⚠ score_steps_by_side [{side}]: supports 길이 불일치 "
-                f"(steps={len(steps)}, supports={len(supports)}) "
-                f"— 이후 {len(steps)-i}개 스텝 스킵"
-            )
+            log(f"  ⚠ score_steps [{side}]: supports 불일치 (steps={len(steps)}, supports={len(supports)}), {len(steps)-i}개 스킵")
             break
-        sup = supports[i]
-        score = _step_quality(
-            start, end, signal,
-            stride_mean_sam, stride_min_sam, stride_max_sam,
-            support=sup,
-        )
-        scored.append(ScoredStep(start=start, end=end, side=side,
-                                 score=score, support=sup))
+        scored.append(ScoredStep(start=s, end=e, side=side, support=supports[i],
+                                  score=_step_quality(s, e, signal, stride_mean, stride_min, stride_max, supports[i])))
     return scored
 
 
 def merge_bilateral_steps(
-    lt_scored: list[ScoredStep],
-    rt_scored: list[ScoredStep],
+    lt_scored: list[ScoredStep], rt_scored: list[ScoredStep],
     overlap_threshold: float = 0.5,
 ) -> list[ScoredStep]:
-    """LT/RT 스텝을 병합한다.
-
-    겹침 제거는 같은 발(same-side) 내에서만 적용.
-    LT↔RT 교차는 정상 보행 패턴이므로 허용.
-    """
-    def _dedup_same_side(steps: list[ScoredStep]) -> list[ScoredStep]:
+    def _dedup(steps: list[ScoredStep]) -> list[ScoredStep]:
         if len(steps) < 2:
             return steps
         steps = sorted(steps, key=lambda x: x.start)
-        kept: list[int] = [0]
+        kept = [0]
         for ci in range(1, len(steps)):
             pi = kept[-1]
-            overlap = max(0, min(steps[pi].end, steps[ci].end)
-                             - max(steps[pi].start, steps[ci].start))
-            if overlap == 0:
+            ov = max(0, min(steps[pi].end, steps[ci].end) - max(steps[pi].start, steps[ci].start))
+            if ov == 0:
                 kept.append(ci)
-                continue
-            shorter = min(steps[pi].end - steps[pi].start,
-                          steps[ci].end  - steps[ci].start)
-            if shorter == 0 or overlap / shorter > overlap_threshold:
-                if steps[ci].score >= steps[pi].score:
-                    kept[-1] = ci
             else:
-                kept.append(ci)
+                shorter = min(steps[pi].end - steps[pi].start, steps[ci].end - steps[ci].start)
+                if shorter == 0 or ov / shorter > overlap_threshold:
+                    if steps[ci].score >= steps[pi].score:
+                        kept[-1] = ci
+                else:
+                    kept.append(ci)
         return [steps[i] for i in kept]
-
-    lt_clean = _dedup_same_side(lt_scored)
-    rt_clean = _dedup_same_side(rt_scored)
-    merged = lt_clean + rt_clean
+    merged = _dedup(lt_scored) + _dedup(rt_scored)
     merged.sort(key=lambda x: x.start)
     return merged
 
 
-def bilateral_sanity_check(
-    steps: list[ScoredStep],
-    fs: int = config.SAMPLE_RATE,
-) -> list[ScoredStep]:
-    """LT/RT 교차 패턴 검증.
-
-    체크 1. 동시 이벤트: LT-RT가 50ms 이내 → 낮은 점수 쪽 제거
-    체크 2. side balance: 한 발이 70% 이상이면 경고 (제거 안 함)
-    """
+def bilateral_sanity_check(steps: list[ScoredStep], fs: int = config.SAMPLE_RATE) -> list[ScoredStep]:
     if len(steps) < 2:
         return steps
-
-    simultaneous_tol = int(fs * 0.05)  # 50ms
-
-    # 체크 1: 동시 LT-RT 제거
+    tol = int(fs * 0.05)
     cleaned: list[ScoredStep] = [steps[0]]
     for curr in steps[1:]:
         prev = cleaned[-1]
-        if (prev.side != curr.side
-                and abs(curr.start - prev.start) <= simultaneous_tol):
-            # 동시 이벤트: 점수 낮은 것 버림
+        if prev.side != curr.side and abs(curr.start - prev.start) <= tol:
             if curr.score > prev.score:
                 cleaned[-1] = curr
-            # else: prev 유지
         else:
             cleaned.append(curr)
-
-    # 체크 2: side balance 경고
     lt_n = sum(1 for s in cleaned if s.side == "LT")
-    rt_n = sum(1 for s in cleaned if s.side == "RT")
-    total = lt_n + rt_n
-    if total > 0:
-        lt_ratio = lt_n / total
-        if lt_ratio > 0.70 or lt_ratio < 0.30:
-            log(f"    ⚠ bilateral balance 불균형: LT={lt_n} RT={rt_n} "
-                f"({lt_ratio:.0%}/{1-lt_ratio:.0%})")
-
+    rt_n = len(cleaned) - lt_n
+    if lt_n + rt_n > 0:
+        r = lt_n / (lt_n + rt_n)
+        if r > 0.70 or r < 0.30:
+            log(f"    ⚠ bilateral imbalance: LT={lt_n} RT={rt_n} ({r:.0%}/{1-r:.0%})")
     return cleaned
 
 
 # ──────────────────────────────────────────────────────────────
-# 8. 리샘플링
+# 리샘플링
 # ──────────────────────────────────────────────────────────────
 
-def resample_step(
-    data_segment: np.ndarray,
-    target_length: int = config.TS,
-) -> np.ndarray:
-    """가변 길이 스텝 세그먼트를 고정 길이로 리샘플링한다."""
+def resample_step(data_segment: np.ndarray, target_length: int = config.TS) -> np.ndarray:
     L, C = data_segment.shape
     if L == target_length:
         return data_segment.astype(np.float32)
-
     result = np.zeros((target_length, C), dtype=np.float32)
     for c in range(C):
         col = data_segment[:, c].copy()
@@ -1040,12 +937,10 @@ def resample_step(
 
 
 # ──────────────────────────────────────────────────────────────
-# 9. step_log 스트리밍
+# 로그 라이터
 # ──────────────────────────────────────────────────────────────
 
 class StepLogWriter:
-    """JSONL 형식으로 스텝 로그를 스트리밍 기록한다."""
-
     def __init__(self, path: Path) -> None:
         self.path = path
         self._fh = path.open("w", encoding="utf-8")
@@ -1064,130 +959,159 @@ class StepLogWriter:
     def __enter__(self) -> "StepLogWriter":
         return self
 
-    def __exit__(                           # ⑤ TracebackType 명시
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
+    def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
 
 # ──────────────────────────────────────────────────────────────
-# 10. CLI
+# HDF5 쓰기
+# ──────────────────────────────────────────────────────────────
+
+def _append_or_create(grp: h5py.Group, name: str, arr: np.ndarray, dtype=None) -> None:
+    n = len(arr)
+    if name in grp:
+        ds = grp[name]
+        old = ds.shape[0]
+        ds.resize(old + n, axis=0)
+        ds[old:old + n] = arr
+    else:
+        grp.create_dataset(name, data=arr, maxshape=(None,),
+                           chunks=(min(1024, max(1, n)),),
+                           dtype=dtype if dtype else arr.dtype)
+
+
+def write_subject_group(
+    hf: h5py.File, sid: int,
+    X_arr: np.ndarray, y_arr: np.ndarray,
+    meta: dict[str, np.ndarray], n_ch: int,
+) -> None:
+    grp_name = f"subjects/S{sid:04d}"
+    str_dt = h5py.string_dtype(encoding="utf-8")
+    if grp_name in hf:
+        grp = hf[grp_name]
+        old_n = grp["X"].shape[0]
+        new_n = old_n + len(X_arr)
+        grp["X"].resize(new_n, axis=0); grp["y"].resize(new_n, axis=0)
+        grp["X"][old_n:new_n] = X_arr; grp["y"][old_n:new_n] = y_arr
+        for k in ("trial_id","bout_start","bout_end","step_start","step_end","trial_step_index"):
+            _append_or_create(grp, k, meta[k])
+        for k in ("trial_key","source_file","side","support"):
+            _append_or_create(grp, k, meta[k], dtype=str_dt)
+    else:
+        grp = hf.create_group(grp_name)
+        n_new = len(X_arr)
+        grp.create_dataset("X", data=X_arr, maxshape=(None, config.TS, n_ch),
+                           chunks=(min(64, max(1, n_new)), config.TS, n_ch))
+        grp.create_dataset("y", data=y_arr, maxshape=(None,))
+        for k in ("trial_id","bout_start","bout_end","step_start","step_end","trial_step_index"):
+            grp.create_dataset(k, data=meta[k], maxshape=(None,))
+        for k in ("trial_key","source_file","side","support"):
+            grp.create_dataset(k, data=meta[k], maxshape=(None,), dtype=str_dt)
+
+
+# ──────────────────────────────────────────────────────────────
+# CLI
 # ──────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    """CLI 인자를 파싱한다."""
-    p = argparse.ArgumentParser(description="힐스트라이크 스텝 분할")
-    p.add_argument(
-        "--n_subjects", type=int, default=None,
-        help="피험자 수 (기본: config.N_SUBJECTS)",
-    )
-    p.add_argument(
-        "--force", action="store_true",
-        help="기존 HDF5 무시, 전체 재생성",
-    )
+    p = argparse.ArgumentParser()
+    p.add_argument("--n_subjects", type=int, default=None)
+    p.add_argument("--force",      action="store_true")
     return p.parse_args()
 
 
 # ──────────────────────────────────────────────────────────────
-# 11. 메인
+# main
 # ──────────────────────────────────────────────────────────────
 
 def main() -> None:
-    """증분 힐스트라이크 분할 파이프라인을 실행한다."""
     args = parse_args()
     config.apply_overrides(n_subjects=args.n_subjects)
     force = args.force
 
-    log(f"{'='*60}")
-    log(f"  step_segmentation.py v9.4-filewise ({'전체 재생성' if force else '증분 모드'})")
-    log(f"  N={config.N_SUBJECTS}  TS={config.TS}pt  {config.SAMPLE_RATE}Hz")
-    log(f"{'='*60}\n")
+    log("=" * 60)
+    log(f"  step_segmentation  {SEGMENTATION_VERSION}")
+    log(f"  {'--force' if force else 'incremental'}  "
+        f"N={config.N_SUBJECTS}  TS={config.TS}pt  {config.SAMPLE_RATE}Hz")
+    log("=" * 60)
 
     all_records = discover_csvs(config.DATA_DIR, config.N_SUBJECTS)
-    log(f"  CSV 파일: {len(all_records)}개")
     if not all_records:
-        raise FileNotFoundError(f"CSV 없음: {config.DATA_DIR}")
+        raise FileNotFoundError(f"no CSV in {config.DATA_DIR}")
 
     cond_count: dict[int, int] = defaultdict(int)
-    subj_set: set[int] = set()
+    subj_set:   set[int]       = set()
     for r in all_records:
         cond_count[r["cond"]] += 1
         subj_set.add(r["sid"])
-
-    log(f"  피험자: {sorted(subj_set)} ({len(subj_set)}명)")
-    for c in sorted(cond_count):
-        log(f"    C{c}: {cond_count[c]}파일")
+    log(f"  CSV: {len(all_records)} files  subjects: {len(subj_set)}")
+    for c, n in sorted(cond_count.items()):
+        exp_str = f"  (expected {COND_EXPECTED_BOUTS[c]} bouts/file)" if c in COND_EXPECTED_BOUTS else ""
+        log(f"    C{c}: {n} files{exp_str}")
 
     t0 = time.time()
-    processed_files_path = config.BATCH_DIR / "processed_files.json"
+    pf_path = config.BATCH_DIR / "processed_files.json"
+
+    # 항상 먼저 기본값으로 초기화 (done_files 미정의 버그 방지)
+    existing_channels, existing_n, done_files = None, 0, set()
+    zero_retries: dict[str, int] = {}
 
     if force:
-        existing_channels: Optional[list[str]] = None
-        existing_n: int = 0
-        done_files: set[str] = set()
-        log("  ★ --force: 기존 HDF5·processed_files 무시, 전체 재생성")
+        log("  ★ --force: full rebuild")
     else:
         existing_channels, existing_n = load_existing_h5_info(config.H5_PATH)
-        done_files, pf_status = load_processed_files(processed_files_path)
-
-        if pf_status != "valid" and config.H5_PATH.exists():
-            log("  ⚠ processed_files가 무효하므로 기존 HDF5와 일관성을 보장할 수 없습니다.")
-            log("  ⚠ --force와 동일하게 전체 재생성 모드로 전환합니다.")
-            force = True
-            existing_channels = None
-            existing_n = 0
-            done_files = set()
-            log("  ★ 안전 모드 전환 완료: 이후 전체 재생성 경로로 진행합니다.")
+        done_files, pf_status, zero_retries = load_processed_files(pf_path)
+        if pf_status != "valid":
+            if config.H5_PATH.exists():
+                log("  ⚠ invalid processed_files → safe rebuild")
+                force = True
+            else:
+                log("  ⚠ invalid processed_files, no HDF5 → fresh start")
+            existing_channels, existing_n, done_files = None, 0, set()
         elif pf_status == "valid":
-            if done_files:
-                log(f"  ★ 기존 processed_files: {len(done_files)}개 파일 완료")
-            if existing_n:
-                log(f"  ★ 기존 HDF5: {existing_n}스텝")
+            log(f"  ★ processed={len(done_files)}  HDF5={existing_n} steps")
 
-    new_records = [r for r in all_records if make_file_key(r) not in done_files]
-
-    target_records = all_records if force else new_records
-
+    # zero_retries 초과 파일은 재시도 제외 (--force 시엔 무시)
+    _skip_keys = {k for k, v in zero_retries.items() if v >= _ZERO_STEP_MAX_RETRIES}
+    if _skip_keys and not force:
+        log(f"  ⚠ zero_retries 한계 초과 skip: {len(_skip_keys)}개 파일 (--force로 재시도 가능)")
+    target_records = all_records if force else [
+        r for r in all_records
+        if make_file_key(r) not in done_files and make_file_key(r) not in _skip_keys
+    ]
     if not target_records:
-        log(f"\n  ✅ 모든 {len(done_files)}개 파일 처리 완료, 스텝 검출 스킵")
-        log(f"     기존 HDF5: {config.H5_PATH} ({existing_n}스텝)")
+        log(f"  ✅ all files done, steps={existing_n}")
         return
-
-    target_sids = sorted(set(r["sid"] for r in target_records))
-    mode_text = "전체" if force else "신규"
-    log(f"\n  {mode_text} 피험자: {target_sids} ({len(target_sids)}명)")
-    log(f"  {mode_text} CSV: {len(target_records)}개")
 
     if existing_channels:
         channels = existing_channels
-        log(f"  [Pass 0] 기존 채널 재사용: {len(channels)}개 (일관성 유지)")
-        verify_channels(target_records, channels)
+        log(f"  [Pass 0] reuse channels: {len(channels)}")
+        # 재사용 채널도 실제 파일과 대조 검증
+        _verify_channels(target_records, channels)
     else:
         all_common = find_common_channels(all_records)
         from channel_groups import filter_raw_channels
         channels = filter_raw_channels(all_common)
-        log(f"  [Pass 0] Raw IMU 필터: {len(all_common)}ch → {len(channels)}ch")
-        if len(channels) == 0:
-            raise ValueError("Raw IMU 채널(Accel/Gyro)을 찾을 수 없습니다")
+        log(f"  [Pass 0] {len(all_common)} → {len(channels)} raw IMU channels")
+        if not channels:
+            raise ValueError("no raw IMU channels")
 
     n_ch = len(channels)
+    log(f"  [Pass 2] {len(target_records)} files → bout → step")
 
-    log(f"  [Pass 2] {mode_text} {len(target_records)}개 CSV → 스텝 검출...")
-    log(
-        "  ⚠ 주의: v9.0부터 LT/RT 병합 적용 → 데이터셋 의미 변경 "
-        "('발별 step' → '파일 단위 시간순 통합 step'). "
-        "이전 버전과 직접 비교 불가."
-    )
-    t1 = time.time()
+    subj_bufs: dict[int, dict[str, list]] = defaultdict(lambda: {
+        "X":[], "y":[], "trial_id":[], "trial_key":[], "bout_start":[], "bout_end":[],
+        "step_start":[], "step_end":[], "trial_step_index":[],
+        "source_file":[], "side":[], "support":[],
+    })
 
-    subj_bufs: dict[int, dict[str, list]] = defaultdict(lambda: {"X": [], "y": []})
     new_steps = 0
     raw_lens: list[int] = []
-    log_path = config.BATCH_DIR / "step_log.jsonl"
-    processed_now: set[str] = set()  # 이번 실행에서 성공적으로 처리된 파일 키
+    processed_now:  set[str] = set()   # step >= 1인 파일만
+    processed_zero: set[str] = set()   # zero_steps 파일 (재시도 대상)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    log_path = config.BATCH_DIR / f"step_log_{ts}.jsonl"
+    log(f"  step log → {log_path}")
 
     with StepLogWriter(log_path) as step_logger:
         for i, rec in enumerate(target_records):
@@ -1196,177 +1120,210 @@ def main() -> None:
                 df = read_csv_with_retry(rec["path"])
                 df = rename_columns(df)
             except Exception as e:
-                log(f"  ⚠ CSV 읽기 실패: {rec['path'].name} ({e})")
-                continue  # 읽기 실패 → 완료 처리 안 함
+                log(f"  ⚠ read fail: {rec['path'].name} ({e})")
+                zero_retries[file_key] = zero_retries.get(file_key, 0) + 1
+                continue
 
-            sid = rec["sid"]
-            cond = rec["cond"]
-            label = rec["label"]
+            sid, cond, label = rec["sid"], rec["cond"], rec["label"]
 
-            data_cols = [c for c in channels if c in df.columns]
-            if len(data_cols) < len(channels):
-                missing = set(channels) - set(data_cols)
-                log(f"  ⚠ {rec['path'].name}: {len(missing)}개 채널 누락, 스킵")
+            missing_ch = set(channels) - set(df.columns)
+            if missing_ch:
+                log(f"  ⚠ {rec['path'].name}: {len(missing_ch)} missing channels, skip")
+                zero_retries[file_key] = zero_retries.get(file_key, 0) + 1
                 del df
-                gc.collect()
-                continue  # 채널 누락 → 완료 처리 안 함
+                continue
 
             data_np = df[channels].values.astype(np.float32)
 
-            lt_raw_steps: list[tuple[int, int]] = []
-            rt_raw_steps: list[tuple[int, int]] = []
-            lt_supports:  list[str] = []
-            rt_supports:  list[str] = []
-            side_signals: dict[str, np.ndarray] = {}
-            side_raw_counts: dict[str, int] = {"LT": 0, "RT": 0}
-
-            for side, raw_bucket, sup_bucket in [
-                ("LT", lt_raw_steps, lt_supports),
-                ("RT", rt_raw_steps, rt_supports),
-            ]:
-                try:
-                    ml_gyro  = extract_ml_gyro(df, side)
-                    ap_accel = extract_ap_accel(df, side)
-
-                    if ml_gyro is None or ap_accel is None:
-                        # 폴백: 발 가속도 norm
-                        norm   = compute_foot_acc_norm(df, side)
-                        norm_f = bandpass_filter(norm)
-                        raw_steps, supports = _fallback_detect_steps(
-                            norm_f, config.SAMPLE_RATE
-                        )
-                        sig_q = norm_f
-                    else:
-                        raw_steps, supports = detect_steps(
-                            ml_gyro.copy(), ap_accel.copy()
-                        )
-                        sig_q = ml_gyro
-
-                    raw_bucket.extend(raw_steps)
-                    sup_bucket.extend(supports)
-                    side_signals[side] = sig_q
-                    side_raw_counts[side] = len(raw_steps)
-
-                except (KeyError, ValueError):
-                    side_signals[side] = np.full(len(data_np), np.nan, dtype=np.float32)
-
-            # ── polarity 재시도: 한 발이 반대 발보다 현저히 적으면 flip ──
-            # 기준: 한 발이 다른 발의 30% 미만이고, 둘 다 최소 2스텝 이상
-            _FLIP_RATIO = 0.30
-            _flip_tried: set[str] = set()
-            for side, raw_bucket, sup_bucket, other_side in [
-                ("LT", lt_raw_steps, lt_supports, "RT"),
-                ("RT", rt_raw_steps, rt_supports, "LT"),
-            ]:
-                other_n = side_raw_counts[other_side]
-                this_n  = side_raw_counts[side]
-                if other_n >= 2 and this_n < other_n * _FLIP_RATIO:
-                    try:
-                        ml_g = extract_ml_gyro(df, side)
-                        ap_a = extract_ap_accel(df, side)
-                        if ml_g is not None and ap_a is not None:
-                            retry_steps, retry_sups = detect_steps(
-                                ml_g.copy(), ap_a.copy(), force_flip=True
-                            )
-                            if len(retry_steps) > this_n:
-                                log(f"    ↺ polarity flip [{side}]: "
-                                    f"{this_n} → {len(retry_steps)}스텝 (flip 적용)")
-                                raw_bucket.clear()
-                                sup_bucket.clear()
-                                raw_bucket.extend(retry_steps)
-                                sup_bucket.extend(retry_sups)
-                                side_signals[side] = ml_g
-                                side_raw_counts[side] = len(retry_steps)
-                                _flip_tried.add(side)
-                    except (KeyError, ValueError):
-                        pass
-
-            # side별 stride 파라미터 (생리적으로 same-side 기준이 맞음)
-            lt_stride_mean, lt_stride_min, lt_stride_max = \
-                estimate_stride_params_from_steps(lt_raw_steps)
-            rt_stride_mean, rt_stride_min, rt_stride_max = \
-                estimate_stride_params_from_steps(rt_raw_steps)
-            # 파일 전체 통계는 bilateral sanity / 로그용
-            file_stride_mean_sam, file_stride_min_sam, file_stride_max_sam = \
-                estimate_stride_params_from_steps(lt_raw_steps + rt_raw_steps)
-
-            nan_sig = np.full(len(data_np), np.nan, dtype=np.float32)
-            lt_scored: list[ScoredStep] = score_steps_by_side(
-                lt_raw_steps, lt_supports, "LT",
-                side_signals.get("LT", nan_sig),
-                lt_stride_mean, lt_stride_min, lt_stride_max,
-            )
-            rt_scored: list[ScoredStep] = score_steps_by_side(
-                rt_raw_steps, rt_supports, "RT",
-                side_signals.get("RT", nan_sig),
-                rt_stride_mean, rt_stride_min, rt_stride_max,
-            )
-
-            # same-side 중복 제거 → bilateral 병합 → sanity check
-            merged_steps = bilateral_sanity_check(
-                merge_bilateral_steps(lt_scored, rt_scored)
-            )
+            # ── bout 분할 (C1/C6 구조 인식) ──
+            bouts = detect_walking_bouts(df, fs=config.SAMPLE_RATE, cond=cond)
+            expected_n = COND_EXPECTED_BOUTS.get(cond)
+            if expected_n is not None and len(bouts) != expected_n:
+                _log_bout_mismatch(step_logger, rec, len(bouts), expected_n)
             file_steps = 0
 
-            for step in merged_steps:
-                start, end, side, _score, _support = step
-                raw_len = end - start
-                if raw_len < config.MIN_STEP_LEN:
+            for local_trial_id, (bout_start, bout_end) in enumerate(bouts, 1):
+                if (bout_end - bout_start) < int(config.SAMPLE_RATE * BOUT_MIN_WALK_SEC):
                     continue
 
-                seg_256 = resample_step(data_np[start:end])
-                subj_bufs[sid]["X"].append(seg_256)
-                subj_bufs[sid]["y"].append(label)
-                file_steps += 1
-                new_steps += 1
-                raw_lens.append(raw_len)
+                df_bout   = df.iloc[bout_start:bout_end].reset_index(drop=True)
+                data_bout = data_np[bout_start:bout_end]
 
-                step_logger.write({
-                    "file": rec["path"].name,
-                    "sid": sid,
-                    "cond": cond,
-                    "label": label,
-                    "side": side,
-                    "start": start,
-                    "end": end,
-                    "raw_len": raw_len,
-                    "score": round(float(_score), 6),
-                    "support": _support,
-                    "stride_mean_sam": round(file_stride_mean_sam, 1),
-                    "stride_min_sam": int(file_stride_min_sam),
-                    "stride_max_sam": int(file_stride_max_sam),
-                    "lt_raw_n": side_raw_counts["LT"],
-                    "rt_raw_n": side_raw_counts["RT"],
-                })
+                lt_steps, lt_sups = [], []
+                rt_steps, rt_sups = [], []
+                side_signals: dict[str, np.ndarray] = {}
+                side_counts:  dict[str, int]        = {"LT": 0, "RT": 0}
+
+                for side, s_steps, s_sups in [
+                    ("LT", lt_steps, lt_sups),
+                    ("RT", rt_steps, rt_sups),
+                ]:
+                    try:
+                        ml_g = extract_ml_gyro(df_bout, side)
+                        ap_a = extract_ap_accel(df_bout, side)
+                        if ml_g is None or ap_a is None:
+                            norm_f = bandpass_filter(compute_foot_acc_norm(df_bout, side))
+                            raw, sups = _fallback_detect_steps(norm_f, config.SAMPLE_RATE)
+                            sig_q = norm_f
+                        else:
+                            raw, sups = detect_steps(ml_g.copy(), ap_a.copy())
+                            sig_q = ml_g
+                        s_steps.extend(raw); s_sups.extend(sups)
+                        side_signals[side] = sig_q
+                        side_counts[side]  = len(raw)
+                    except Exception:
+                        side_signals[side] = np.full(len(data_bout), np.nan, dtype=np.float32)
+
+                # ── polarity flip 재시도 (발별 품질 기준) ──────────────────
+                for side, s_steps, s_sups, other in [
+                    ("LT", lt_steps, lt_sups, "RT"),
+                    ("RT", rt_steps, rt_sups, "LT"),
+                ]:
+                    other_n = side_counts[other]
+                    this_n  = side_counts[side]
+                    if other_n < 2 or this_n >= other_n * _FLIP_RATIO:
+                        continue
+                    try:
+                        ml_g = extract_ml_gyro(df_bout, side)
+                        ap_a = extract_ap_accel(df_bout, side)
+                        if ml_g is None or ap_a is None:
+                            continue
+                        retry, rsups = detect_steps(ml_g.copy(), ap_a.copy(), force_flip=True)
+                        if len(retry) <= this_n:
+                            continue
+
+                        # ── 품질 비교: 단순 개수 증가 아닌 3가지 기준 ──
+                        # 1) 과폭증 방지: retry가 other_n의 1.5배 초과하면 거부
+                        if len(retry) > other_n * 1.5:
+                            log(f"    ✗ flip [{side}] 거부 (폭증 {this_n}→{len(retry)}, other={other_n})")
+                            continue
+
+                        # 2) stride CV 비교: retry가 더 규칙적이어야 채택
+                        def _stride_cv(steps: list) -> float:
+                            if len(steps) < 3:
+                                return 1.0
+                            ivs = np.diff([s for s, _ in steps]).astype(float)
+                            return float(np.std(ivs)) / max(float(np.mean(ivs)), 1.0)
+
+                        cv_orig  = _stride_cv([(s, e) for s, e in s_steps])
+                        cv_retry = _stride_cv([(s, e) for s, e in retry])
+                        # CV가 나빠지면서 개수만 늘어난 경우 거부
+                        if cv_retry > cv_orig * 1.3 and len(retry) < this_n * 2:
+                            log(f"    ✗ flip [{side}] 거부 (CV 악화 {cv_orig:.2f}→{cv_retry:.2f})")
+                            continue
+
+                        # 3) both support 비율 비교: 나빠지면 거부
+                        def _both_ratio(sups: list) -> float:
+                            return sups.count("both") / max(len(sups), 1)
+
+                        br_orig  = _both_ratio(s_sups)
+                        br_retry = _both_ratio(rsups)
+                        if br_retry < br_orig * 0.5 and br_orig > 0.1:
+                            log(f"    ✗ flip [{side}] 거부 (both 비율 저하 {br_orig:.2f}→{br_retry:.2f})")
+                            continue
+
+                        log(f"    ↺ flip [{side}] 채택: {this_n}→{len(retry)}"
+                            f"  CV:{cv_orig:.2f}→{cv_retry:.2f}"
+                            f"  both:{br_orig:.2f}→{br_retry:.2f}")
+                        s_steps.clear(); s_sups.clear()
+                        s_steps.extend(retry); s_sups.extend(rsups)
+                        side_signals[side] = ml_g
+                        side_counts[side]  = len(retry)
+                    except Exception:
+                        pass
+
+                if side_counts["LT"] + side_counts["RT"] < MIN_STEPS_PER_BOUT:
+                    continue
+
+                nan_sig = np.full(len(data_bout), np.nan, dtype=np.float32)
+                lt_m, lt_lo, lt_hi = estimate_stride_params_from_steps(lt_steps)
+                rt_m, rt_lo, rt_hi = estimate_stride_params_from_steps(rt_steps)
+
+                # ── 발별 baseline 통계 로그 ────────────────────────────────
+                for _side, _steps, _sups, _m in [
+                    ("LT", lt_steps, lt_sups, lt_m),
+                    ("RT", rt_steps, rt_sups, rt_m),
+                ]:
+                    if _steps:
+                        _lens = [e - s for s, e in _steps]
+                        _cv   = float(np.std(_lens)) / max(float(np.mean(_lens)), 1.0)
+                        _both = _sups.count("both") / max(len(_sups), 1)
+                        step_logger.write({
+                            "type": "bout_side_stats",
+                            "file": rec["path"].name, "sid": sid, "cond": cond,
+                            "trial_id": local_trial_id, "side": _side,
+                            "n": len(_steps),
+                            "stride_mean_ms": round(_m / config.SAMPLE_RATE * 1000, 1),
+                            "stride_cv": round(_cv, 3),
+                            "both_ratio": round(_both, 3),
+                        })
+
+                # ── LT/RT ratio hard filter ──────────────────────────────
+                lt_n_raw = side_counts["LT"]
+                rt_n_raw = side_counts["RT"]
+                total_raw = lt_n_raw + rt_n_raw
+                if total_raw >= MIN_STEPS_PER_BOUT:
+                    lt_ratio = lt_n_raw / total_raw
+                    if lt_ratio > 0.80 or lt_ratio < 0.20:
+                        log(f"    ✗ bout{local_trial_id} skip: "
+                            f"LT/RT={lt_n_raw}/{rt_n_raw} ({lt_ratio:.0%}/{1-lt_ratio:.0%}) — 극단 불균형")
+                        continue
+
+                lt_scored = score_steps_by_side(lt_steps, lt_sups, "LT",
+                                                side_signals.get("LT", nan_sig), lt_m, lt_lo, lt_hi)
+                rt_scored = score_steps_by_side(rt_steps, rt_sups, "RT",
+                                                side_signals.get("RT", nan_sig), rt_m, rt_lo, rt_hi)
+
+                merged = bilateral_sanity_check(merge_bilateral_steps(lt_scored, rt_scored))
+
+                trial_step_idx = 0
+                for step in merged:
+                    s, e, side, score, support = step
+                    raw_len = e - s
+                    if raw_len < config.MIN_STEP_LEN:
+                        continue
+                    g_s, g_e = bout_start + s, bout_start + e
+                    seg = resample_step(data_bout[s:e])
+
+                    buf = subj_bufs[sid]
+                    buf["X"].append(seg); buf["y"].append(label)
+                    buf["trial_id"].append(local_trial_id)
+                    buf["trial_key"].append(f"{rec['path'].name}__trial{local_trial_id}")
+                    buf["bout_start"].append(bout_start); buf["bout_end"].append(bout_end)
+                    buf["step_start"].append(g_s); buf["step_end"].append(g_e)
+                    buf["trial_step_index"].append(trial_step_idx)
+                    buf["source_file"].append(rec["path"].name)
+                    buf["side"].append(side); buf["support"].append(support)
+
+                    file_steps += 1; new_steps += 1; raw_lens.append(raw_len)
+                    step_logger.write({
+                        "file": rec["path"].name, "sid": sid, "cond": cond, "label": label,
+                        "trial_id": local_trial_id,
+                        "bout_start": bout_start, "bout_end": bout_end,
+                        "step_start": g_s, "step_end": g_e,
+                        "trial_step_index": trial_step_idx,
+                        "side": side, "score": round(float(score), 6), "support": support,
+                        "lt_raw_n": side_counts["LT"], "rt_raw_n": side_counts["RT"],
+                    })
+                    trial_step_idx += 1
+
+            if file_steps > 0:
+                processed_now.add(file_key)
+            else:
+                processed_zero.add(file_key)
+                zero_retries[file_key] = zero_retries.get(file_key, 0) + 1
+                step_logger.write({"file": rec["path"].name, "sid": sid,
+                                   "cond": cond, "status": "zero_steps",
+                                   "retry_count": zero_retries[file_key]})
 
             del df, data_np
-            gc.collect()
-
-            # 처리 상태 분류: "steps" / "zero_steps" (검출 실패와 원래 없는 것 구분 가능)
-            proc_status = "steps" if file_steps > 0 else "zero_steps"
-            processed_now.add(file_key)  # 파일 읽기·채널 검증 성공 기준
-
-            if proc_status == "zero_steps":
-                step_logger.write({
-                    "file": rec["path"].name,
-                    "sid": sid, "cond": cond, "label": label,
-                    "status": "zero_steps",
-                    "lt_raw_n": side_raw_counts["LT"],
-                    "rt_raw_n": side_raw_counts["RT"],
-                })
-
+            # gc는 20파일마다 1번 (매 파일 강제 GC 불필요)
             if (i + 1) % 20 == 0 or (i + 1) == len(target_records):
-                log(
-                    f"    {i+1}/{len(target_records)} 파일"
-                    f"  최종 병합: {file_steps} 스텝"
-                    f"  누적: {new_steps}"
-                )
+                gc.collect()
+            if (i + 1) % 20 == 0 or (i + 1) == len(target_records):
+                log(f"    {i+1}/{len(target_records)}  file_steps={file_steps}  total={new_steps}")
 
-    log(
-        f"\n  [Pass 2] 스텝 검출 완료: {new_steps}스텝"
-        f"  로그: {step_logger.count}건 → {log_path}"
-        f"  ({time.time()-t1:.1f}s)"
-    )
+    log(f"\n  [Pass 2] done: {new_steps} steps")
 
     if force and config.H5_PATH.exists():
         config.H5_PATH.unlink()
@@ -1375,93 +1332,78 @@ def main() -> None:
     total_steps = existing_n
 
     with h5py.File(config.H5_PATH, "a") as hf:
-        if "subjects" not in hf:
-            hf.create_group("subjects")
-
+        hf.require_group("subjects")
         for sid, buf in sorted(subj_bufs.items()):
             if not buf["X"]:
                 continue
-
-            grp_name = f"subjects/S{sid:04d}"
-            X_arr = np.stack(buf["X"], axis=0).astype(np.float32)
+            X_arr = np.stack(buf["X"]).astype(np.float32)
             y_arr = np.array(buf["y"], dtype=np.int64)
-            n_new = len(X_arr)
-
-            if grp_name in hf:
-                grp = hf[grp_name]
-                old_n = grp["X"].shape[0]
-                new_n = old_n + n_new
-                grp["X"].resize(new_n, axis=0)
-                grp["y"].resize(new_n, axis=0)
-                grp["X"][old_n:new_n] = X_arr
-                grp["y"][old_n:new_n] = y_arr
-                log(f"    S{sid:04d}: 확장 {old_n}→{new_n}스텝")
-            else:
-                grp = hf.create_group(grp_name)
-                grp.create_dataset(
-                    "X", data=X_arr,
-                    maxshape=(None, config.TS, n_ch),
-                    chunks=(min(64, n_new), config.TS, n_ch),
-                )
-                grp.create_dataset("y", data=y_arr, maxshape=(None,))
-                log(f"    S{sid:04d}: 신규 {n_new}스텝")
-
-            total_steps += n_new
-            del X_arr, y_arr
+            meta = {
+                "trial_id":         np.array(buf["trial_id"],         dtype=np.int32),
+                "trial_key":        np.array(buf["trial_key"],        dtype=object),
+                "bout_start":       np.array(buf["bout_start"],       dtype=np.int32),
+                "bout_end":         np.array(buf["bout_end"],         dtype=np.int32),
+                "step_start":       np.array(buf["step_start"],       dtype=np.int32),
+                "step_end":         np.array(buf["step_end"],         dtype=np.int32),
+                "trial_step_index": np.array(buf["trial_step_index"], dtype=np.int32),
+                "source_file":      np.array(buf["source_file"],      dtype=object),
+                "side":             np.array(buf["side"],             dtype=object),
+                "support":          np.array(buf["support"],          dtype=object),
+            }
+            write_subject_group(hf, sid, X_arr, y_arr, meta, n_ch)
+            total_steps += len(X_arr)
 
         if "channels" in hf:
             del hf["channels"]
         hf.create_dataset("channels", data=np.array(channels, dtype="S"))
+        hf.attrs.update({
+            "segmentation":    "heel_strike",
+            "sample_rate":     config.SAMPLE_RATE,
+            "target_ts":       config.TS,
+            "n_classes":       config.NUM_CLASSES,
+            "format":          "subject_group_v10",
+            "label_base":      0,
+            "label_semantics": "terrain_condition",
+            "step_definition": "trialwise_dual_signal_consensus_bilateral_merge",
+            "trial_definition":"walking_bout_in_file_excluding_stop_turn",
+            "trial_key_definition": "source_file__trial{trial_id}",
+            "expected_bouts":  json.dumps(COND_EXPECTED_BOUTS, ensure_ascii=False),
+            "label_mapping":   json.dumps({f"C{i+1}": i for i in range(config.NUM_CLASSES)},
+                                           ensure_ascii=False),
+        })
 
-        hf.attrs["segmentation"] = "heel_strike"
-        hf.attrs["sample_rate"] = config.SAMPLE_RATE
-        hf.attrs["target_ts"] = config.TS
-        hf.attrs["n_classes"] = config.NUM_CLASSES
-        hf.attrs["format"] = "subject_group_v9"
-        hf.attrs["label_base"] = 0
-        hf.attrs["label_semantics"] = "terrain_condition"
-        hf.attrs["step_definition"] = "filewise_dual_signal_consensus_bilateral_merge"
-        hf.attrs["label_mapping"] = json.dumps(
-            {f"C{i+1}": i for i in range(config.NUM_CLASSES)},
-            ensure_ascii=False,
+    log(f"  HDF5 write: {time.time()-t2:.1f}s")
+    # processed_now = file_steps > 0만 (processed_zero와 배타적이므로 단순 저장)
+    all_done = processed_now if force else (done_files | processed_now)
+    # force 시엔 zero_retries 리셋
+    save_zero_retries = {} if force else zero_retries
+    save_processed_files(pf_path, all_done, save_zero_retries)
+    if processed_zero:
+        log(f"  ⚠ zero_steps: {len(processed_zero)}개 파일 (다음 실행에서 재시도)")
+        zero_path = config.BATCH_DIR / "zero_steps_files.json"
+        zero_path.write_text(
+            json.dumps(sorted(processed_zero), indent=2, ensure_ascii=False),
+            encoding="utf-8",
         )
-
-    log(f"  HDF5 쓰기: {time.time()-t2:.1f}s")
-
-    # processed_files.json 갱신
-    all_done_files = processed_now if force else (done_files | processed_now)
-    save_processed_files(processed_files_path, all_done_files)
-    log(f"  processed_files: {len(all_done_files)}개 → {processed_files_path}")
+        log(f"     zero_steps 목록 → {zero_path}")
 
     size_mb = config.H5_PATH.stat().st_size / 1024**2
-    log(f"\n  ✅ HDF5: {config.H5_PATH}")
-    if force:
-        log(f"     전체 재생성: {new_steps}스텝 (총: {total_steps}스텝)")
-    else:
-        log(f"     기존: {existing_n}스텝 + 신규: {new_steps}스텝 = 총: {total_steps}스텝")
-    log(f"     파일 크기: {size_mb:.1f} MB")
+    log(f"  ✅ {config.H5_PATH}  {size_mb:.1f} MB")
+    log(f"     existing={existing_n} + new={new_steps} = total={total_steps}")
 
     if total_steps > 0:
         with h5py.File(config.H5_PATH, "r") as f:
-            all_sids = sorted(int(k[1:]) for k in f["subjects"])
-            label_counts: dict[int, int] = defaultdict(int)
-            for skey in f["subjects"]:
-                for lbl in f[f"subjects/{skey}/y"][:]:
-                    label_counts[int(lbl)] += 1
+            lc: dict[int, int] = defaultdict(int)
+            for sk in f["subjects"]:
+                for lbl in f[f"subjects/{sk}/y"][:]:
+                    lc[int(lbl)] += 1
+        log(f"     label dist: {dict(sorted(lc.items()))}")
 
-            log(f"     라벨 분포(0-based): {dict(sorted(label_counts.items()))}")
-            log(f"     피험자: {all_sids} ({len(all_sids)}명)")
+    if raw_lens:
+        log(f"     step length: min={min(raw_lens)} max={max(raw_lens)} "
+            f"mean={np.mean(raw_lens):.0f} ({np.mean(raw_lens)/config.SAMPLE_RATE*1000:.0f}ms)")
 
-        if raw_lens:
-            log(
-                f"     스텝 길이: min={min(raw_lens)} max={max(raw_lens)}"
-                f"  mean={np.mean(raw_lens):.0f}"
-                f" ({np.mean(raw_lens)/config.SAMPLE_RATE*1000:.0f}ms)"
-            )
-    else:
-        log("  ⚠ 검출된 스텝이 없습니다!")
-
-    log(f"\n  총 소요: {time.time()-t0:.1f}s\n")
+    log(f"  elapsed: {time.time()-t0:.1f}s")
 
 
 if __name__ == "__main__":
