@@ -26,7 +26,7 @@ import numpy as np
 import h5py
 import torch
 import torch.nn as nn
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.decomposition import IncrementalPCA
@@ -849,7 +849,7 @@ def _run(
                 lam = 1.0
 
             # Forward
-            with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
+            with autocast("cuda", enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
                 logits = model(inp)
                 loss = (
                     mixup_criterion(crit, logits, ya, yb_mix, lam)
@@ -979,7 +979,7 @@ def train_model(
         opt, T_max=config.EPOCHS, eta_min=config.MIN_LR)
     # bfloat16은 FP32와 같은 exponent range → GradScaler 불필요
     use_scaler = config.USE_AMP and config.AMP_DTYPE == torch.float16
-    scaler = GradScaler(enabled=use_scaler)
+    scaler = GradScaler("cuda", enabled=use_scaler)
 
     hist: dict[str, list[float]] = {"tl": [], "ta": [], "vl": [], "va": []}
     best_vl = float("inf")
@@ -1178,7 +1178,7 @@ def _run_tta(
                         xb = xb.float()
                     inp = augment(xb, True) if use_aug else xb
 
-                with autocast(enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
+                with autocast("cuda", enabled=config.USE_AMP, dtype=config.AMP_DTYPE):
                     logits = model(inp)
                 logit_parts.append(logits.detach())
                 label_parts.append(yb.detach())

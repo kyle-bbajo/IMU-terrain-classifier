@@ -107,23 +107,49 @@
 
 7개 모델을 K-Fold로 비교합니다. Hybrid 모델(M7, Hierarchical)은 CNN/ResNetTCN과 216-feat FeatureMLP를 융합합니다.
 
-| 모델 | 유형 | 특징 |
-|------|------|------|
-| M2 | CNN | 경량 2-block CNN |
-| M4 | CNN | 4-block CNN + SE |
-| M6 | CNN | 6-block CNN + CBAM |
-| ResNet1D | ResNet | 1D Residual Network |
-| CNNTCN | CNN+TCN | CNN + Temporal Convolutional Network |
-| ResNetTCN | ResNet+TCN | ResNet + TCN 결합 |
-| M7 (Hybrid) | CNN+Feature | M6 + 216-feat FeatureMLP 융합 (`IS_HYBRID=True`) |
+#### K-Fold 비교 실험 (7개)
 
-### 3.1 FeatureMLP 구조
+| 모델 | 클래스 | 유형 | 설명 |
+|------|--------|------|------|
+| M2 | `M2_BranchCNN` | Branch CNN | 기본 branch CNN (plain) |
+| M3 | `M3_BranchSE` | Branch CNN + SE | Squeeze-Excitation 적용 |
+| M4 | `M4_BranchCBAM` | Branch CNN + CBAM | Channel+Spatial Attention |
+| M5 | `M5_BranchCBAMCross` | Branch CNN + CBAM + Cross | 그룹 간 교차 어텐션 추가 |
+| M6 | `M6_BranchCBAMCrossAug` | Branch CNN + CBAM + Aug | M5 + 데이터 증강 |
+| ResNet1D | `BranchResNet1D` | Branch ResNet | 1D Residual Network |
+| CNNTCN | `BranchCNNTCN` | Branch CNN+TCN | CNN + Temporal Conv Network |
+| ResNetTCN | `ResNetTCN` | ResNet+TCN | ResNet + TCN 결합 |
+| **M7** | `M7_Hybrid` | **CNN + Feature** | M6 + 216-feat FeatureMLP 융합 (`IS_HYBRID=True`) |
+
+#### 최종 실험 (1개)
+
+| 모델 | 클래스 | 유형 | 설명 |
+|------|--------|------|------|
+| **Hierarchical** | `HierarchicalFusionNet` | **ResNetTCN + Feature** | ResNetTCN + 216-feat FeatureMLP 융합 (`IS_HYBRID=True`) |
+
+### 3.1 Branch 구조
+
+5개 센서 그룹(Pelvis/Hand/Thigh/Shank/Foot) 각각에 독립 인코더를 적용한 뒤 융합합니다.
+
+```
+입력 (54ch) → 센서 그룹 분리
+  Pelvis  (6ch)  → Branch Encoder → 특징
+  Hand   (12ch)  → Branch Encoder → 특징
+  Thigh  (12ch)  → Branch Encoder → 특징
+  Shank  (12ch)  → Branch Encoder → 특징
+  Foot   (12ch)  → Branch Encoder → 특징
+→ Concat → CrossGroupAttn → Classifier
+```
+
+### 3.2 FeatureMLP 구조 (Hybrid 모델 공통)
 
 ```
 BatchNorm1d(216)
 → Linear(216, 128) → ReLU → Dropout(0.3)
 → Linear(128, feat_dim) → ReLU → Dropout(0.3)
 ```
+
+M7과 Hierarchical 모두 CNN/ResNetTCN 인코더 출력과 FeatureMLP 출력을 concat하여 최종 분류합니다.
 
 ---
 
@@ -227,4 +253,4 @@ experiments/
 
 ---
 
-*IMU 지형 분류 파이프라인 v2.0*
+*IMU 지형 분류 파이프라인 v2.1
