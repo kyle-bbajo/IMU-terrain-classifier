@@ -35,7 +35,7 @@ from train_common import (
     save_json, Timer,
 )
 from channel_groups import build_branch_idx, get_foot_accel_idx
-from features import batch_extract, N_FEATURES
+from features import batch_extract, N_FEATURES, _N_SENSOR
 from models import MODEL_REGISTRY
 
 
@@ -257,10 +257,14 @@ def main():
     if use_cache and cache_path.exists():
         log(f"[feat] 캐시 히트 → {cache_path}")
         feat_all = np.load(cache_path)
+        log(f"[feat] shape={feat_all.shape}  (센서{_N_SENSOR}+컨텍스트{N_FEATURES-_N_SENSOR})")
     else:
-        log("[feat] 추출 시작...")
+        log("[feat] 추출 시작 (센서+bout컨텍스트 324차원)...")
         with Timer() as t:
-            feat_all = batch_extract(X_all, foot_idx, CFG.sample_rate)
+            feat_all = batch_extract(
+                X_all, foot_idx, CFG.sample_rate,
+                h5_path=str(CFG.h5_path),
+            )
         if use_cache:
             np.save(cache_path, feat_all)
         log(f"[feat] 완료 shape={feat_all.shape}  ({t})")

@@ -94,6 +94,9 @@ def make_balanced_sampler(y: np.ndarray) -> WeightedRandomSampler:
     classes, counts = np.unique(y, return_counts=True)
     class_w = np.zeros(N_CLASSES, dtype=np.float64)
     class_w[classes] = 1.0 / counts.astype(np.float64)
+    # C4/C5/C6 oversample ×5
+    for ci in [C4, C5, C6]:
+        class_w[ci] *= 5.0
     sample_w = class_w[y]
     log(f"    BalancedSampler: {dict(zip(classes.tolist(), counts.tolist()))}")
     return WeightedRandomSampler(
@@ -231,7 +234,7 @@ def threshold_search(
     순차 탐색 (greedy per class).
     """
     if search_vals is None:
-        search_vals = [0.5, 0.7, 0.9, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0]
+        search_vals = [0.3, 0.5, 0.7, 0.9, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0]
     mults = np.ones(n_classes, dtype=np.float32)
     for ci in range(n_classes):
         best_f1, best_m = -1.0, 1.0
@@ -314,7 +317,7 @@ def run_fold(fi, tr_ds, te_ds, args, device):
 
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        opt, T_0=20, T_mult=2, eta_min=1e-6,
+        opt, T_0=40, T_mult=2, eta_min=5e-7,
     )
 
     best_f1 = -1.0; best_state = None; best_mults = np.ones(N_CLASSES, dtype=np.float32)
@@ -369,18 +372,18 @@ def run_fold(fi, tr_ds, te_ds, args, device):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--epochs",        type=int,   default=120)
+    p.add_argument("--epochs",        type=int,   default=150)
     p.add_argument("--batch",         type=int,   default=1024)
-    p.add_argument("--lr",            type=float, default=1e-4)
+    p.add_argument("--lr",            type=float, default=2e-4)
     p.add_argument("--wd",            type=float, default=1e-4)
-    p.add_argument("--hidden_dim",    type=int,   default=512)
-    p.add_argument("--n_blocks",      type=int,   default=4)
-    p.add_argument("--dropout",       type=float, default=0.2)
+    p.add_argument("--hidden_dim",    type=int,   default=1024)
+    p.add_argument("--n_blocks",      type=int,   default=8)
+    p.add_argument("--dropout",       type=float, default=0.3)
     p.add_argument("--gamma_default", type=float, default=2.0)
-    p.add_argument("--gamma_surface", type=float, default=4.0,
+    p.add_argument("--gamma_surface", type=float, default=6.0,
                    help="Focal gamma for C4/C5/C6 (surface classes)")
     p.add_argument("--label_smooth",  type=float, default=0.05)
-    p.add_argument("--early_stop",    type=int,   default=25)
+    p.add_argument("--early_stop",    type=int,   default=30)
     p.add_argument("--grad_clip",     type=float, default=5.0)
     p.add_argument("--kfold",         type=int,   default=5)
     p.add_argument("--seed",          type=int,   default=42)
@@ -403,7 +406,7 @@ def main():
     log("=" * 60)
 
     if not args.no_wandb:
-        wandb_start("attribute_kfold_v3", args, cfg_dict=vars(args))
+        wandb_start("attribute_kfold_v4", args, cfg_dict=vars(args))
 
     # ── 데이터 로드 ──────────────────────────────────────────
     h5     = H5Data(_cfg.CFG.h5_path)
@@ -416,7 +419,7 @@ def main():
     # ── feat 추출 (캐시) ─────────────────────────────────────
     from channel_groups import get_foot_accel_idx
     foot_idx   = get_foot_accel_idx(h5.channels)
-    cache_dir  = ensure_dir(_cfg.CFG.repo_dir / "cache" / f"feat{N_FEATURES}_seed{args.seed}_attr_v3")
+    cache_dir  = ensure_dir(_cfg.CFG.repo_dir / "cache" / f"feat{N_FEATURES}_seed{args.seed}_attr_v4")
     cache_path = cache_dir / "all_feat.npy"
 
     if cache_path.exists():
@@ -425,12 +428,13 @@ def main():
     else:
         log(f"  feat 추출 중... (N_FEATURES={N_FEATURES})")
         with Timer() as t:
-            feat_all = batch_extract(h5.X, foot_idx, _cfg.CFG.sample_rate)
+            feat_all = batch_extract(h5.X, foot_idx, _cfg.CFG.sample_rate,
+                                       h5_path=str(_cfg.CFG.h5_path))  # 컨텍스트 60차원 활성화
         np.save(cache_path, feat_all)
         log(f"  feat 추출 완료  shape={feat_all.shape}  {t}")
 
     # ── 출력 디렉토리 ────────────────────────────────────────
-    out = ensure_dir(_cfg.CFG.repo_dir / "out_N50" / "attribute_kfold_v3")
+    out = ensure_dir(_cfg.CFG.repo_dir / "out_N50" / "attribute_kfold_v4")
 
     # ── K-Fold ───────────────────────────────────────────────
     sgkf    = StratifiedGroupKFold(n_splits=args.kfold, shuffle=True, random_state=args.seed)
@@ -468,8 +472,8 @@ def main():
     log(f"{'='*60}")
 
     save_json({
-        "experiment": "attribute_kfold_v3",
-        "version":    "v3_ResidualMLP_SurfaceGate",
+        "experiment": "attribute_kfold_v4",
+        "version":    "v4_ResidualMLP_SurfaceGate_ctx324",
         "mean_acc":   round(mean_acc, 4),
         "mean_f1":    round(mean_f1,  4),
         "total_time": str(total_timer),
@@ -481,7 +485,7 @@ def main():
         },
         "folds": [{k: v for k, v in r.items() if k not in ("report", "cm")}
                   for r in results],
-    }, out / "summary_attribute_v3.json")
+    }, out / "summary_attribute_v4.json")
 
     if not args.no_wandb:
         wandb_finish(results=[{"model": "AttributeV3", "acc": mean_acc, "f1": mean_f1}])

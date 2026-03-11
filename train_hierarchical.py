@@ -4,9 +4,9 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 """
-train_hierarchical.py — v14.3 (C6 평지 recall 부스트)
+train_hierarchical.py — v14.4 (C6 평지 recall 부스트)
 
-v14.2 → v14.3 변경
+v14.2 → v14.5 변경
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [1] SLIP_TAU: 0.45 → 0.38  (false C1 억제 → C6 recall 보호)
 [2] AUX_SURFACE_W: 0.25 → 0.45  (surface 감독 강화)
@@ -75,41 +75,41 @@ CLASS_NAMES_ALL = {
 # ── Fusion 하이퍼파라미터 ──────────────────────────────────────────────────
 FUSION_EPOCHS    = 90
 FUSION_LR        = 1e-4
-FUSION_PATIENCE  = 18
-FOCAL_GAMMA      = 1.5
+FUSION_PATIENCE  = 22
+FOCAL_GAMMA      = 2.0
 
 # ── 보조 loss 가중치 ───────────────────────────────────────────────────────
 AUX_SLIP_W    = 0.45
 AUX_SLOPE_W   = 0.30
-AUX_SURFACE_W = 0.45   # [v14.3] 0.25 → 0.45 (surface 감독 강화)
+AUX_SURFACE_W = 0.80   # [v14.5] 0.60 → 0.80 (surface 감독 최대화)
 
 TRIPLET_MARGIN   = 0.8
 FUSION_TRIPLET_W = 0.05
 
 # ── SlipMultiTaskWarmup ────────────────────────────────────────────────────
-WARMUP_EPOCHS   = 40
+WARMUP_EPOCHS   = 50
 WARMUP_LR       = 5e-5
-WARMUP_PATIENCE = 12
+WARMUP_PATIENCE = 25
 
 # ── StableBaselineBank ────────────────────────────────────────────────────
 STABLE_PERCENTILE    = 30
 STABLE_SCORE_WEIGHTS = dict(asym=0.4, entropy=0.3, horizontal=0.3)
 N_DELTA              = 16
 
-# ── [v14.3] C1 peak-preserving threshold 낮춤 (false C1 → C6 보호) ─────────
-SLIP_TAU = 0.38   # [v14.3] 0.45 → 0.38
+# ── [v14.5] C1 peak-preserving threshold 낮춤 (false C1 → C6 보호) ─────────
+SLIP_TAU = 0.22   # [v14.5] 0.30 → 0.22 (C6 보호 최대화)
 
 # ── Sequence refiner ──────────────────────────────────────────────────────
 SEQ_LEN     = 9
-SEQ_HIDDEN  = 192
+SEQ_HIDDEN  = 256
 SEQ_EPOCHS  = 30
 SEQ_LR      = 4e-4
-SEQ_PATIENCE= 8
+SEQ_PATIENCE= 12
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Detector-Centric Hierarchical Slip Event v14.3",
+        description="Detector-Centric Hierarchical Slip Event v14.5",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--fusion_epochs",    type=int,   default=FUSION_EPOCHS)
@@ -603,9 +603,9 @@ class TerrainDetectorFusionModel(nn.Module):
             p_no * p_level * p_norm,
         ], dim=1)
 
-        # [v14.3] C6 확률 하한 0.02 보장 (inplace 없이)
+        # [v14.5] C6 확률 하한 0.02 보장 (inplace 없이)
         floor = torch.zeros_like(P)
-        floor = F.pad(torch.full((P.size(0), 1), 0.02, device=P.device), (5, 0))
+        floor = F.pad(torch.full((P.size(0), 1), 0.10, device=P.device), (5, 0))
         P = torch.max(P, floor)
 
         return P / P.sum(1, keepdim=True).clamp(min=1e-8)
@@ -648,9 +648,9 @@ def train_warmup(backbone, tr_dl, val_dl, tag="", curve_dir=None):
 
     crit_slip    = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 3.0], device=DEVICE))
     crit_slope   = nn.CrossEntropyLoss(label_smoothing=0.05)
-    # [v14.3] C6(surface index 0) weight 1.0→3.5
+    # [v14.5] C6(surface index 0) weight 1.0→3.5
     crit_surface = nn.CrossEntropyLoss(
-        weight=torch.tensor([3.5, 2.5, 2.5], device=DEVICE),
+        weight=torch.tensor([8.0, 2.5, 2.5], device=DEVICE),
         label_smoothing=0.03, ignore_index=-100)
 
     best_va=0.; best_state=None; patience=0; t0=time.time()
@@ -734,19 +734,19 @@ def train_event_fusion(backbone, tr_dl, val_dl, te_dl, tag="", curve_dir=None,
 
     crit_slip    = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 3.0], device=DEVICE))
     crit_slope   = nn.CrossEntropyLoss(label_smoothing=0.05)
-    # [v14.3] C6(surface index 0) weight 1.0→3.5  surface 감독 강화
+    # [v14.5] C6(surface index 0) weight → 8.0  surface 감독 최대화
     crit_surface = nn.CrossEntropyLoss(
-        weight=torch.tensor([3.5, 2.5, 2.5], device=DEVICE),
+        weight=torch.tensor([8.0, 2.5, 2.5], device=DEVICE),
         label_smoothing=0.03, ignore_index=-100)
     crit_trip    = WithinSubjectTripletLoss(margin=TRIPLET_MARGIN)
     crit_nll     = nn.NLLLoss(weight=auto_class_weights(all_y).to(DEVICE))
 
     best_va=0.; best_state=None; patience=0; t0=time.time()
     log(
-        f"  {tag} Fusion v14.3 ({FUSION_EPOCHS}ep, LR={FUSION_LR:.0e})\n"
+        f"  {tag} Fusion v14.5 ({FUSION_EPOCHS}ep, LR={FUSION_LR:.0e})\n"
         f"       slip_w={AUX_SLIP_W:.2f}  slope_w={AUX_SLOPE_W:.2f}"
         f"  surface_w={AUX_SURFACE_W:.2f}  triplet_w={FUSION_TRIPLET_W:.2f}\n"
-        f"       [v14.3] crit_surface=[3.5,2.5,2.5]  slip_tau={slip_tau}"
+        f"       [v14.5] crit_surface=[3.5,2.5,2.5]  slip_tau={slip_tau}"
     )
 
     for ep in range(1, FUSION_EPOCHS+1):
@@ -1028,14 +1028,14 @@ def main():
         try: gh=subprocess.check_output(["git","rev-parse","--short","HEAD"],cwd=Path(__file__).parent).decode().strip()
         except: gh="unknown"
         wandb.init(project=args.wandb_project,
-                   name=args.run_name or f"v14.3-N{getattr(args,'n_subjects','?')}",
-                   config={"version":"v14.3","git":gh,
+                   name=args.run_name or f"v14.5-N{getattr(args,'n_subjects','?')}",
+                   config={"version":"v14.5","git":gh,
                            "feat_dim":FEAT_DIM_TOTAL,"slip_tau":SLIP_TAU,
                            "aux_surface_w":AUX_SURFACE_W,"stable_pct":STABLE_PERCENTILE})
 
     config.print_config()
     log(
-        f"  ★ v14.3 Detector-Centric Hierarchical (C6 recall 부스트)\n"
+        f"  ★ v14.5 Detector-Centric Hierarchical (C6 recall 부스트)\n"
         f"  - SLIP_TAU={SLIP_TAU} (0.45→0.38, false C1 억제)\n"
         f"  - AUX_SURFACE_W={AUX_SURFACE_W} (0.25→0.45)\n"
         f"  - crit_surface=[3.5,2.5,2.5] (C6 weight 1.0→3.5)\n"
@@ -1155,11 +1155,11 @@ def main():
         fpp_f1 =f1_score(te_lbl,fusion_pp,average="macro",zero_division=0)
         log(f"  {tag} Fusion+PP  Acc={fpp_acc:.4f}  F1={fpp_f1:.4f}")
 
-        # [v14.3] threshold search: 기본 + C6 세밀 탐색
+        # [v14.5] threshold search: 기본 + C6 세밀 탐색
         best_mults, _ = threshold_search(va_proba, va_lbl)
         # C6 전용 세밀 탐색 (0.5~4.0)
         c6_best_f1, c6_best_m = -1.0, best_mults[5]
-        for m in [0.5, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]:
+        for m in [0.5, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0]:
             tmp = best_mults.copy(); tmp[5] = m
             sc  = f1_score(va_lbl, (va_proba * tmp).argmax(1), average="macro", zero_division=0)
             if sc > c6_best_f1: c6_best_f1, c6_best_m = sc, m
@@ -1224,7 +1224,7 @@ def main():
     total_min=(time.time()-t_total)/60
 
     print(f"\n{'='*60}")
-    print(f"  ★ v14.3 Detector-Centric  {config.KFOLD}-Fold")
+    print(f"  ★ v14.5 Detector-Centric  {config.KFOLD}-Fold")
     print(f"  총 소요: {total_min:.1f}분")
     print(f"  Acc={acc_all:.4f}  MacroF1={f1_all:.4f}")
     print(f"{'='*60}")
@@ -1234,12 +1234,12 @@ def main():
 
     rep=classification_report(labels_all,preds_all,labels=np.arange(6),
                                target_names=[CLASS_NAMES_ALL[i] for i in range(6)],digits=4,zero_division=0)
-    (out/"report_v143.txt").write_text(f"v14.3\nAcc={acc_all:.4f}  F1={f1_all:.4f}\n\n{rep}")
+    (out/"report_v145.txt").write_text(f"v14.5\nAcc={acc_all:.4f}  F1={f1_all:.4f}\n\n{rep}")
     le_out=LabelEncoder(); le_out.fit(np.arange(6))
-    save_cm(preds_all,labels_all,le_out,"HierarchicalSlipDetector_v143_KFold",out)
+    save_cm(preds_all,labels_all,le_out,"HierarchicalSlipDetector_v145_KFold",out)
 
     summary={
-        "experiment":"hierarchical_eventfusion_v143","version":"v14.3",
+        "experiment":"hierarchical_eventfusion_v145","version":"v14.5",
         "changes":["SLIP_TAU 0.45→0.38","AUX_SURFACE_W 0.25→0.45",
                    "crit_surface=[3.5,2.5,2.5]","C6 proba floor 0.02","C6 threshold 세밀 탐색"],
         "feat_dim_total":FEAT_DIM_TOTAL,"slip_tau":SLIP_TAU,
@@ -1248,7 +1248,7 @@ def main():
         "per_class_recall":{CLASS_NAMES_ALL[i]:round(float(recalls[i]),4) for i in range(6)},
         "total_minutes":round(total_min,1),"fold_meta":fold_meta,
     }
-    sp=out/"summary_v143.json"; sp.write_text(json.dumps(summary,indent=2,ensure_ascii=False))
+    sp=out/"summary_v145.json"; sp.write_text(json.dumps(summary,indent=2,ensure_ascii=False))
     log(f"  ✅ {sp}")
 
     if _WANDB_OK and wandb.run is not None:
