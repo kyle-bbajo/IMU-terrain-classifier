@@ -784,7 +784,7 @@ class ConfigState:
 def _auto_batch() -> int:
     """GPU 메모리 기반 배치 크기를 자동 결정한다."""
     if USE_GPU:
-        base = 2048 if GPU_MEM_GB >= 40 else (512 if GPU_MEM_GB >= 20 else 128)
+        base = 4096 if GPU_MEM_GB >= 40 else (4096 if GPU_MEM_GB >= 20 else 256)
         return base * max(1, N_GPU)
     return 128
 

@@ -11,12 +11,13 @@
    42-47  Shank  RT   Accel(3) + Gyro(3)
    48-53  Foot   RT   Accel(3) + Gyro(3)
 
-피처 구성 (총 N_FEATURES = 216):
+피처 구성 (총 N_FEATURES = 232):
     Pelvis      :  22개  (몸통 안정성 · tilt · jerk)
     Hand  LT/RT :  38개  (팔 스윙 리듬 · 좌우 대칭)
     Thigh LT/RT :  36개  (고관절 ROM · 각속도)
     Shank LT/RT :  40개  (무릎 충격 · 정강이 진동)
     Foot  LT/RT :  80개  (착지 패턴 · 보행 주파수)
+    Terrain      :  16개  (흙길 불규칙성 8 + 잔디 탄성감쇠 8)
 """
 from __future__ import annotations
 
@@ -329,6 +330,136 @@ def _feat_foot(lt_seg: np.ndarray, rt_seg: np.ndarray, fs: int) -> np.ndarray:
 # 통합 추출기
 # ─────────────────────────────────────────────────────────────
 
+
+def _peak_height_variance(s: np.ndarray, fs: int) -> float:
+    """피크 높이의 분산 — 흙길(불규칙) 지표"""
+    peaks, props = find_peaks(np.abs(s), height=np.abs(s).mean() * 0.5, distance=int(fs * 0.05))
+    if len(props["peak_heights"]) < 2:
+        return 0.0
+    return float(np.var(props["peak_heights"]))
+
+
+def _peak_interval_cv(s: np.ndarray, fs: int) -> float:
+    """피크 간격 변동계수(CV) — 흙길(불규칙 보행 타이밍) 지표"""
+    peaks, _ = find_peaks(np.abs(s), height=np.abs(s).mean() * 0.5, distance=int(fs * 0.05))
+    if len(peaks) < 3:
+        return 0.0
+    intervals = np.diff(peaks).astype(np.float32)
+    return float(intervals.std() / (intervals.mean() + 1e-8))
+
+
+def _jerk_variance(s: np.ndarray, fs: int) -> float:
+    """jerk(가속도 미분) 분산 — 흙길(충격 불규칙성) 지표"""
+    jerk = np.diff(s) * fs
+    return float(np.var(jerk))
+
+
+def _hf_band_ratio(s: np.ndarray, fs: int) -> float:
+    """고주파(>30 Hz) 에너지 비율 — 흙길(진동) 지표"""
+    mag   = np.abs(np.fft.rfft(s)) ** 2
+    freqs = np.fft.rfftfreq(len(s), d=1.0 / fs)
+    total = mag.sum() + 1e-8
+    return float(mag[freqs >= 30].sum() / total)
+
+
+def _impact_peak(s: np.ndarray) -> float:
+    """최대 충격 피크 — 잔디(낮음) vs 아스팔트(높음) 지표"""
+    return float(np.abs(s).max())
+
+
+def _loading_rate(s: np.ndarray, fs: int) -> float:
+    """초기 피크까지의 상승 기울기(loading rate) — 잔디(완만) 지표"""
+    abs_s  = np.abs(s)
+    pk_idx = int(np.argmax(abs_s))
+    if pk_idx == 0:
+        return 0.0
+    start  = max(pk_idx - int(fs * 0.05), 0)
+    rise   = float(abs_s[pk_idx] - abs_s[start])
+    dur    = (pk_idx - start) / fs + 1e-8
+    return float(rise / dur)
+
+
+def _lf_hf_ratio(s: np.ndarray, fs: int) -> float:
+    """저주파(<10 Hz) / 고주파(>30 Hz) 에너지 비율 — 잔디(높음) 지표"""
+    mag   = np.abs(np.fft.rfft(s)) ** 2
+    freqs = np.fft.rfftfreq(len(s), d=1.0 / fs)
+    lf    = mag[freqs < 10].sum() + 1e-8
+    hf    = mag[freqs >= 30].sum() + 1e-8
+    return float(lf / hf)
+
+
+def _rebound_ratio(s: np.ndarray, fs: int) -> float:
+    """첫 번째 피크 대비 두 번째 피크 비율 — 잔디(낮은 반발) 지표"""
+    abs_s  = np.abs(s)
+    peaks, props = find_peaks(abs_s, height=abs_s.mean() * 0.3, distance=int(fs * 0.05))
+    if len(peaks) < 2:
+        return 0.0
+    heights = props["peak_heights"]
+    return float(heights[1] / (heights[0] + 1e-8))
+
+
+def _feat_terrain(
+    foot_lt: np.ndarray, foot_rt: np.ndarray,
+    shank_lt: np.ndarray, shank_rt: np.ndarray,
+    fs: int,
+) -> np.ndarray:
+    """
+    C4(흙길) / C5(잔디) 구분 특화 피처
+    출력: 16개
+        [흙길 = 불규칙성] 8개:
+            foot_lt  peak_height_var       1
+            foot_lt  peak_interval_cv      1
+            foot_lt  jerk_variance         1
+            shank_lt hf_band_ratio         1
+            foot_rt  peak_height_var       1
+            foot_rt  peak_interval_cv      1
+            foot_rt  jerk_variance         1
+            LR peak height asymmetry       1
+
+        [잔디 = 탄성/감쇠] 8개:
+            foot_lt  impact_peak           1
+            foot_lt  loading_rate          1
+            foot_lt  lf_hf_ratio           1
+            foot_lt  rebound_ratio         1
+            foot_rt  impact_peak           1
+            foot_rt  loading_rate          1
+            foot_rt  lf_hf_ratio           1
+            foot_rt  rebound_ratio         1
+    """
+    fa_lt = foot_lt[2]   # foot LT accel Z
+    fa_rt = foot_rt[2]   # foot RT accel Z
+    sa_lt = shank_lt[2]  # shank LT accel Z
+    sa_rt = shank_rt[2]  # shank RT accel Z
+
+    # ── 흙길 불규칙성 ─────────────────────────────────────────
+    lt_phv = _peak_height_variance(fa_lt, fs)
+    lt_pic = _peak_interval_cv(fa_lt, fs)
+    lt_jv  = _jerk_variance(fa_lt, fs)
+    lt_hf  = _hf_band_ratio(sa_lt, fs)
+
+    rt_phv = _peak_height_variance(fa_rt, fs)
+    rt_pic = _peak_interval_cv(fa_rt, fs)
+    rt_jv  = _jerk_variance(fa_rt, fs)
+
+    # LR 피크 높이 비대칭 (흙길 = 비대칭 큼)
+    lt_pk_mean = float(np.abs(fa_lt).max())
+    rt_pk_mean = float(np.abs(fa_rt).max())
+    lr_asym    = abs(lt_pk_mean - rt_pk_mean) / (lt_pk_mean + rt_pk_mean + 1e-8)
+
+    irreg = [lt_phv, lt_pic, lt_jv, lt_hf, rt_phv, rt_pic, rt_jv, lr_asym]
+
+    # ── 잔디 탄성/감쇠 ────────────────────────────────────────
+    comp = [
+        _impact_peak(fa_lt),  _loading_rate(fa_lt, fs),
+        _lf_hf_ratio(fa_lt, fs), _rebound_ratio(fa_lt, fs),
+        _impact_peak(fa_rt),  _loading_rate(fa_rt, fs),
+        _lf_hf_ratio(fa_rt, fs), _rebound_ratio(fa_rt, fs),
+    ]
+
+    out = np.array(irreg + comp, dtype=np.float32)
+    assert len(out) == 16, f"terrain feat len={len(out)}"
+    return out
+
 _IDX = {
     "pelvis":   slice(0,  6),
     "hand_lt":  slice(6,  12),
@@ -341,7 +472,7 @@ _IDX = {
     "foot_rt":  slice(48, 54),
 }
 
-N_FEATURES: int = 216  # 22 + 38 + 36 + 40 + 80
+N_FEATURES: int = 232  # 22 + 38 + 36 + 40 + 80 + 16(terrain)
 
 
 class SensorFeatureExtractor:
@@ -360,13 +491,17 @@ class SensorFeatureExtractor:
         assert x.shape[0] >= 54, f"채널 수 부족: {x.shape[0]} < 54"
         fs = self.fs
 
-        pelvis = _feat_pelvis(x[_IDX["pelvis"]],  fs)
-        hand   = _feat_hand(x[_IDX["hand_lt"]],   x[_IDX["hand_rt"]], fs)
-        thigh  = _feat_thigh(x[_IDX["thigh_lt"]], x[_IDX["thigh_rt"]], fs)
-        shank  = _feat_shank(x[_IDX["shank_lt"]], x[_IDX["shank_rt"]], fs)
-        foot   = _feat_foot(x[_IDX["foot_lt"]],   x[_IDX["foot_rt"]], fs)
+        pelvis  = _feat_pelvis(x[_IDX["pelvis"]],  fs)
+        hand    = _feat_hand(x[_IDX["hand_lt"]],   x[_IDX["hand_rt"]], fs)
+        thigh   = _feat_thigh(x[_IDX["thigh_lt"]], x[_IDX["thigh_rt"]], fs)
+        shank   = _feat_shank(x[_IDX["shank_lt"]], x[_IDX["shank_rt"]], fs)
+        foot    = _feat_foot(x[_IDX["foot_lt"]],   x[_IDX["foot_rt"]], fs)
+        terrain = _feat_terrain(
+            x[_IDX["foot_lt"]][0:3],  x[_IDX["foot_rt"]][0:3],
+            x[_IDX["shank_lt"]][0:3], x[_IDX["shank_rt"]][0:3], fs,
+        )
 
-        feat = np.concatenate([pelvis, hand, thigh, shank, foot])
+        feat = np.concatenate([pelvis, hand, thigh, shank, foot, terrain])
         assert len(feat) == N_FEATURES, f"총 피처 수 불일치: {len(feat)} != {N_FEATURES}"
         return np.nan_to_num(feat, nan=0.0, posinf=1e6, neginf=-1e6)
 
@@ -377,7 +512,7 @@ class SensorFeatureExtractor:
 
 # 센서 구간 정의 (로그용)
 _SECTIONS: list[tuple[str, int]] = [
-    ("Pelvis", 22), ("Hand", 38), ("Thigh", 36), ("Shank", 40), ("Foot", 80),
+    ("Pelvis", 22), ("Hand", 38), ("Thigh", 36), ("Shank", 40), ("Foot", 80), ("Terrain", 16),
 ]
 _LOG_INTERVAL = 1000   # 몇 샘플마다 진행률을 출력할지
 
@@ -439,8 +574,15 @@ def batch_extract(
         foot = _feat_foot(seg[_IDX["foot_lt"]], seg[_IDX["foot_rt"]], fs)
         sec_times["Foot"] += _time.perf_counter() - t0
 
+        t0 = _time.perf_counter()
+        terrain = _feat_terrain(
+            seg[_IDX["foot_lt"]][0:3],  seg[_IDX["foot_rt"]][0:3],
+            seg[_IDX["shank_lt"]][0:3], seg[_IDX["shank_rt"]][0:3], fs,
+        )
+        sec_times["Terrain"] += _time.perf_counter() - t0
+
         feats[i] = np.nan_to_num(
-            np.concatenate([pelvis, hand, thigh, shank, foot]),
+            np.concatenate([pelvis, hand, thigh, shank, foot, terrain]),
             nan=0.0, posinf=1e6, neginf=-1e6,
         )
 
@@ -511,7 +653,7 @@ if __name__ == "__main__":
 
     ext = SensorFeatureExtractor()
     f   = ext.extract(X[0])
-    sections = {"Pelvis": 22, "Hand": 38, "Thigh": 36, "Shank": 40, "Foot": 80}
+    sections = {"Pelvis": 22, "Hand": 38, "Thigh": 36, "Shank": 40, "Foot": 80, "Terrain": 16}
     idx = 0
     for name, n in sections.items():
         chunk = f[idx:idx+n]

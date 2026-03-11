@@ -1,9 +1,10 @@
-"""src/models.py — M1–M7 + ResNet1D + CNNTCN + ResNetTCN + HierarchicalFusionNet.
+"""src/models.py — M1–M8 + ResNet1D + CNNTCN + ResNetTCN + HierarchicalFusionNet.
 
 MODEL_REGISTRY 키:
     baseline    : "M2", "M4", "M6"
     comparison  : "ResNet1D", "CNNTCN", "ResNetTCN"
     hybrid      : "M7"             (CNN + N_FEATURES-feat, IS_HYBRID=True)
+    surface-aware: "M8"            (M7 + SurfaceGate + FlatDetector, IS_HYBRID=True)
     advanced    : "Hierarchical"   (ResNetTCN + N_FEATURES-feat, IS_HYBRID=True)
     flat        : "M1"             (PCA + flat CNN, 별도 run_M1)
 """
@@ -183,7 +184,6 @@ class FreqBranch(nn.Module):
 # ─────────────────────────────────────────────
 
 class Branch(nn.Module):
-    """CNN 브랜치 (plain / se / cbam 모드)."""
     def __init__(self, in_ch, out_dim, mode="plain"):
         super().__init__()
         d = CFG.dropout_feat
@@ -202,7 +202,6 @@ class Branch(nn.Module):
 
 
 class ResNetBranch(nn.Module):
-    """ResNet 브랜치 (time-axis preserving)."""
     def __init__(self, in_ch, out_dim):
         super().__init__()
         d = CFG.dropout_feat
@@ -238,14 +237,13 @@ class CNNTCNBranch(nn.Module):
 
 
 # ─────────────────────────────────────────────
-# M1 (Flat CNN, PCA input)
+# M1 (Flat CNN)
 # ─────────────────────────────────────────────
 
 class M1_FlatCNN(nn.Module):
     def __init__(self, in_ch=None, num_classes=None):
         super().__init__()
-        in_ch = in_ch or CFG.pca_ch
-        n_cls = num_classes or CFG.num_classes
+        in_ch = in_ch or CFG.pca_ch; n_cls = num_classes or CFG.num_classes
         fd, dc = CFG.feat_dim, CFG.dropout_clf
         self.net = nn.Sequential(
             ConvBNReLU(in_ch, 64, 7, 3), nn.MaxPool1d(2), nn.Dropout(CFG.dropout_feat),
@@ -260,25 +258,18 @@ class M1_FlatCNN(nn.Module):
 
 
 # ─────────────────────────────────────────────
-# _BranchBase (M2–M6 공통)
+# _BranchBase (M2–M6)
 # ─────────────────────────────────────────────
 
 class _BranchBase(nn.Module):
     def __init__(self, branch_channels, branch_ctor, mode="plain", cross=False, num_classes=None):
         super().__init__()
-        feat  = CFG.feat_dim
-        n_cls = num_classes or CFG.num_classes
-        drop  = CFG.dropout_clf
-        self.names    = list(branch_channels.keys())
-        self.n        = len(self.names)
-        self.cross    = cross
-        self.branches = nn.ModuleDict({
-            nm: branch_ctor(ch, feat, mode) for nm, ch in branch_channels.items()
-        })
+        feat  = CFG.feat_dim; n_cls = num_classes or CFG.num_classes; drop = CFG.dropout_clf
+        self.names    = list(branch_channels.keys()); self.n = len(self.names); self.cross = cross
+        self.branches = nn.ModuleDict({nm: branch_ctor(ch, feat, mode) for nm, ch in branch_channels.items()})
         self.use_fft  = CFG.use_fft_branch and CFG.fft_source_group in branch_channels
         if self.use_fft:
-            self.fft_src     = CFG.fft_source_group
-            self.freq_branch = FreqBranch(branch_channels[self.fft_src], feat)
+            self.fft_src = CFG.fft_source_group; self.freq_branch = FreqBranch(branch_channels[self.fft_src], feat)
         if cross:
             self.cross_attn = CrossGroupAttn(feat)
         n_f = self.n + (1 if self.use_fft else 0)
@@ -292,7 +283,7 @@ class _BranchBase(nn.Module):
     def _encode(self, bi):
         feats = [self.branches[nm](bi[nm]) for nm in self.names]
         if self.cross:
-            x     = self.cross_attn(torch.stack(feats, dim=1))
+            x = self.cross_attn(torch.stack(feats, dim=1))
             feats = [x[:, i, :] for i in range(self.n)]
         if self.use_fft:
             feats.append(self.freq_branch(bi[self.fft_src]))
@@ -301,10 +292,6 @@ class _BranchBase(nn.Module):
     def forward(self, bi): return self.clf(self._encode(bi))
     def extract(self, bi): return self._encode(bi)
 
-
-# ─────────────────────────────────────────────
-# M2–M6 팩토리
-# ─────────────────────────────────────────────
 
 def M2_BranchCNN(bc):       return _BranchBase(bc, Branch, "plain", False)
 def M3_BranchSE(bc):        return _BranchBase(bc, Branch, "se",    False)
@@ -320,7 +307,7 @@ class M6_BranchCBAMCrossAug(_BranchBase):
 
 
 # ─────────────────────────────────────────────
-# ResNet1D, CNNTCN (브랜치 래퍼)
+# ResNet1D, CNNTCN, ResNetTCN
 # ─────────────────────────────────────────────
 
 def BranchResNet1D(bc):
@@ -351,16 +338,11 @@ def BranchCNNTCN(bc):
     return _BranchBase(bc, CNNTCNBranch, "cbam", True)
 
 
-# ─────────────────────────────────────────────
-# ResNetTCN (시간축 보존 + AttnPool)
-# ─────────────────────────────────────────────
-
 def ResNetTCN(bc: dict) -> nn.Module:
-    """ResNet 브랜치 → concat → 4단 Dilated TCN → AttnPool."""
     class _M(nn.Module):
         def __init__(self):
             super().__init__()
-            feat  = CFG.feat_dim; d = CFG.dropout_feat; dc = CFG.dropout_clf
+            feat = CFG.feat_dim; d = CFG.dropout_feat; dc = CFG.dropout_clf
             self.names    = list(bc.keys())
             self.branches = nn.ModuleDict({nm: ResNetBranch(ch, feat) for nm, ch in bc.items()})
             total         = feat * len(self.names)
@@ -384,18 +366,13 @@ def ResNetTCN(bc: dict) -> nn.Module:
 
 
 # ─────────────────────────────────────────────
-# FeatureMLP — N_FEATURES 동적 참조 (하드코딩 금지)
+# FeatureMLP
 # ─────────────────────────────────────────────
 
 class FeatureMLP(nn.Module):
-    """핸드크래프트 피처 스트림 MLP.
-
-    n_feat 기본값은 features.N_FEATURES (현재 216) 를 동적으로 참조한다.
-    """
     def __init__(self, n_feat: int = N_FEATURES, out_dim: int = None):
         super().__init__()
-        out_dim = out_dim or CFG.feat_dim
-        d = CFG.dropout_feat
+        out_dim = out_dim or CFG.feat_dim; d = CFG.dropout_feat
         self.net = nn.Sequential(
             nn.BatchNorm1d(n_feat),
             nn.Linear(n_feat, 128), nn.ReLU(inplace=True), nn.Dropout(d),
@@ -405,7 +382,7 @@ class FeatureMLP(nn.Module):
 
 
 # ─────────────────────────────────────────────
-# M7: CNN(M6) + N_FEATURES-feat Hybrid
+# M7: CNN(M6) + N_FEATURES Hybrid
 # ─────────────────────────────────────────────
 
 class M7_HybridModel(nn.Module):
@@ -414,17 +391,15 @@ class M7_HybridModel(nn.Module):
     def __init__(self, bc):
         super().__init__()
         feat = CFG.feat_dim; dc = CFG.dropout_clf
-        self.names    = list(bc.keys())
-        self.n        = len(self.names)
+        self.names    = list(bc.keys()); self.n = len(self.names)
         self.branches = nn.ModuleDict({nm: Branch(ch, feat, "cbam") for nm, ch in bc.items()})
         self.cross    = CrossGroupAttn(feat)
         self.use_fft  = CFG.use_fft_branch and CFG.fft_source_group in bc
         if self.use_fft:
-            self.fft_src     = CFG.fft_source_group
-            self.freq_branch = FreqBranch(bc[self.fft_src], feat)
-        n_f        = self.n + (1 if self.use_fft else 0)
-        cnn_dim    = feat * n_f
-        self.feat_mlp  = FeatureMLP(N_FEATURES)   # ← 동적 참조
+            self.fft_src = CFG.fft_source_group; self.freq_branch = FreqBranch(bc[self.fft_src], feat)
+        n_f = self.n + (1 if self.use_fft else 0)
+        cnn_dim = feat * n_f
+        self.feat_mlp  = FeatureMLP(N_FEATURES)
         fusion_dim     = cnn_dim + CFG.feat_dim
         self.bn_fuse   = nn.BatchNorm1d(fusion_dim)
         self.clf       = nn.Sequential(
@@ -438,14 +413,11 @@ class M7_HybridModel(nn.Module):
         feats = [self.branches[nm](bi[nm]) for nm in self.names]
         x     = self.cross(torch.stack(feats, dim=1))
         feats = [x[:, i, :] for i in range(self.n)]
-        if self.use_fft:
-            feats.append(self.freq_branch(bi[self.fft_src]))
+        if self.use_fft: feats.append(self.freq_branch(bi[self.fft_src]))
         return torch.cat(feats, dim=1)
 
     def forward(self, bi, feat):
-        """feat: (B, N_FEATURES) — 하이브리드 피처 스트림."""
-        if self.training:
-            bi = {k: augment(v, True) for k, v in bi.items()}
+        if self.training: bi = {k: augment(v, True) for k, v in bi.items()}
         fused = self.bn_fuse(torch.cat([self._cnn_encode(bi), self.feat_mlp(feat)], dim=1))
         return self.clf(fused)
 
@@ -456,8 +428,143 @@ class M7_HybridModel(nn.Module):
 def M7_Hybrid(bc): return M7_HybridModel(bc)
 
 
+class M7_AttributeHybridModel(nn.Module):
+    IS_HYBRID = True
+    C1, C2, C3, C4, C5, C6 = 0, 1, 2, 3, 4, 5
+
+    def __init__(self, bc):
+        super().__init__()
+        feat = CFG.feat_dim; dc = CFG.dropout_clf
+        self.names    = list(bc.keys()); self.n = len(self.names)
+        self.branches = nn.ModuleDict({nm: Branch(ch, feat, "cbam") for nm, ch in bc.items()})
+        self.cross    = CrossGroupAttn(feat)
+        self.use_fft  = CFG.use_fft_branch and CFG.fft_source_group in bc
+        if self.use_fft:
+            self.fft_src = CFG.fft_source_group; self.freq_branch = FreqBranch(bc[self.fft_src], feat)
+        n_f = self.n + (1 if self.use_fft else 0)
+        cnn_dim = feat * n_f
+        self.feat_mlp  = FeatureMLP(N_FEATURES)
+        fusion_dim     = cnn_dim + CFG.feat_dim
+        self.bn_fuse   = nn.BatchNorm1d(fusion_dim)
+        self.slip_head  = nn.Linear(fusion_dim, 1)
+        self.slope_head = nn.Linear(fusion_dim, 3)
+        self.irreg_head = nn.Linear(fusion_dim, 1)
+        self.comp_head  = nn.Linear(fusion_dim, 1)
+        self.flat_head  = nn.Linear(fusion_dim, 1)
+        self.clf = nn.Sequential(
+            nn.Linear(fusion_dim + 7, 256), nn.ReLU(inplace=True), nn.Dropout(dc),
+            nn.Linear(256, 128),            nn.ReLU(inplace=True), nn.Dropout(dc),
+            nn.Linear(128, CFG.num_classes),
+        )
+        self.apply(_init)
+
+    def _fuse(self, bi, feat):
+        feats = [self.branches[nm](bi[nm]) for nm in self.names]
+        x     = self.cross(torch.stack(feats, dim=1))
+        feats = [x[:, i, :] for i in range(self.n)]
+        if self.use_fft: feats.append(self.freq_branch(bi[self.fft_src]))
+        return self.bn_fuse(torch.cat([torch.cat(feats, dim=1), self.feat_mlp(feat)], dim=1))
+
+    def forward(self, bi, feat):
+        if self.training: bi = {k: augment(v, True) for k, v in bi.items()}
+        h   = self._fuse(bi, feat)
+        sl  = self.slip_head(h); slo = self.slope_head(h)
+        ir  = self.irreg_head(h); co  = self.comp_head(h); fl = self.flat_head(h)
+        aux = torch.cat([sl, slo, ir, co, fl], dim=-1)
+        fin = self.clf(torch.cat([h, aux], dim=-1))
+        return {"final_logits": fin, "slip_logit": sl.squeeze(-1),
+                "slope_logits": slo, "irreg_logit": ir.squeeze(-1),
+                "comp_logit": co.squeeze(-1), "flat_logit": fl.squeeze(-1)}
+
+    def extract(self, bi, feat): return self._fuse(bi, feat)
+
+
+def M7_AttributeHybrid(bc): return M7_AttributeHybridModel(bc)
+
+
 # ─────────────────────────────────────────────
-# HierarchicalFusionNet: ResNetTCN + N_FEATURES-feat
+# M8: Surface-Aware Hybrid (C4/C5/C6 Gate + C6 FlatDetector)
+# ─────────────────────────────────────────────
+
+class M8_SurfaceAwareModel(nn.Module):
+    """M7 기반 + Surface Gate + Flat Detector.
+
+    Surface Gate : fusion embedding → C4/C5/C6 logit bias (학습 가능한 보정)
+    Flat Detector: fusion embedding → sigmoid → C6 로짓 직접 보강
+    C4/C5/C6 recall (특히 C6 평지 47%) 개선 목적.
+    """
+    IS_HYBRID = True
+
+    def __init__(self, bc):
+        super().__init__()
+        feat = CFG.feat_dim; dc = CFG.dropout_clf
+        self.names    = list(bc.keys()); self.n = len(self.names)
+        self.branches = nn.ModuleDict({nm: Branch(ch, feat, "cbam") for nm, ch in bc.items()})
+        self.cross    = CrossGroupAttn(feat)
+        self.use_fft  = CFG.use_fft_branch and CFG.fft_source_group in bc
+        if self.use_fft:
+            self.fft_src = CFG.fft_source_group
+            self.freq_branch = FreqBranch(bc[self.fft_src], feat)
+
+        n_f        = self.n + (1 if self.use_fft else 0)
+        cnn_dim    = feat * n_f
+        self.feat_mlp  = FeatureMLP(N_FEATURES)
+        fusion_dim     = cnn_dim + CFG.feat_dim
+        self.bn_fuse   = nn.BatchNorm1d(fusion_dim)
+
+        # Surface Gate: C4/C5/C6 학습 가능한 logit bias
+        self.surface_gate = nn.Sequential(
+            nn.Linear(fusion_dim, 128), nn.LayerNorm(128),
+            nn.GELU(), nn.Dropout(dc),
+            nn.Linear(128, 3),   # C4_bias, C5_bias, C6_bias
+        )
+        # Flat Detector: C6(평지) 전용 신호
+        self.flat_detector = nn.Sequential(
+            nn.Linear(fusion_dim, 64), nn.LayerNorm(64),
+            nn.GELU(), nn.Dropout(dc),
+            nn.Linear(64, 1),    # flat_logit
+        )
+        # 메인 분류 헤드
+        self.clf = nn.Sequential(
+            nn.Linear(fusion_dim, 256), nn.ReLU(inplace=True), nn.Dropout(dc),
+            nn.Linear(256, 128),        nn.ReLU(inplace=True), nn.Dropout(dc),
+            nn.Linear(128, CFG.num_classes),
+        )
+        self.apply(_init)
+
+    def _cnn_encode(self, bi):
+        feats = [self.branches[nm](bi[nm]) for nm in self.names]
+        x     = self.cross(torch.stack(feats, dim=1))
+        feats = [x[:, i, :] for i in range(self.n)]
+        if self.use_fft: feats.append(self.freq_branch(bi[self.fft_src]))
+        return torch.cat(feats, dim=1)
+
+    def forward(self, bi, feat):
+        if self.training: bi = {k: augment(v, True) for k, v in bi.items()}
+        fused  = self.bn_fuse(torch.cat([self._cnn_encode(bi), self.feat_mlp(feat)], dim=1))
+        base   = self.clf(fused)                           # (B, 6)
+
+        # Surface Gate: C4/C5/C6 bias — F.pad으로 inplace 없이
+        gate     = self.surface_gate(fused)                # (B, 3)
+        gate_pad = F.pad(0.5 * gate, (3, 0))              # (B, 6)
+        logits   = base + gate_pad
+
+        # Flat Detector: C6 boost — F.pad으로 inplace 없이
+        flat_val  = 0.4 * torch.sigmoid(self.flat_detector(fused))  # (B, 1)
+        flat_pad  = F.pad(flat_val, (5, 0))               # (B, 6)
+        logits    = logits + flat_pad
+
+        return logits
+
+    def extract(self, bi, feat):
+        return self.bn_fuse(torch.cat([self._cnn_encode(bi), self.feat_mlp(feat)], dim=1))
+
+
+def M8_SurfaceAware(bc): return M8_SurfaceAwareModel(bc)
+
+
+# ─────────────────────────────────────────────
+# HierarchicalFusionNet
 # ─────────────────────────────────────────────
 
 class HierarchicalFusionNet(nn.Module):
@@ -474,7 +581,7 @@ class HierarchicalFusionNet(nn.Module):
             DilatedTCN(total, 4, d), DilatedTCN(total, 8, d),
         )
         self.pool      = AttnPool1D(total)
-        self.feat_mlp  = FeatureMLP(N_FEATURES)   # ← 동적 참조
+        self.feat_mlp  = FeatureMLP(N_FEATURES)
         fusion_dim     = total + CFG.feat_dim
         self.bn_fuse   = nn.BatchNorm1d(fusion_dim)
         self.clf       = nn.Sequential(
@@ -489,9 +596,7 @@ class HierarchicalFusionNet(nn.Module):
         return self.pool(self.tcn(torch.cat(feats, dim=1)))
 
     def forward(self, bi, feat):
-        """feat: (B, N_FEATURES) — 하이브리드 피처 스트림."""
-        if self.training:
-            bi = {k: augment(v, True) for k, v in bi.items()}
+        if self.training: bi = {k: augment(v, True) for k, v in bi.items()}
         fused = self.bn_fuse(torch.cat([self._deep(bi), self.feat_mlp(feat)], dim=1))
         return self.clf(fused)
 
@@ -513,6 +618,8 @@ MODEL_REGISTRY: Dict[str, object] = {
     "M5":           M5_BranchCBAMCross,
     "M6":           M6_BranchCBAMCrossAug,
     "M7":           M7_Hybrid,
+    "M7_Attr":      M7_AttributeHybrid,
+    "M8":           M8_SurfaceAware,
     "ResNet1D":     BranchResNet1D,
     "CNNTCN":       BranchCNNTCN,
     "ResNetTCN":    ResNetTCN,

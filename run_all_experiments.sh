@@ -3,68 +3,97 @@
 # run_all_experiments.sh — IMU 지형 분류 전체 실험 파이프라인
 # ══════════════════════════════════════════════════════════════
 # 사용법:
-#   chmod +x run_all_experiments.sh
-#   ./run_all_experiments.sh              # 전체 (kfold → loso → hierarchical)
 #   ./run_all_experiments.sh kfold
-#   ./run_all_experiments.sh loso
-#   ./run_all_experiments.sh hierarchical
+#   ./run_all_experiments.sh kfold --bg
+#   ./run_all_experiments.sh kfold,hierarchical       # 동시 백그라운드
+#   ./run_all_experiments.sh all                      # 순차
+#
+# W&B 비활성화: WANDB_PROJECT="" ./run_all_experiments.sh kfold
 # ══════════════════════════════════════════════════════════════
 
 set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}/src:${PYTHONPATH}"
+
+# ── W&B 설정 ─────────────────────────────────────────────────
+export WANDB_PROJECT="${WANDB_PROJECT:-imu-terrain}"
+export WANDB_ENTITY="${WANDB_ENTITY:-}"
+export WANDB_DIR="${SCRIPT_DIR}/experiments/wandb"
+mkdir -p "${WANDB_DIR}"
+[ -n "${WANDB_PROJECT}" ] \
+    && echo "  [W&B] project=${WANDB_PROJECT}" \
+    || echo "  [W&B] 비활성화"
+
 LOG_DIR="${SCRIPT_DIR}/experiments/logs"
 mkdir -p "${LOG_DIR}"
 TS=$(date +%Y%m%d_%H%M%S)
 
-run_kfold() {
-    echo "════════════════════════════════════════"
-    echo "  [1/3] K-Fold 비교 실험"
-    echo "════════════════════════════════════════"
-    LOG="${LOG_DIR}/kfold_${TS}.log"
-    python "${SCRIPT_DIR}/train_kfold.py" \
-        --models "M2,M4,M6,ResNet1D,CNNTCN,ResNetTCN,M7" \
-        2>&1 | tee "${LOG}"
-    echo "  ✅ K-Fold 완료 → ${LOG}"
+TARGETS="${1:-all}"
+BG=0
+[ "${2}" = "--bg" ] && BG=1
+
+# ── 실험별 명령 (배열) ─────────────────────────────────────────
+_cmd_kfold=(
+    python "${SCRIPT_DIR}/train_kfold.py"
+    --models "M2,M4,M6,ResNet1D,CNNTCN,ResNetTCN,M7"
+    --run_name "kfold_${TS}"
+)
+_cmd_loso=(
+    python "${SCRIPT_DIR}/train_loso.py"
+    --models "M6,ResNet1D,ResNetTCN,M7"
+    --run_name "loso_${TS}"
+)
+_cmd_hierarchical=(
+    python "${SCRIPT_DIR}/train_hierarchical.py"
+    --run_name "hierarchical_${TS}"
+)
+
+# ── 실행 헬퍼 ─────────────────────────────────────────────────
+_run() {
+    local name="$1"; shift
+    local log="${LOG_DIR}/${name}_${TS}.log"
+    if [ $BG -eq 1 ]; then
+        nohup "$@" > "${log}" 2>&1 &
+        local pid=$!
+        echo "${pid}" > "${LOG_DIR}/${name}.pid"
+        echo "  ▶ ${name} 백그라운드 시작  PID=${pid}"
+        echo "    로그: tail -f ${log}"
+        echo "    종료: kill ${pid}"
+    else
+        echo "════════════════════════════════════════"
+        echo "  ${name} 실행 중..."
+        echo "════════════════════════════════════════"
+        "$@" 2>&1 | tee "${log}"
+        echo "  ✅ ${name} 완료 → ${log}"
+    fi
 }
 
-run_loso() {
-    echo "════════════════════════════════════════"
-    echo "  [2/3] LOSO 실험"
-    echo "════════════════════════════════════════"
-    LOG="${LOG_DIR}/loso_${TS}.log"
-    python "${SCRIPT_DIR}/train_loso.py" \
-        --models "M6,ResNet1D,ResNetTCN,M7" \
-        2>&1 | tee "${LOG}"
-    echo "  ✅ LOSO 완료 → ${LOG}"
+# ── 타겟 실행 ─────────────────────────────────────────────────
+_dispatch() {
+    local name="$1"
+    case "$name" in
+        kfold)         _run kfold        "${_cmd_kfold[@]}" ;;
+        loso)          _run loso         "${_cmd_loso[@]}" ;;
+        hierarchical)  _run hierarchical "${_cmd_hierarchical[@]}" ;;
+        *) echo "알 수 없는 실험: $name"; exit 1 ;;
+    esac
 }
 
-run_hierarchical() {
-    echo "════════════════════════════════════════"
-    echo "  [3/3] HierarchicalFusionNet 실험"
-    echo "════════════════════════════════════════"
-    LOG="${LOG_DIR}/hierarchical_${TS}.log"
-    python "${SCRIPT_DIR}/train_hierarchical.py" \
-        2>&1 | tee "${LOG}"
-    echo "  ✅ Hierarchical 완료 → ${LOG}"
-}
-
-case "${1:-all}" in
-    kfold)         run_kfold ;;
-    loso)          run_loso ;;
-    hierarchical)  run_hierarchical ;;
+case "$TARGETS" in
     all)
-        run_kfold
-        run_loso
-        run_hierarchical
-        echo ""
-        echo "════════════════════════════════════════"
-        echo "  ★ 전체 실험 완료"
-        echo "  결과: ${SCRIPT_DIR}/experiments/"
-        echo "════════════════════════════════════════"
+        _run kfold        "${_cmd_kfold[@]}"
+        _run loso         "${_cmd_loso[@]}"
+        _run hierarchical "${_cmd_hierarchical[@]}"
+        echo "★ 전체 실험 완료"
+        ;;
+    *,*)
+        BG=1
+        IFS=',' read -ra NAMES <<< "$TARGETS"
+        for name in "${NAMES[@]}"; do
+            _dispatch "$(echo "$name" | tr -d ' ')"
+        done
         ;;
     *)
-        echo "Usage: $0 [kfold|loso|hierarchical|all]"
-        exit 1
+        _dispatch "$TARGETS"
         ;;
 esac
