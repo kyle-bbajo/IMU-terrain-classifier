@@ -62,14 +62,17 @@ from models import M6_BranchCBAMCrossAug
 from train_common import (
     log, H5Data, fit_bsc_on_train,
     make_branch_dataset, make_loader, save_cm, clear_fold_cache,
+    filter_and_remap, N_ACTIVE_CLASSES, ACTIVE_CLASS_NAMES,
 )
 
 DEVICE = config.DEVICE
-ALL6   = np.arange(6)
+# C5 제외: 5클래스
+ALL5 = np.arange(N_ACTIVE_CLASSES)   # [0,1,2,3,4]
+ALL6 = ALL5   # 하위 호환 alias (코드 내 ALL6 참조 유지)
 
 CLASS_NAMES_ALL = {
     0: "C1-미끄러운", 1: "C2-오르막", 2: "C3-내리막",
-    3: "C4-흙길",     4: "C5-잔디",   5: "C6-평지",
+    3: "C4-흙길",     4: "C6-평지",   # C5(잔디) 제외
 }
 
 # ── Fusion 하이퍼파라미터 ──────────────────────────────────────────────────
@@ -207,13 +210,13 @@ def _inner_val_split(tr_idx, groups, y, val_ratio=0.15):
     val_sbj    = set(rng.choice(unique_sbj, n_val, replace=False).tolist())
     mask       = np.array([g not in val_sbj for g in tr_groups])
     inner_tr   = tr_idx[mask]; inner_va = tr_idx[~mask]
-    missing    = set(range(6)) - set(np.unique(y[inner_va]).tolist())
+    missing    = set(range(N_ACTIVE_CLASSES)) - set(np.unique(y[inner_va]).tolist())
     if missing: log(f"    [WARN] inner val: 클래스 {sorted(missing)} 누락")
     log(f"    inner split: tr={mask.sum()}  val={(~mask).sum()}  val_sbj={sorted(val_sbj)}")
     return inner_tr, inner_va
 
 
-def auto_class_weights(y_flat, num_classes=6):
+def auto_class_weights(y_flat, num_classes=N_ACTIVE_CLASSES):
     present = np.unique(y_flat); w = np.ones(num_classes, dtype=np.float32)
     if len(present):
         for c, wc in zip(present, compute_class_weight("balanced", classes=present, y=y_flat)):
@@ -535,7 +538,7 @@ def make_fusion_loader(ds, shuffle, balanced=False):
     sampler=None; us=shuffle
     if shuffle and balanced:
         cls,cnt=np.unique(ds.y,return_counts=True)
-        cw=np.zeros(len(CLASS_NAMES_ALL),dtype=np.float64)
+        cw=np.zeros(N_ACTIVE_CLASSES, dtype=np.float64)
         cw[cls]=1./cnt.astype(np.float64)
         sampler=WeightedRandomSampler(torch.as_tensor(cw[ds.y],dtype=torch.double),len(ds.y),replacement=True)
         us=False
@@ -590,22 +593,21 @@ class TerrainDetectorFusionModel(nn.Module):
         p_level  = p_slo[:, 0]
         p_up     = p_slo[:, 1]
         p_down   = p_slo[:, 2]
-        p_norm   = p_sur[:, 0]   # C6
-        p_irr    = p_sur[:, 1]   # C4
-        p_soft   = p_sur[:, 2]   # C5
+        p_norm   = p_sur[:, 0]   # C6 평지
+        p_irr    = p_sur[:, 1]   # C4 흙길
+        # p_soft(C5 잔디) 제거됨
 
         P = torch.stack([
             p_slip_,
             p_no * p_up,
             p_no * p_down,
             p_no * p_level * p_irr,
-            p_no * p_level * p_soft,
             p_no * p_level * p_norm,
         ], dim=1)
 
         # [v14.5] C6 확률 하한 0.02 보장 (inplace 없이)
         floor = torch.zeros_like(P)
-        floor = F.pad(torch.full((P.size(0), 1), 0.10, device=P.device), (5, 0))
+        floor = F.pad(torch.full((P.size(0), 1), 0.10, device=P.device), (4, 0))
         P = torch.max(P, floor)
 
         return P / P.sum(1, keepdim=True).clamp(min=1e-8)
@@ -803,7 +805,7 @@ def train_event_fusion(backbone, tr_dl, val_dl, te_dl, tag="", curve_dir=None,
         else:
             va_p = va_p_raw
         va_acc=accuracy_score(va_l,va_p)
-        va_f1 =f1_score(va_l,va_p,labels=ALL6,average="macro",zero_division=0)
+        va_f1 =f1_score(va_l,va_p,labels=ALL5,average="macro",zero_division=0)
         va_score=0.4*va_acc+0.6*va_f1; curve.record(acc=va_score)
 
         if va_score>best_va: best_va=va_score; best_state=_clone_state(model); patience=0
@@ -848,7 +850,7 @@ def train_event_fusion(backbone, tr_dl, val_dl, te_dl, tag="", curve_dir=None,
 # Threshold search & postprocess
 # ─────────────────────────────────────────────────────────────────────────────
 
-def threshold_search(proba, labels, n_classes=6):
+def threshold_search(proba, labels, n_classes=N_ACTIVE_CLASSES):
     mults = np.ones(n_classes, dtype=np.float32)
     for ci in range(n_classes):
         best_f1, best_m = -1.0, 1.0
@@ -897,7 +899,7 @@ class _SeqConvBlock(nn.Module):
 
 
 class LocalSequenceRefiner(nn.Module):
-    def __init__(self,in_dim,hidden=SEQ_HIDDEN,n_classes=6):
+    def __init__(self,in_dim,hidden=SEQ_HIDDEN,n_classes=N_ACTIVE_CLASSES):
         super().__init__()
         self.proj=nn.Linear(in_dim,hidden)
         self.conv=nn.Sequential(_SeqConvBlock(hidden,1),_SeqConvBlock(hidden,2),_SeqConvBlock(hidden,4))
@@ -976,7 +978,7 @@ def train_sequence_refiner(tr_groups,va_groups,te_groups,
             for xb,yb in va_ld:
                 vp.append(model(xb.to(DEVICE).float())[:,half,:].argmax(1).cpu()); vl.append(yb)
         vp=torch.cat(vp).float().numpy(); vl=torch.cat(vl).float().numpy()
-        vs=0.4*accuracy_score(vl,vp)+0.6*f1_score(vl,vp,labels=ALL6,average="macro",zero_division=0)
+        vs=0.4*accuracy_score(vl,vp)+0.6*f1_score(vl,vp,labels=ALL5,average="macro",zero_division=0)
         if vs>best_va: best_va=vs; best_state=_clone_state(model); patience=0
         else:
             patience+=1
@@ -993,12 +995,12 @@ def train_sequence_refiner(tr_groups,va_groups,te_groups,
     vp_seq=torch.cat(vp_seq).float().numpy()
     vp_seq_pp=peak_preserving_postprocess(vp_seq, sf_va_probas, va_cgrp, vote_window, slip_tau)
     bvs = (0.4*accuracy_score(sf_va_labels, vp_seq_pp) +
-           0.6*f1_score(sf_va_labels, vp_seq_pp, labels=ALL6, average="macro", zero_division=0))
+           0.6*f1_score(sf_va_labels, vp_seq_pp, labels=ALL5, average="macro", zero_division=0))
 
     fv_pp = peak_preserving_postprocess(sf_va_preds,  sf_va_probas, va_cgrp, vote_window, slip_tau)
     ft_pp = peak_preserving_postprocess(sf_te_preds,  sf_te_probas, te_cgrp, vote_window, slip_tau)
     bvf   = (0.4*accuracy_score(sf_va_labels, fv_pp) +
-             0.6*f1_score(sf_va_labels, fv_pp, labels=ALL6, average="macro", zero_division=0))
+             0.6*f1_score(sf_va_labels, fv_pp, labels=ALL5, average="macro", zero_division=0))
 
     te_ld=DataLoader(torch.from_numpy(te_seq),batch_size=512,shuffle=False)
     tp=[]; model.eval()
@@ -1047,21 +1049,20 @@ def main():
     curve_dir=out/"curves"; out.mkdir(parents=True,exist_ok=True); curve_dir.mkdir(parents=True,exist_ok=True)
 
     h5data=H5Data(config.H5_PATH)
-    le=LabelEncoder(); y=le.fit_transform(h5data.y_raw).astype(np.int64); groups=h5data.subj_id
+    # ── C5 제외 ─────────────────────────────────────────────
+    config.NUM_CLASSES = N_ACTIVE_CLASSES
+    y_raw_orig = h5data.y_raw.astype(np.int64)
+    y, groups, kept_idx = filter_and_remap(y_raw_orig, h5data.subj_id)
+    y_full = np.full(len(y_raw_orig), -1, dtype=np.int64)
+    y_full[kept_idx] = y
     branch_idx,branch_ch=build_branch_idx(h5data.channels)
-
-    if le.classes_.dtype.kind in ('U', 'S', 'O'):
-        expected = [CLASS_NAMES_ALL[i] for i in range(6)]
-        if list(le.classes_) != expected:
-            raise ValueError(f"[FATAL] LabelEncoder 순서 불일치!\n  실제: {le.classes_.tolist()}\n  기대: {expected}")
-    else:
-        expected_ints = list(range(6))
-        if list(le.classes_) != expected_ints:
-            raise ValueError(f"[FATAL] 정수 레이블 순서 불일치!\n  실제: {le.classes_.tolist()}")
-        log(f"  [INFO] y_raw가 정수 레이블 — CLASS_NAMES_ALL 매핑 기준")
+    le=LabelEncoder(); le.classes_=np.array(list(CLASS_NAMES_ALL.values()))
+    log(f"  C5 제외 후: N={len(y)}  classes={N_ACTIVE_CLASSES}  {list(CLASS_NAMES_ALL.values())}")
 
     feat_ext=ExpandedTerrainFeatures()
-    log(f"  클래스: {le.classes_.tolist()}  피험자: {len(np.unique(groups))}명  샘플: {len(y)}")
+    log(f"  클래스: {list(CLASS_NAMES_ALL.values())}  피험자: {len(np.unique(groups))}명  샘플: {len(y)}")
+    # kept_idx를 h5data에 반영 (read_X 호출 시 전달)
+    _h5_kept_idx = kept_idx   # 이후 tr_idx/te_idx는 이 공간의 인덱스
     sgkf=StratifiedGroupKFold(n_splits=config.KFOLD,shuffle=True,random_state=config.SEED)
 
     all_preds,all_labels,fold_meta=[],[],[]
@@ -1075,11 +1076,16 @@ def main():
         log(f"{'='*60}")
 
         inner_tr,inner_va=_inner_val_split(tr_idx,groups,y)
-        bsc=fit_bsc_on_train(h5data,inner_tr)
-        tr_ds    =make_branch_dataset(h5data,y,inner_tr,bsc,branch_idx,fold_tag=f"EF{fi}_N{config.N_SUBJECTS}",split="train")
-        tr_ds_det=make_branch_dataset(h5data,y,inner_tr,bsc,branch_idx,fold_tag=f"EF{fi}_N{config.N_SUBJECTS}_det",split="val")
-        va_ds    =make_branch_dataset(h5data,y,inner_va,bsc,branch_idx,fold_tag=f"EF{fi}v_N{config.N_SUBJECTS}",split="val")
-        te_ds    =make_branch_dataset(h5data,y,te_idx,bsc,branch_idx,fold_tag=f"EF{fi}_N{config.N_SUBJECTS}",split="test")
+        # ── kept_idx 역매핑: sgkf 인덱스(0~N') → 원본 HDF5 인덱스 ──
+        # make_branch_dataset은 h5data.read_X()를 호출하므로 원본 인덱스 필요
+        h5_inner_tr = _h5_kept_idx[inner_tr]
+        h5_inner_va = _h5_kept_idx[inner_va]
+        h5_te_idx   = _h5_kept_idx[te_idx]
+        bsc=fit_bsc_on_train(h5data,h5_inner_tr)
+        tr_ds    =make_branch_dataset(h5data,y_full,h5_inner_tr,bsc,branch_idx,fold_tag=f"EF{fi}_N{config.N_SUBJECTS}",split="train")
+        tr_ds_det=make_branch_dataset(h5data,y_full,h5_inner_tr,bsc,branch_idx,fold_tag=f"EF{fi}_N{config.N_SUBJECTS}_det",split="val")
+        va_ds    =make_branch_dataset(h5data,y_full,h5_inner_va,bsc,branch_idx,fold_tag=f"EF{fi}v_N{config.N_SUBJECTS}",split="val")
+        te_ds    =make_branch_dataset(h5data,y_full,h5_te_idx,bsc,branch_idx,fold_tag=f"EF{fi}_N{config.N_SUBJECTS}",split="test")
 
         tr_dl=make_loader(tr_ds,True,branch=True); va_dl=make_loader(va_ds,False,branch=True)
         te_dl=make_loader(te_ds,False,branch=True)
@@ -1093,7 +1099,7 @@ def main():
         backbone_fusion=M6_BranchCBAMCrossAug(branch_ch).to(DEVICE)
         backbone_fusion.load_state_dict(wu_model.backbone.state_dict())
 
-        trg=groups[inner_tr]; vag=groups[inner_va]; teg=groups[te_idx]
+        trg=groups[inner_tr]; vag=groups[inner_va]; teg=groups[te_idx]   # groups는 이미 filtered 공간
 
         log(f"  {tag} ExpandedTerrainFeatures 추출")
         tr_raw=extract_all_engineered_features(tr_ds_det,feat_ext)
@@ -1219,7 +1225,7 @@ def main():
     preds_all=np.concatenate(all_preds); labels_all=np.concatenate(all_labels)
     acc_all=accuracy_score(labels_all,preds_all)
     f1_all =f1_score(labels_all,preds_all,average="macro",zero_division=0)
-    cm=confusion_matrix(labels_all,preds_all,labels=np.arange(6))
+    cm=confusion_matrix(labels_all,preds_all,labels=np.arange(N_ACTIVE_CLASSES))
     recalls=cm.diagonal()/cm.sum(1).clip(min=1)
     total_min=(time.time()-t_total)/60
 
@@ -1232,10 +1238,10 @@ def main():
         flag = "⚠" if r < 0.70 else "✅"
         print(f"    {flag} {CLASS_NAMES_ALL[i]:<14} {r*100:.1f}%")
 
-    rep=classification_report(labels_all,preds_all,labels=np.arange(6),
-                               target_names=[CLASS_NAMES_ALL[i] for i in range(6)],digits=4,zero_division=0)
+    rep=classification_report(labels_all,preds_all,labels=np.arange(N_ACTIVE_CLASSES),
+                               target_names=[CLASS_NAMES_ALL[i] for i in range(N_ACTIVE_CLASSES)],digits=4,zero_division=0)
     (out/"report_v145.txt").write_text(f"v14.5\nAcc={acc_all:.4f}  F1={f1_all:.4f}\n\n{rep}")
-    le_out=LabelEncoder(); le_out.fit(np.arange(6))
+    le_out=LabelEncoder(); le_out.fit(np.arange(N_ACTIVE_CLASSES))
     save_cm(preds_all,labels_all,le_out,"HierarchicalSlipDetector_v145_KFold",out)
 
     summary={
@@ -1245,7 +1251,7 @@ def main():
         "feat_dim_total":FEAT_DIM_TOTAL,"slip_tau":SLIP_TAU,
         "stable_percentile":STABLE_PERCENTILE,
         "overall":{"acc":round(acc_all,4),"f1":round(f1_all,4)},
-        "per_class_recall":{CLASS_NAMES_ALL[i]:round(float(recalls[i]),4) for i in range(6)},
+        "per_class_recall":{CLASS_NAMES_ALL[i]:round(float(recalls[i]),4) for i in range(N_ACTIVE_CLASSES)},
         "total_minutes":round(total_min,1),"fold_meta":fold_meta,
     }
     sp=out/"summary_v145.json"; sp.write_text(json.dumps(summary,indent=2,ensure_ascii=False))

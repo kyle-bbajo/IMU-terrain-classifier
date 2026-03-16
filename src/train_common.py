@@ -706,7 +706,7 @@ class AttributeMultiTaskLoss(nn.Module):
               + self.ws["slip"]  * F.binary_cross_entropy_with_logits(out["slip_logit"],  slip)
               + self.ws["slope"] * self.ce_slope(out["slope_logits"], slope)
               + self.ws["irreg"] * F.binary_cross_entropy_with_logits(out["irreg_logit"], irreg)
-              + self.ws["comp"]  * F.binary_cross_entropy_with_logits(out["comp_logit"],  comp)
+              + self.ws["comp"]  * (F.binary_cross_entropy_with_logits(out["comp_logit"],  comp) if "comp_logit" in out else 0.0)
               + self.ws["flat"]  * F.binary_cross_entropy_with_logits(out["flat_logit"],  flat))
 
 

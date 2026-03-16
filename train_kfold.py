@@ -1,16 +1,20 @@
+import json
+import json
 """train_final.py — 95% 목표 최종 파이프라인
 
 핵심 전략:
   1. Subject-wise Feature Normalization  (개인차 제거)
-  2. M7_Attr (CNN + 232feat + Attribute Heads + GRU fusion)
+  2. M7_Attr (CNN + 324feat + Attribute Heads + GRU fusion)
   3. Per-class Threshold Grid Search     (val set 기준)
-  4. Hierarchical + M7_Attr Soft Ensemble (저장된 logits 결합)
+  4. 3모델 앙상블: kfold + attribute_v5 + hierarchical
+     Phase A: 가중 평균 (자동 grid search)
+     Phase B: LightGBM Stacking (meta-learner)
+     → val F1 높은 것 채택
 
 실행:
   cd ~/project/repo
-  python train_final.py
-  python train_final.py --models M7_Attr --epochs 80
-  python train_final.py --ensemble_only  (학습 없이 앙상블만)
+  python train_kfold.py
+  python train_kfold.py --ensemble_only  (학습 없이 앙상블만)
 """
 from __future__ import annotations
 
@@ -33,9 +37,10 @@ from train_common import (
     H5Data, train_model, save_report, save_cm,
     save_summary_table, seed_everything, log, ensure_dir,
     save_json, Timer,
+    filter_and_remap, N_ACTIVE_CLASSES, ACTIVE_CLASS_NAMES,
 )
 from channel_groups import build_branch_idx, get_foot_accel_idx
-from features import batch_extract, N_FEATURES, _N_SENSOR
+from features import batch_extract, N_FEATURES
 from models import MODEL_REGISTRY
 
 
@@ -51,11 +56,17 @@ def parse_args():
     p.add_argument("--seed",           type=int, default=None)
     p.add_argument("--no-feat-cache",  action="store_true")
     p.add_argument("--ensemble_only",  action="store_true",
-                   help="학습 없이 저장된 logits로 앙상블만 수행")
-    p.add_argument("--hier_logits",    type=str, default=None,
-                   help="Hierarchical logits .npy 경로 (앙상블용)")
-    p.add_argument("--hier_weight",    type=float, default=0.5,
-                   help="앙상블 시 Hierarchical 가중치 (0~1)")
+                   help="학습 없이 저장된 probas로 앙상블만 수행")
+    # ── 앙상블 소스 경로 ──────────────────────────────────────
+    p.add_argument("--attr_proba_dir", type=str,
+                   default="out_N50/attribute_kfold_v5/probas",
+                   help="attribute fold별 proba 디렉토리")
+    p.add_argument("--hier_proba_dir", type=str,
+                   default="out_N50/hierarchical_eventfusion/probas",
+                   help="hierarchical fold별 proba 디렉토리")
+    p.add_argument("--n_folds",        type=int, default=5)
+    p.add_argument("--no_stack",       action="store_true",
+                   help="LightGBM stacking 건너뜀")
     return p.parse_args()
 
 
@@ -180,6 +191,257 @@ def find_best_ensemble_weight(
 
 
 # ════════════════════════════════════════════════════════════════
+# 4-B. 3모델 앙상블 유틸
+# ════════════════════════════════════════════════════════════════
+
+def _load_fold_probas(proba_dir: str, prefix: str, n_folds: int):
+    """fold별 proba/labels npy 로드 → concat."""
+    d = Path(proba_dir)
+    probas, labels = [], []
+    for fi in range(1, n_folds + 1):
+        pp = d / f"{prefix}_proba_fold{fi}.npy"
+        lp = d / f"{prefix}_labels_fold{fi}.npy"
+        if pp.exists() and lp.exists():
+            probas.append(np.load(pp))
+            labels.append(np.load(lp))
+        else:
+            log(f"  [WARN] 없음: {pp}")
+    if not probas:
+        return None, None
+    return np.concatenate(probas), np.concatenate(labels)
+
+
+def _weight_search(probas_list, labels, steps=6):
+    """3개 모델 가중치 grid search → 최적 (w0,w1,w2) 반환."""
+    vals = np.linspace(0, 1, steps + 1)
+    best_f1, best_w = -1.0, None
+    avail = [(i, p) for i, p in enumerate(probas_list) if p is not None]
+    for wa in vals:
+        for wb in vals:
+            wc = 1.0 - wa - wb
+            if wc < -1e-6: continue
+            ws = [wa, wb, max(wc, 0.0)]
+            total = sum(ws[i] for i, _ in avail)
+            if total < 1e-8: continue
+            combo = sum(ws[i] / total * p for i, p in avail)
+            f1 = f1_score(labels, combo.argmax(1), average="macro", zero_division=0)
+            if f1 > best_f1:
+                best_f1, best_w = f1, tuple(ws)
+    return best_w, best_f1
+
+
+def _stacking(kfold_probas_list, attr_probas_list, hier_probas_list,
+              kfold_labels_list, n_folds):
+    """LightGBM OOF stacking."""
+    try:
+        import lightgbm as lgb
+    except ImportError:
+        log("  [WARN] lightgbm 미설치 → pip install lightgbm"); return None, -1.0
+
+    meta_X, meta_y = [], []
+    for fi in range(n_folds):
+        parts, lbl = [], None
+        for plist, llist in [(kfold_probas_list,  kfold_labels_list),
+                              (attr_probas_list,   None),
+                              (hier_probas_list,   None)]:
+            if fi < len(plist) and plist[fi] is not None:
+                parts.append(plist[fi])
+                if lbl is None and llist is not None and fi < len(llist):
+                    lbl = llist[fi]
+        if not parts or lbl is None: continue
+        min_n = min(len(p) for p in parts)
+        meta_X.append(np.concatenate([p[:min_n] for p in parts], axis=1))
+        meta_y.append(lbl[:min_n])
+
+    if not meta_X:
+        log("  [WARN] stacking meta feature 없음"); return None, -1.0
+
+    X = np.concatenate(meta_X).astype(np.float32)
+    y = np.concatenate(meta_y).astype(np.int64)
+    log(f"  Stacking X={X.shape}")
+
+    from sklearn.model_selection import StratifiedKFold
+    skf  = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    oof  = np.zeros(len(y), dtype=np.int64)
+    params = dict(objective="multiclass", num_class=N_ACTIVE_CLASSES, n_estimators=500,
+                  learning_rate=0.05, num_leaves=63, min_child_samples=20,
+                  subsample=0.8, colsample_bytree=0.8, class_weight="balanced",
+                  random_state=42, n_jobs=-1, verbose=-1)
+    for tr_i, va_i in skf.split(X, y):
+        clf = lgb.LGBMClassifier(**params)
+        clf.fit(X[tr_i], y[tr_i],
+                eval_set=[(X[va_i], y[va_i])],
+                callbacks=[lgb.early_stopping(50, verbose=False),
+                           lgb.log_evaluation(period=-1)])
+        oof[va_i] = clf.predict(X[va_i])
+
+    f1 = f1_score(y, oof, average="macro", zero_division=0)
+    acc = accuracy_score(y, oof)
+    log(f"  Stacking OOF  Acc={acc:.4f}  F1={f1:.4f}")
+    return oof, f1
+
+
+def run_ensemble(kfold_proba, kfold_labels, out_dir, args, repo_dir):
+    """attr + hier + raw + surface 최대 4모델 앙상블."""
+    log(f"\n{'='*60}")
+    log("  다중 모델 앙상블 시작 (attr + hier + raw + surface)")
+    log(f"{'='*60}")
+
+    # ── 외부 proba 로드 ────────────────────────────────────────
+    attr_p,    attr_l    = _load_fold_probas(
+        str(repo_dir / args.attr_proba_dir), "attr", args.n_folds)
+    hier_p,    hier_l    = _load_fold_probas(
+        str(repo_dir / args.hier_proba_dir), "hier", args.n_folds)
+    raw_p,     raw_l     = _load_fold_probas(
+        str(repo_dir / "out_N50/raw_cnn_transformer/probas"), "raw", args.n_folds)
+    surface_p, surface_l = _load_fold_probas(
+        str(repo_dir / "out_N50/surface_expert/probas"), "surface", args.n_folds)
+
+    if attr_p is None and hier_p is None and raw_p is None and surface_p is None:
+        log("  [WARN] 외부 proba 없음 → 앙상블 스킵")
+        return None, 0.0, 0.0
+
+    # labels 기준: attr 우선 → hier → raw → surface
+    base_labels = next(l for l in [attr_l, hier_l, raw_l, surface_l]
+                       if l is not None)
+    N = len(base_labels)
+
+    # 가용 모델 목록
+    all_models = [
+        (attr_p,    "attribute"),
+        (hier_p,    "hierarchical"),
+        (raw_p,     "raw_cnn"),
+        (surface_p, "surface"),
+    ]
+    avail = [(p, name) for p, name in all_models if p is not None]
+
+    # 단독 성능 로그
+    for p, name in avail:
+        n = min(len(p), N)
+        f1  = f1_score(base_labels[:n], p[:n].argmax(1), average="macro", zero_division=0)
+        acc = accuracy_score(base_labels[:n], p[:n].argmax(1))
+        log(f"  단독 {name:<14} Acc={acc:.4f}  F1={f1:.4f}")
+
+    # ── Phase A: 가중 평균 탐색 ──────────────────────────────
+    log(f"\n  [Phase A] {len(avail)}모델 가중 평균 탐색...")
+    n = min(N, *[len(p) for p, _ in avail])
+    labels_n = base_labels[:n]
+
+    if len(avail) == 1:
+        combo_A = avail[0][0][:n]
+        best_ws = {avail[0][1]: 1.0}
+    else:
+        best_f1_w, best_ws, best_combo = -1.0, {}, None
+        # 가중치 그리드 탐색 (최대 4모델 대응)
+        vals = np.linspace(0, 1, 6)   # 0.0~1.0, 6단계
+        n_models = len(avail)
+
+        def _grid(depth, remaining, current):
+            nonlocal best_f1_w, best_ws, best_combo
+            if depth == n_models - 1:
+                ws = current + [remaining]
+                if sum(ws) < 1e-8: return
+                ws_norm = [w / sum(ws) for w in ws]
+                combo = sum(w * p[:n] for w, (p, _) in zip(ws_norm, avail))
+                f1 = f1_score(labels_n, combo.argmax(1),
+                              average="macro", zero_division=0)
+                if f1 > best_f1_w:
+                    best_f1_w = f1
+                    best_ws   = {name: w for w, (_, name) in zip(ws_norm, avail)}
+                    best_combo = combo
+                return
+            for v in vals:
+                if v > remaining + 1e-6: break
+                _grid(depth + 1, remaining - v, current + [v])
+
+        _grid(0, 1.0, [])
+        combo_A = best_combo
+        log(f"  최적 가중치: " + "  ".join(f"{k}={v:.2f}" for k, v in best_ws.items()))
+
+    mults_A, _ = threshold_search(combo_A, labels_n, n_classes=N_ACTIVE_CLASSES)
+    preds_A    = (combo_A * mults_A).argmax(1)
+    acc_A = accuracy_score(labels_n, preds_A)
+    f1_A  = f1_score(labels_n, preds_A, average="macro", zero_division=0)
+    log(f"  [Phase A] 가중평균+threshold  Acc={acc_A:.4f}  F1={f1_A:.4f}")
+
+    # ── Phase B: LightGBM Stacking ────────────────────────────
+    f1_B, stack_preds = -1.0, None
+    if not args.no_stack and len(avail) >= 2:
+        log(f"\n  [Phase B] LightGBM Stacking ({len(avail)*6}차원)...")
+        try:
+            import lightgbm as lgb
+            from sklearn.model_selection import StratifiedKFold
+            import warnings
+            warnings.filterwarnings("ignore", message="X does not have valid feature names")
+
+            X_meta = np.concatenate([p[:n] for p, _ in avail], axis=1).astype(np.float32)
+            y_meta = labels_n.astype(np.int64)
+
+            skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+            oof = np.zeros(n, dtype=np.int64)
+            params = dict(objective="multiclass", num_class=N_ACTIVE_CLASSES, n_estimators=500,
+                          learning_rate=0.05, num_leaves=63, min_child_samples=20,
+                          subsample=0.8, colsample_bytree=0.8, class_weight="balanced",
+                          random_state=42, n_jobs=-1, verbose=-1)
+
+            for tr_i, va_i in skf.split(X_meta, y_meta):
+                clf = lgb.LGBMClassifier(**params)
+                clf.fit(X_meta[tr_i], y_meta[tr_i],
+                        eval_set=[(X_meta[va_i], y_meta[va_i])],
+                        callbacks=[lgb.early_stopping(50, verbose=False),
+                                   lgb.log_evaluation(period=-1)])
+                oof[va_i] = clf.predict(X_meta[va_i])
+
+            f1_B  = f1_score(y_meta, oof, average="macro", zero_division=0)
+            acc_B = accuracy_score(y_meta, oof)
+            log(f"  [Phase B] Stacking OOF  Acc={acc_B:.4f}  F1={f1_B:.4f}")
+            stack_preds = oof
+        except Exception as e:
+            log(f"  [Phase B] Stacking 실패: {e}")
+
+    # ── 최종 채택 ─────────────────────────────────────────────
+    if f1_B > f1_A and stack_preds is not None:
+        final_preds = stack_preds
+        method = f"LightGBM Stacking (F1={f1_B:.4f})"
+    else:
+        final_preds = preds_A
+        method = f"가중평균+threshold (F1={f1_A:.4f})"
+
+    final_acc = accuracy_score(labels_n, final_preds)
+    final_f1  = f1_score(labels_n, final_preds, average="macro", zero_division=0)
+
+    log(f"\n  ★ 앙상블 채택: {method}")
+    log(f"  ★ 앙상블 Acc={final_acc:.4f}  F1={final_f1:.4f}")
+
+    rep = classification_report(labels_n, final_preds,
+                                target_names=ACTIVE_CLASS_NAMES,   # C5 제외 5클래스
+                                digits=4, zero_division=0)
+    log(f"\n{rep}")
+
+    from sklearn.metrics import confusion_matrix as cm_fn
+    cm = cm_fn(labels_n, final_preds, labels=list(range(N_ACTIVE_CLASSES)))
+    recalls = cm.diagonal() / cm.sum(1).clip(min=1)
+    for i, r in enumerate(recalls):
+        flag = "✅" if r >= 0.85 else ("⚠" if r >= 0.70 else "❌")
+        cname = ACTIVE_CLASS_NAMES[i] if i < len(ACTIVE_CLASS_NAMES) else f"C{i}"
+        log(f"  {flag} {cname}  recall={r*100:.1f}%")
+
+    # 저장
+    ens_dir = ensure_dir(out_dir / "ensemble")
+    np.save(ens_dir / "ensemble_proba.npy",  combo_A)
+    np.save(ens_dir / "ensemble_preds.npy",  final_preds)
+    np.save(ens_dir / "ensemble_labels.npy", labels_n)
+    (ens_dir / "ensemble_summary.json").write_text(json.dumps({
+        "method": method, "acc": round(final_acc, 4), "f1": round(final_f1, 4),
+        "weights": best_ws, "models_used": [n for _, n in avail],
+        "phase_A_f1": round(f1_A, 4), "phase_B_f1": round(f1_B, 4),
+    }, indent=2, ensure_ascii=False))
+    log(f"  결과 저장 → {ens_dir}")
+
+    return final_preds, final_acc, final_f1
+
+
+# ════════════════════════════════════════════════════════════════
 # 5. 모델 forward → softmax 확률 추출
 # ════════════════════════════════════════════════════════════════
 
@@ -232,17 +494,18 @@ def main():
 
     # ── 데이터 로드 ───────────────────────────────────────────
     h5     = H5Data(CFG.h5_path)
-    le     = LabelEncoder()
-    y_all  = le.fit_transform(h5.y_raw).astype(np.int64)
-    groups = h5.subj_id
-    X_all  = h5.X
 
-    # C6(평지) 레이블 인덱스
-    flat_label = int(np.where(le.classes_ == le.classes_[np.argmax(
-        [(c in ("C6", "flat", "평지", "6")) for c in le.classes_]
-    )])[0][0]) if any(
-        c in ("C6", "flat", "평지", "6") for c in le.classes_
-    ) else 5
+    # ── C5 제외: 5클래스 학습 ─────────────────────────────────
+    CFG.num_classes = N_ACTIVE_CLASSES   # 모델 출력 5클래스로 고정
+    y_raw_all  = h5.y_raw.astype(np.int64)
+    y_all, groups, kept_idx = filter_and_remap(y_raw_all, h5.subj_id)
+    X_all  = h5.X[kept_idx]
+    le     = LabelEncoder()
+    le.classes_ = np.array(ACTIVE_CLASS_NAMES)   # 5클래스 이름 설정
+    log(f"  C5 제외 후: N={len(y_all)}  classes={N_ACTIVE_CLASSES}")
+
+    # C6(평지) 레이블 인덱스 — C5 제외 후 새 인덱스=4
+    flat_label = 4   # ACTIVE_CLASS_NAMES[4] = "C6-평지"
 
     log(f"피험자 {len(np.unique(groups))}명  N={len(y_all)}  flat_label={flat_label}({le.classes_[flat_label]})")
 
@@ -250,20 +513,20 @@ def main():
     foot_idx = get_foot_accel_idx(h5.channels)
 
     # ── feat 추출 (캐시) ──────────────────────────────────────
-    cache_dir  = ensure_dir(CFG.repo_dir / "cache" / f"feat{N_FEATURES}_seed{CFG.seed}_final")
+    cache_dir  = ensure_dir(CFG.repo_dir / "cache" / f"feat{N_FEATURES}_seed{CFG.seed}_final_noc5")
     cache_path = cache_dir / "all_feat.npy"
     use_cache  = not args.no_feat_cache
 
     if use_cache and cache_path.exists():
         log(f"[feat] 캐시 히트 → {cache_path}")
         feat_all = np.load(cache_path)
-        log(f"[feat] shape={feat_all.shape}  (센서{_N_SENSOR}+컨텍스트{N_FEATURES-_N_SENSOR})")
     else:
         log("[feat] 추출 시작 (센서+bout컨텍스트 324차원)...")
         with Timer() as t:
             feat_all = batch_extract(
                 X_all, foot_idx, CFG.sample_rate,
                 h5_path=str(CFG.h5_path),
+                kept_idx=kept_idx,    # C5 제거 인덱스 → 컨텍스트 피처 정합성 보장
             )
         if use_cache:
             np.save(cache_path, feat_all)
@@ -280,7 +543,7 @@ def main():
     sgkf = StratifiedGroupKFold(n_splits=CFG.kfold, shuffle=True, random_state=CFG.seed)
 
     # fold별 결과 저장
-    fold_results: dict[str, dict] = {n: {"preds": [], "probas": [], "labels": []} for n in model_fns}
+    fold_results: dict[str, dict] = {n: {"preds": [], "probas": [], "labels": [], "fold_probas": []} for n in model_fns}
 
     with Timer() as total_t:
         for fi, (tr_idx, te_idx) in enumerate(
@@ -327,6 +590,7 @@ def main():
 
                 fold_results[mname]["preds"].extend(preds.tolist())
                 fold_results[mname]["probas"].append(probas)
+                fold_results[mname]["fold_probas"].append(probas)   # fold별 보존
                 fold_results[mname]["labels"].extend(labels.tolist())
 
                 # fold 단위 로그
@@ -339,7 +603,7 @@ def main():
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     # ══════════════════════════════════════════════════════════
-    # 7. 최종 평가
+    # 7. 최종 평가 + 3모델 앙상블
     # ══════════════════════════════════════════════════════════
     log(f"\n{'='*60}")
     log("  최종 평가")
@@ -348,66 +612,61 @@ def main():
     for mname, data in fold_results.items():
         pred_arr  = np.array(data["preds"])
         label_arr = np.array(data["labels"])
-        proba_arr = np.concatenate(data["probas"])  # (N, C)
+        proba_arr = np.concatenate(data["probas"])  # (N, 6)
 
         # ── 기본 성능 ─────────────────────────────────────────
         acc = accuracy_score(label_arr, pred_arr)
         f1  = f1_score(label_arr, pred_arr, average="macro", zero_division=0)
         log(f"\n[{mname}] 기본  Acc={acc:.4f}  F1={f1:.4f}")
 
-        # ── Threshold Grid Search ─────────────────────────────
-        log(f"[{mname}] Per-class threshold search...")
-        best_mults, best_f1_thresh = threshold_search(proba_arr, label_arr)
+        # ── Threshold Search ──────────────────────────────────
+        log(f"[{mname}] Per-class threshold search (5클래스)...")
+        best_mults, best_f1_thresh = threshold_search(proba_arr, label_arr,
+                                                       n_classes=N_ACTIVE_CLASSES)
         thresh_preds = (proba_arr * best_mults).argmax(1)
         thresh_acc   = accuracy_score(label_arr, thresh_preds)
-        log(f"[{mname}] Threshold 적용  Acc={thresh_acc:.4f}  F1={best_f1_thresh:.4f}")
-        log(f"[{mname}] Best multipliers: {dict(enumerate(best_mults.round(2)))}")
+        log(f"[{mname}] Threshold  Acc={thresh_acc:.4f}  F1={best_f1_thresh:.4f}")
 
-        # ── Hierarchical 앙상블 (logits 파일 있으면) ──────────
-        final_preds = thresh_preds
-        final_acc   = thresh_acc
-        final_f1    = best_f1_thresh
+        # proba 저장 (fold별 + 전체)
+        np.save(out_dir / f"{mname}_proba.npy",  proba_arr)
+        np.save(out_dir / f"{mname}_labels.npy", label_arr)
+        np.save(out_dir / f"{mname}_mults.npy",  best_mults)
+        # fold별 저장 (앙상블용)
+        kfold_proba_dir = ensure_dir(out_dir / "probas")
+        offset = 0
+        for fi, plist in enumerate(data["fold_probas"], 1):
+            n = len(plist)
+            np.save(kfold_proba_dir / f"M7_Attr_proba_fold{fi}.npy",  plist)
+            np.save(kfold_proba_dir / f"M7_Attr_labels_fold{fi}.npy", label_arr[offset:offset+n])
+            offset += n
+        log(f"[{mname}] proba 저장 → {out_dir}/{mname}_proba.npy")
 
-        if args.hier_logits and Path(args.hier_logits).exists():
-            hier_proba = np.load(args.hier_logits)
-            if hier_proba.shape == proba_arr.shape:
-                log(f"[{mname}] Hierarchical 앙상블 weight search...")
-                best_w, ens_f1 = find_best_ensemble_weight(
-                    hier_proba, proba_arr * best_mults / (proba_arr * best_mults).sum(1, keepdims=True),
-                    label_arr,
-                )
-                ens_preds, ens_acc, ens_f1 = soft_ensemble(
-                    hier_proba,
-                    proba_arr * best_mults / (proba_arr * best_mults).sum(1, keepdims=True),
-                    label_arr, best_w,
-                )
-                log(f"[{mname}] Ensemble  Acc={ens_acc:.4f}  F1={ens_f1:.4f}  (hier_w={best_w:.2f})")
-                if ens_f1 > final_f1:
-                    final_preds, final_acc, final_f1 = ens_preds, ens_acc, ens_f1
-
-        # ── Classification Report ─────────────────────────────
-        log(f"\n[{mname}] 최종 결과  Acc={final_acc:.4f}  F1={final_f1:.4f}")
+        # ── 단독 리포트 ───────────────────────────────────────
         report = classification_report(
-            label_arr, final_preds,
-            target_names=le.classes_,
-            digits=4,
+            label_arr, thresh_preds,
+            target_names=ACTIVE_CLASS_NAMES,   # C5 제외 5클래스
+            digits=4, zero_division=0,
         )
         log(f"\n{report}")
+        save_report(thresh_preds, label_arr, le, mname, out_dir)
+        save_cm(thresh_preds, label_arr, le, mname, out_dir)
 
-        # ── 저장 ─────────────────────────────────────────────
-        save_report(final_preds, label_arr, le, mname, out_dir)
-        save_cm(final_preds, label_arr, le, mname, out_dir)
+        results.append({"model": mname, "acc": round(thresh_acc, 4),
+                        "f1": round(best_f1_thresh, 4)})
 
-        # softmax 확률 저장 (다른 모델과 앙상블용)
-        np.save(out_dir / f"{mname}_proba.npy", proba_arr)
-        np.save(out_dir / f"{mname}_mults.npy", best_mults)
-        log(f"[{mname}] probas 저장 → {out_dir}/{mname}_proba.npy")
-
-        results.append({"model": mname, "acc": round(final_acc, 4), "f1": round(final_f1, 4)})
+    # ── 3모델 앙상블 ──────────────────────────────────────────
+    if not args.ensemble_only:
+        # 전체 proba (마지막 모델 기준)
+        last_proba  = np.concatenate(fold_results[list(fold_results.keys())[-1]]["probas"])
+        last_labels = np.array(fold_results[list(fold_results.keys())[-1]]["labels"])
+        ens_preds, ens_acc, ens_f1 = run_ensemble(
+            last_proba, last_labels, out_dir, args, CFG.repo_dir)
+        results.append({"model": "Ensemble_3model", "acc": round(ens_acc, 4),
+                        "f1": round(ens_f1, 4)})
 
     save_summary_table(results, out_dir.parent / "tables")
     save_json({
-        "experiment": "final",
+        "experiment": "final_with_ensemble",
         "models":     model_names,
         "n_features": N_FEATURES,
         "total_time": str(total_t),
@@ -416,7 +675,7 @@ def main():
 
     log(f"\n★ 완료  총 소요: {total_t}")
     for r in results:
-        log(f"  RESULT {r['model']:<20} Acc={r['acc']:.4f}  F1={r['f1']:.4f}")
+        log(f"  RESULT {r['model']:<25} Acc={r['acc']:.4f}  F1={r['f1']:.4f}")
 
     h5.close()
 

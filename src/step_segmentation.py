@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-step_segmentation.py — heel-strike step segmentation  (v10.0-trialwise)
+step_segmentation.py — heel-strike step segmentation  (v10.1-trialwise)
 ════════════════════════════════════════════════════════════════════════════
 핵심 구조:
   [1] 파일 전체 → walking bout(trial) 분할
       - stop / turn 구간 자동 제거
-      - C1(4 bout), C6(2 bout) 구조 인식
-      - bout 수 미달 시 파라미터 자동 재시도
+      - S1~S57: C1(4 bout), C6(2 bout) 구조 인식 — 한 파일에 다수 bout 통합
+      - S58+  : 파일 = 1 trial (SxCxTx.csv) — bout detection은 stop/turn 제거용
+      - bout 수 미달 시 파라미터 자동 재시도 (S57 이하만)
 
   [2] 각 bout 안에서만 HS 검출
       - LT/RT dual-signal consensus
@@ -16,6 +17,10 @@ step_segmentation.py — heel-strike step segmentation  (v10.0-trialwise)
   [3] HDF5 메타 저장
       source_file / trial_id / bout_start / bout_end /
       step_start / step_end / side / support
+
+  파일명 패턴:
+      S1~S57  : DATE_S{n}C{n}.csv        (bout 분할)
+      S58+    : DATE_S{n}C{n}T{n}.csv    (trial 분할)
 
 사용:
     python3 step_segmentation.py
@@ -47,9 +52,26 @@ from scipy.signal import find_peaks, resample, butter, filtfilt
 # 상수
 # ──────────────────────────────────────────────────────────────
 
-SEGMENTATION_VERSION   = "v10.0-trialwise-bout-step"
+SEGMENTATION_VERSION   = "v10.1-trialwise-bout-step"
 CSV_SKIPROWS = getattr(config, "CSV_SKIPROWS", 2)  # Noraxon export: 헤더 2줄 skip
 _SUPPORTED_H5_FORMATS  = {"subject_group_v10", "subject_group_v9", "subject_group_v8"}
+
+# 데이터 채널에서 항상 제외할 컬럼 (time + 메타/마커 계열)
+# 최종 채널 수 = 54 (센서만)
+_ALWAYS_DROP_COLS: frozenset[str] = frozenset({
+    "time", "Activity", "Marker",
+})
+
+def _resolve_drop_cols(cols: list[str]) -> set[str]:
+    """step_segmentation 자체 drop 규칙.
+    config.resolve_drop_cols 결과에 _ALWAYS_DROP_COLS를 합산해 반환.
+    config가 이미 포함하더라도 중복 적용 무해."""
+    try:
+        cfg_drop = set(config.resolve_drop_cols(cols))
+    except Exception:
+        cfg_drop = set()
+    return cfg_drop | (_ALWAYS_DROP_COLS & set(cols))
+
 
 BOUT_SMOOTH_SEC    = 0.25
 BOUT_MIN_WALK_SEC  = 2.0
@@ -60,8 +82,13 @@ TURN_Z_THR         = 2.0
 TURN_MIN_SEC       = 0.25
 MIN_STEPS_PER_BOUT = 2
 
-# C1: 4회 왕복, C6: 중간 방향 전환 1회 → 2 bout
+# C1: 4회 왕복, C6: 중간 방향 전환 1회 → 2 bout  (S1~S57 통합파일에만 적용)
 COND_EXPECTED_BOUTS: dict[int, int] = {1: 4, 6: 2}
+
+# S58부터 파일 구조 변경: 파일 자체가 1 trial (T번호로 구분된 개별 파일)
+# S1~S57: SxCx.csv  — 한 파일에 여러 bout 통합
+# S58+  : SxCxTx.csv — 파일 = 1 trial, T번호가 trial 구분자
+TRIAL_SPLIT_FROM_SID: int = 58
 
 _FLIP_RATIO = 0.60
 
@@ -100,18 +127,17 @@ def robust_zscore(x: np.ndarray) -> np.ndarray:
 
 
 def find_true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
-    runs: list[tuple[int, int]] = []
-    in_run = False
-    start = 0
-    for i, v in enumerate(mask):
-        if v and not in_run:
-            in_run, start = True, i
-        elif not v and in_run:
-            runs.append((start, i))
-            in_run = False
-    if in_run:
-        runs.append((start, len(mask)))
-    return runs
+    """True 구간을 (start, end) 리스트로 반환. numpy diff 기반으로 벡터화."""
+    mask = np.asarray(mask, dtype=bool)
+    if not mask.any():
+        return []
+    padded = np.empty(len(mask) + 2, dtype=bool)
+    padded[0] = padded[-1] = False
+    padded[1:-1] = mask
+    diff = np.diff(padded.view(np.uint8))
+    starts = np.where(diff ==  1)[0]
+    ends   = np.where(diff == -1)[0]
+    return list(zip(starts.tolist(), ends.tolist()))
 
 
 def merge_close_runs(runs: list[tuple[int, int]], max_gap: int) -> list[tuple[int, int]]:
@@ -195,19 +221,19 @@ def rename_columns(df: pd.DataFrame) -> pd.DataFrame:
 # ──────────────────────────────────────────────────────────────
 
 
-def interpolate_sensor_gaps(df, max_gap=100):
+def interpolate_sensor_gaps(df: pd.DataFrame, max_gap: int = 100) -> pd.DataFrame:
     """센서 NaN 구간을 linear interpolation으로 복구 (max_gap 샘플 이하만)."""
-    import pandas as pd
-    for col in df.select_dtypes(include=["float64","float32","int64","int32"]).columns:
-        if df[col].isna().any():
-            s = df[col]
-            nan_mask = s.isna()
-            groups = nan_mask != nan_mask.shift()
-            group_id = groups.cumsum()
-            group_sizes = nan_mask.groupby(group_id).transform("sum")
-            interp_mask = nan_mask & (group_sizes <= max_gap)
-            if interp_mask.any():
-                df[col] = df[col].where(~interp_mask, s.interpolate(method="linear", limit_direction="both"))
+    num_cols = df.select_dtypes(include=["float64", "float32", "int64", "int32"]).columns
+    for col in num_cols:
+        s = df[col]
+        nan_mask = s.isna()
+        if not nan_mask.any():
+            continue
+        group_id    = (nan_mask != nan_mask.shift()).cumsum()
+        group_sizes = nan_mask.groupby(group_id).transform("size")
+        interp_mask = nan_mask & (group_sizes <= max_gap)
+        if interp_mask.any():
+            df[col] = s.where(~interp_mask, s.interpolate(method="linear", limit_direction="both"))
     return df
 
 def parse_filename(fname: str) -> tuple[Optional[int], Optional[int], Optional[int]]:
@@ -315,7 +341,7 @@ def find_common_channels(records: list[dict]) -> list[str]:
             cols_df = read_csv_with_retry(rec["path"], nrows=0)
             cols_df = rename_columns(cols_df)
             cols = cols_df.columns.tolist()
-            drop = set(config.resolve_drop_cols(cols))
+            drop = _resolve_drop_cols(cols)
             data_cols = set(c for c in cols if c not in drop)
             if common is None:
                 common = data_cols
@@ -341,7 +367,7 @@ def _verify_channels(records: list[dict], required_channels: list[str]) -> None:
         try:
             cols_df = read_csv_with_retry(rec["path"], nrows=0)
             cols_df = rename_columns(cols_df)
-            cols = set(c for c in cols_df.columns if c not in set(config.resolve_drop_cols(cols_df.columns.tolist())))
+            cols = set(c for c in cols_df.columns if c not in _resolve_drop_cols(cols_df.columns.tolist()))
             missing = req_set - cols
             if missing:
                 warn_count += 1
@@ -648,12 +674,12 @@ def _detect_hs_acc(ap_accel: np.ndarray, fs: int) -> np.ndarray:
     if len(peaks) == 0 or sigma == 0:
         return np.array([], dtype=int)
     win = int(0.10 * fs)
-    trusted = []
-    for p in peaks:
-        w = sig[max(0, p - win): min(n, p + win)]
-        if len(w) > 0 and float(np.nanmax(w)) - float(sig[p]) > 0.3 * sigma:
-            trusted.append(p)
-    return np.array(trusted, dtype=int)
+    # 벡터화: 각 peak 주변 창의 max를 한 번에 계산
+    p_lo = np.maximum(0, peaks - win)
+    p_hi = np.minimum(n, peaks + win)
+    surr_max = np.array([float(np.nanmax(sig[lo:hi])) for lo, hi in zip(p_lo, p_hi)])
+    mask_t = (surr_max - sig[peaks]) > 0.3 * sigma
+    return peaks[mask_t]
 
 
 def _detect_hs_gyro(
@@ -736,9 +762,9 @@ def _boutwise_stride_filter(
 ) -> list[tuple[int, str]]:
     if len(candidates) < 2:
         return candidates
-    times = np.array([t for t, _ in candidates], dtype=float)
+    all_times     = np.array([t for t, _ in candidates], dtype=float)
     trusted_times = np.array([t for t, s in candidates if s == "both"], dtype=float)
-    ref = trusted_times if len(trusted_times) >= 4 else times
+    ref = trusted_times if len(trusted_times) >= 4 else all_times
     intervals = np.diff(ref)
     if len(intervals) >= 4:
         med = float(np.median(intervals))
@@ -937,20 +963,19 @@ def bilateral_sanity_check(steps: list[ScoredStep], fs: int = config.SAMPLE_RATE
 # ──────────────────────────────────────────────────────────────
 
 def resample_step(data_segment: np.ndarray, target_length: int = config.TS) -> np.ndarray:
+    """스텝 세그먼트를 target_length로 리샘플. NaN 보간 후 전 채널 일괄 처리."""
     L, C = data_segment.shape
     if L == target_length:
         return data_segment.astype(np.float32)
-    result = np.zeros((target_length, C), dtype=np.float32)
+    seg = data_segment.astype(np.float64)
+    # NaN이 있는 채널만 보간 (채널별로 확인 후 벡터 보간)
+    x = np.arange(L)
     for c in range(C):
-        col = data_segment[:, c].copy()
-        nans = np.isnan(col)
-        if nans.all():
-            continue
-        if nans.any():
-            x = np.arange(L)
-            col[nans] = np.interp(x[nans], x[~nans], col[~nans])
-        result[:, c] = resample(col, target_length)
-    return result
+        nans = np.isnan(seg[:, c])
+        if nans.any() and not nans.all():
+            seg[nans, c] = np.interp(x[nans], x[~nans], seg[~nans, c])
+    # 전 채널 일괄 리샘플 (axis=0 → 시간축)
+    return resample(seg, target_length, axis=0).astype(np.float32)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1063,7 +1088,7 @@ def main() -> None:
         subj_set.add(r["sid"])
     log(f"  CSV: {len(all_records)} files  subjects: {len(subj_set)}")
     for c, n in sorted(cond_count.items()):
-        exp_str = f"  (expected {COND_EXPECTED_BOUTS[c]} bouts/file)" if c in COND_EXPECTED_BOUTS else ""
+        exp_str = f"  (expected {COND_EXPECTED_BOUTS[c]} bouts/file, S1~S{TRIAL_SPLIT_FROM_SID-1})" if c in COND_EXPECTED_BOUTS else ""
         log(f"    C{c}: {n} files{exp_str}")
 
     t0 = time.time()
@@ -1092,9 +1117,10 @@ def main() -> None:
     _skip_keys = {k for k, v in zero_retries.items() if v >= _ZERO_STEP_MAX_RETRIES}
     if _skip_keys and not force:
         log(f"  ⚠ zero_retries 한계 초과 skip: {len(_skip_keys)}개 파일 (--force로 재시도 가능)")
+    _done_or_skip = done_files | _skip_keys
     target_records = all_records if force else [
         r for r in all_records
-        if make_file_key(r) not in done_files and make_file_key(r) not in _skip_keys
+        if make_file_key(r) not in _done_or_skip
     ]
     if not target_records:
         log(f"  ✅ all files done, steps={existing_n}")
@@ -1106,8 +1132,8 @@ def main() -> None:
         # 재사용 채널도 실제 파일과 대조 검증
         _verify_channels(target_records, channels)
     else:
-        all_common = find_common_channels(all_records)
         from channel_groups import filter_raw_channels
+        all_common = find_common_channels(all_records)
         channels = filter_raw_channels(all_common)
         log(f"  [Pass 0] {len(all_common)} → {len(channels)} raw IMU channels")
         if not channels:
@@ -1153,14 +1179,38 @@ def main() -> None:
 
             data_np = df[channels].values.astype(np.float32)
 
-            # ── bout 분할 (C1/C6 구조 인식) ──
-            bouts = detect_walking_bouts(df, fs=config.SAMPLE_RATE, cond=cond)
-            expected_n = COND_EXPECTED_BOUTS.get(cond)
-            if expected_n is not None and len(bouts) != expected_n:
-                _log_bout_mismatch(step_logger, rec, len(bouts), expected_n)
+            # ── bout 분할 ──────────────────────────────────────────────────
+            # S58+: 파일 자체가 1 trial (SxCxTx.csv)
+            #       → bout detection은 stop/turn 제거 전처리용으로만 사용
+            #       → COND_EXPECTED_BOUTS 적용 안 함
+            #       → trial_id = 파일명 T번호 (rec["trial"])
+            # S1~S57: 한 파일에 여러 bout 통합 (C1=4, C6=2)
+            #       → 기존 방식 유지
+            is_per_trial = (sid >= TRIAL_SPLIT_FROM_SID)
+
+            if is_per_trial:
+                # 파일 전체를 1 walking region으로 취급
+                # bout detection으로 맨 앞뒤 stop 구간만 제거하고 전체를 1 bout으로 병합
+                bouts_raw = detect_walking_bouts(df, fs=config.SAMPLE_RATE, cond=None)
+                if bouts_raw:
+                    bouts = [(bouts_raw[0][0], bouts_raw[-1][1])]
+                else:
+                    bouts = [(0, len(df))]
+                expected_n = None
+                log(f"    [per-trial] S{sid} T{rec['trial']}: 1 bout "
+                    f"({bouts[0][0]}~{bouts[0][1]}, "
+                    f"{(bouts[0][1]-bouts[0][0])/config.SAMPLE_RATE:.1f}s)")
+            else:
+                # 기존: C1/C6 멀티-bout 구조 인식
+                bouts = detect_walking_bouts(df, fs=config.SAMPLE_RATE, cond=cond)
+                expected_n = COND_EXPECTED_BOUTS.get(cond)
+                if expected_n is not None and len(bouts) != expected_n:
+                    _log_bout_mismatch(step_logger, rec, len(bouts), expected_n)
             file_steps = 0
 
-            for local_trial_id, (bout_start, bout_end) in enumerate(bouts, 1):
+            for bout_idx, (bout_start, bout_end) in enumerate(bouts, 1):
+                # S58+: trial_id = 파일명 T번호 / S1~S57: trial_id = bout 인덱스
+                local_trial_id = rec["trial"] if is_per_trial else bout_idx
                 if (bout_end - bout_start) < int(config.SAMPLE_RATE * BOUT_MIN_WALK_SEC):
                     continue
 
@@ -1340,7 +1390,6 @@ def main() -> None:
             # gc는 20파일마다 1번 (매 파일 강제 GC 불필요)
             if (i + 1) % 20 == 0 or (i + 1) == len(target_records):
                 gc.collect()
-            if (i + 1) % 20 == 0 or (i + 1) == len(target_records):
                 log(f"    {i+1}/{len(target_records)}  file_steps={file_steps}  total={new_steps}")
 
     log(f"\n  [Pass 2] done: {new_steps} steps")
@@ -1388,6 +1437,7 @@ def main() -> None:
             "trial_definition":"walking_bout_in_file_excluding_stop_turn",
             "trial_key_definition": "source_file__trial{trial_id}",
             "expected_bouts":  json.dumps(COND_EXPECTED_BOUTS, ensure_ascii=False),
+            "trial_split_from_sid": TRIAL_SPLIT_FROM_SID,
             "label_mapping":   json.dumps({f"C{i+1}": i for i in range(config.NUM_CLASSES)},
                                            ensure_ascii=False),
         })

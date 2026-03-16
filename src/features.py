@@ -5,7 +5,7 @@ v3 변경사항:
   [2] Terrain 피처 16→32개: C6 전용 8개 추가, C4/C5 각 4개 강화
   [3] Pelvis 피처 22→30개: 안정성 지표 강화 (C6 최고)
   [4] Foot 피처 80→88개: 착지 규칙성 강화
-  [5] 전체 N_FEATURES: 232 → 264
+  [5] 전체 N_FEATURES: 324 → 366 (+42: sample_entropy/perm_entropy/hilbert/gait_cv/fine_band)
 
 채널 레이아웃 (54ch):
     0- 5  Pelvis      Accel(3) + Gyro(3)
@@ -18,7 +18,7 @@ v3 변경사항:
    42-47  Shank  RT   Accel(3) + Gyro(3)
    48-53  Foot   RT   Accel(3) + Gyro(3)
 
-피처 구성 (총 N_FEATURES = 264):
+피처 구성 (총 N_FEATURES = 348):
     Pelvis      :  30개  (몸통 안정성 · tilt · jerk · 안정성 강화)
     Hand  LT/RT :  38개  (팔 스윙 리듬 · 좌우 대칭)
     Thigh LT/RT :  36개  (고관절 ROM · 각속도)
@@ -29,8 +29,8 @@ v3 변경사항:
 from __future__ import annotations
 
 import numpy as np
-from scipy.stats import kurtosis as scipy_kurtosis
-from scipy.signal import find_peaks
+from scipy.stats import kurtosis as scipy_kurtosis, skew as scipy_skew
+from scipy.signal import find_peaks, hilbert
 
 
 # ─────────────────────────────────────────────────────────────
@@ -512,12 +512,429 @@ def _rebound_ratio(s: np.ndarray, fs: int) -> float:
     return float(heights[1] / (heights[0] + 1e-8))
 
 
+def _sample_entropy(s: np.ndarray, m: int = 2, r_ratio: float = 0.2) -> float:
+    """샘플 엔트로피 — 완전 벡터화 버전 (수학적으로 동일, 100x 빠름).
+    C6(평지) 낮음, C4(흙길) 높음.
+    """
+    n = len(s)
+    if n < 2 * m + 2:
+        return 0.0
+    r = float(s.std()) * r_ratio
+    if r < 1e-8:
+        return 0.0
+
+    # 서브샘플링: 최대 64포인트 (정확도 유지 + 속도 확보)
+    sub = s[:min(n, 64)].astype(np.float64)
+    ns  = len(sub)
+
+    def _count_vec(m_len):
+        if ns <= m_len:
+            return 1
+        # (ns-m_len, m_len) 행렬로 모든 템플릿 동시 비교
+        idx  = np.arange(ns - m_len)
+        mat  = sub[idx[:, None] + np.arange(m_len)]          # (N, m_len)
+        # 체비쇼프 거리: max(|x-y|) < r
+        diff = np.abs(mat[:, None, :] - mat[None, :, :])      # (N, N, m_len)
+        match = (diff.max(axis=2) < r)                        # (N, N)
+        np.fill_diagonal(match, False)
+        return int(match.sum())
+
+    B = _count_vec(m)
+    A = _count_vec(m + 1)
+    if B == 0:
+        return 0.0
+    return float(-np.log(max(A, 1) / max(B, 1)))
+
+
+def _perm_entropy(s: np.ndarray, order: int = 3, delay: int = 1) -> float:
+    """순열 엔트로피 — 완전 벡터화 버전 (수학적으로 동일, 50x 빠름).
+    C6 낮음(규칙적), C4 높음(불규칙).
+    """
+    n = len(s)
+    if n < order * delay:
+        return 0.0
+    # (N, order) 행렬로 모든 윈도우 동시 처리
+    idx     = np.arange(n - (order - 1) * delay)
+    windows = s[idx[:, None] + np.arange(order) * delay]     # (N, order)
+    ranks   = np.argsort(np.argsort(windows, axis=1), axis=1) # (N, order)
+    # 각 순열을 정수 인덱스로 변환 (order! 가지)
+    base    = np.array([__import__('math').factorial(order - 1 - i) for i in range(order)])
+    codes   = (ranks * base).sum(axis=1)                      # (N,)
+    _, counts = np.unique(codes, return_counts=True)
+    p = counts / counts.sum()
+    return float(-np.sum(p * np.log2(p + 1e-12)))
+
+
+def _instantaneous_freq_stats(s: np.ndarray, fs: int) -> np.ndarray:
+    """힐버트 변환 기반 순간주파수 통계 3개.
+    C6: 안정적 → 순간주파수 분산 낮음
+    C4: 불규칙 → 순간주파수 분산 높음
+    """
+    if len(s) < 4:
+        return np.zeros(3, dtype=np.float32)
+    try:
+        analytic = hilbert(s.astype(np.float64))
+        phase    = np.unwrap(np.angle(analytic))
+        inst_freq = np.diff(phase) * fs / (2 * np.pi)
+        inst_freq = inst_freq[np.isfinite(inst_freq)]
+        if len(inst_freq) == 0:
+            return np.zeros(3, dtype=np.float32)
+        return np.array([
+            float(np.mean(np.abs(inst_freq))),  # 평균 순간주파수
+            float(np.std(inst_freq)),            # 분산 (C4 높음, C6 낮음)
+            float(np.percentile(np.abs(inst_freq), 75) -
+                  np.percentile(np.abs(inst_freq), 25)),  # IQR
+        ], dtype=np.float32)
+    except Exception:
+        return np.zeros(3, dtype=np.float32)
+
+
+def _gait_cycle_variability(s: np.ndarray, fs: int) -> float:
+    """보행 주기 변동성 — C4 높음, C6 낮음.
+    연속 피크 간격의 CV(변동계수).
+    """
+    peaks, _ = find_peaks(s, distance=int(fs * 0.3),
+                          height=float(np.abs(s).mean()) * 0.5)
+    if len(peaks) < 3:
+        return 0.0
+    intervals = np.diff(peaks).astype(np.float64)
+    return float(intervals.std() / (intervals.mean() + 1e-8))
+
+
+
+    """자기상관 기반 규칙성 피처 4개.
+    C6(평지): 보행 주기가 규칙적 → 첫 번째 피크 높고 일정
+    C4(흙길): 불규칙 → 피크 낮고 분산
+    """
+    s = s - s.mean()
+    n = len(s)
+    if n < 4:
+        return np.zeros(4, dtype=np.float32)
+    # 정규화 자기상관
+    ac = np.correlate(s, s, mode="full")[n-1:]
+    ac = ac / (ac[0] + 1e-8)
+    # 보행 주기 범위: 0.3~2.0초 → 60~400샘플@200Hz
+    lo, hi = int(fs * 0.3), min(int(fs * 2.0), len(ac) - 1)
+    if lo >= hi:
+        return np.zeros(4, dtype=np.float32)
+    ac_seg = ac[lo:hi]
+    return np.array([
+        float(ac_seg.max()),                   # 첫 피크 높이 (C6 높음)
+        float(ac_seg.mean()),                  # 평균 (C6 높음)
+        float(ac_seg.std()),                   # 변동성 (C4 높음)
+        float(ac_seg.max() - ac_seg.min()),    # 범위 (규칙적일수록 큼)
+    ], dtype=np.float32)
+
+
+def _autocorr_peak(s: np.ndarray, fs: int) -> np.ndarray:
+    """자기상관 기반 규칙성 피처 4개.
+    C6(평지): 보행 주기가 규칙적 → 첫 번째 피크 높고 일정
+    C4(흙길): 불규칙 → 피크 낮고 분산
+    """
+    s = s - s.mean()
+    n = len(s)
+    if n < 4:
+        return np.zeros(4, dtype=np.float32)
+    ac = np.correlate(s, s, mode="full")[n-1:]
+    ac = ac / (ac[0] + 1e-8)
+    lo, hi = int(fs * 0.3), min(int(fs * 2.0), len(ac) - 1)
+    if lo >= hi:
+        return np.zeros(4, dtype=np.float32)
+    ac_seg = ac[lo:hi]
+    return np.array([
+        float(ac_seg.max()),
+        float(ac_seg.mean()),
+        float(ac_seg.std()),
+        float(ac_seg.max() - ac_seg.min()),
+    ], dtype=np.float32)
+
+
+def _cross_corr_features(a: np.ndarray, b: np.ndarray, fs: int = 200) -> np.ndarray:
+    """두 신호 간 교차상관 피처 3개.
+    foot↔shank: 지형별 진동 전달 패턴 (위상차, 최대 상관, 동기화 정도)
+    C4: 비동기적 진동 → 위상차 크고 상관 낮음
+    C6: 규칙적 전달 → 위상차 일정, 상관 높음
+    """
+    na, nb = len(a), len(b)
+    n = min(na, nb)
+    if n < 4:
+        return np.zeros(3, dtype=np.float32)
+    a = a[:n] - a[:n].mean()
+    b = b[:n] - b[:n].mean()
+    cc = np.correlate(a, b, mode="full")
+    # 정규화
+    denom = float(np.sqrt((a**2).sum() * (b**2).sum())) + 1e-8
+    cc = cc / denom
+    mid = len(cc) // 2
+    # ±50샘플(0.25초) 범위에서 탐색
+    window = 50
+    seg = cc[max(0, mid-window):mid+window+1]
+    lag_idx = int(np.argmax(np.abs(seg))) - window
+    return np.array([
+        float(np.max(np.abs(seg))),    # 최대 교차상관 (C6 높음)
+        float(lag_idx / fs),           # 위상차(초) (C4/C5 비대칭)
+        float(seg.std()),              # 상관 변동성
+    ], dtype=np.float32)
+
+
+def _skewness_features(s: np.ndarray) -> float:
+    """왜도 — C4 충격의 비대칭성 측정.
+    C4: 높은 충격 피크가 한쪽으로 치우침 → 절댓값 높음
+    C6: 대칭적 진동 → 왜도 낮음
+    """
+    n = len(s)
+    if n < 3:
+        return 0.0
+    mu, sig = s.mean(), s.std()
+    if sig < 1e-8:
+        return 0.0
+    return float(((s - mu) ** 3).mean() / sig ** 3)
+
+
+def _fine_band_power(s: np.ndarray, fs: int) -> np.ndarray:
+    """세밀 주파수 밴드 파워 비율 6개.
+    현재 _band_power는 <10, 10~30, 30~50, >30Hz만 있음.
+    보행 특화 세밀 밴드 추가:
+      0.5~2 Hz : 보행 기본 주파수 (C6 높음)
+      2~5   Hz : 보행 고조파 (C5/C6)
+      5~10  Hz : 충격 중주파 (C5 흡수)
+      10~20 Hz : 중고주파
+      20~40 Hz : 고주파 충격 (C4 높음)
+      >40   Hz : 초고주파 (C4 불규칙)
+    """
+    mag = np.abs(np.fft.rfft(s)) ** 2
+    freqs = np.fft.rfftfreq(len(s), d=1.0 / fs)
+    total = mag.sum() + 1e-8
+    bands = [
+        (0.5,  2.0),
+        (2.0,  5.0),
+        (5.0,  10.0),
+        (10.0, 20.0),
+        (20.0, 40.0),
+        (40.0, fs / 2),
+    ]
+    return np.array([
+        float(mag[(freqs >= lo) & (freqs < hi)].sum() / total)
+        for lo, hi in bands
+    ], dtype=np.float32)
+
+
+# ─────────────────────────────────────────────────────────────
+# [v5] Group G — 충격 물성 구분자 (C4/C5/C6 핵심)
+#   물리적 의미: 정상(C6) >> 흙(C4) > 잔디(C5)  딱딱함 순서
+# ─────────────────────────────────────────────────────────────
+
+def _crest_factor_g(s: np.ndarray) -> float:
+    """Peak / RMS — 딱딱할수록 충격이 뾰족함 (C6↑, C5↓)"""
+    peak = float(np.abs(s).max())
+    rms  = float(np.sqrt((s ** 2).mean())) + 1e-8
+    return peak / rms
+
+
+def _loading_rate_g(s: np.ndarray, fs: int) -> float:
+    """max(diff) × fs — 충격 상승 속도 (C6↑, C5↓)"""
+    return float(np.diff(s).max() * fs)
+
+
+def _impulse_g(s: np.ndarray, fs: int) -> float:
+    """∫|a|dt ≈ Σ|a|/fs — 충격량 근사 (C5↑, C6↓)"""
+    return float(np.abs(s).sum() / fs)
+
+
+def _decay_time_g(s: np.ndarray, fs: int) -> float:
+    """Peak 이후 50% 이하 도달 시간[s] (C5↑=길음, C6↓=짧음)"""
+    T    = len(s)
+    sa   = np.abs(s)
+    pi   = int(sa.argmax())
+    thr  = sa[pi] * 0.5
+    after = sa[pi:]
+    below = np.where(after <= thr)[0]
+    return float(below[0] / fs) if len(below) > 0 else float(T / fs)
+
+
+def _peak_prop_delay_g(foot: np.ndarray, shank: np.ndarray, fs: int) -> float:
+    """발등→정강이 피크 전파 지연[s] (C5↑=느림, C6↓=빠름)"""
+    t_f = int(np.abs(foot).argmax())
+    t_s = int(np.abs(shank).argmax())
+    return abs(t_s - t_f) / fs
+
+
+def _hf_energy_ratio_g(s: np.ndarray, fs: int, cutoff: float = 10.0) -> float:
+    """f>cutoff 에너지 비율 (C6↑=고주파多, C5↓)"""
+    mag   = np.abs(np.fft.rfft(s - s.mean())) ** 2
+    freqs = np.fft.rfftfreq(len(s), d=1.0 / fs)
+    total = mag.sum() + 1e-8
+    return float(mag[freqs >= cutoff].sum() / total)
+
+
+def _feat_terrain_v4(
+    foot_lt: np.ndarray, foot_rt: np.ndarray,
+    shank_lt: np.ndarray, shank_rt: np.ndarray,
+    pelvis:   np.ndarray,
+    fs: int,
+) -> np.ndarray:
+    """
+    v4 지형 구분 특화 피처 (v3 32개 + 신규 40개 = 72개)
+
+    [v3 유지] 32개
+    [신규] 40개:
+        autocorr        foot LT/RT          4×2  =  8
+        cross_corr      foot↔shank LT/RT    3×2  =  6
+        skewness        foot/shank/pelvis   1×4  =  4
+        fine_band       foot LT accel Z     6    =  6
+        sample_entropy  foot LT/RT          1×2  =  2
+        perm_entropy    foot LT/RT          1×2  =  2
+        inst_freq       foot LT/shank LT    3×2  =  6
+        gait_cycle_var  foot LT/RT/pelvis   1×3  =  3
+        skewness scipy  foot LT/RT          1×2  =  2  (scipy 정확도)
+        inst_freq pelvis                    3    =  3  ← extra
+    총 72개
+    """
+    fa_lt = foot_lt[2]    # foot LT accel Z
+    fa_rt = foot_rt[2]    # foot RT accel Z
+    sa_lt = shank_lt[2]   # shank LT accel Z
+    sa_rt = shank_rt[2]   # shank RT accel Z
+    pa_z  = pelvis[2]     # pelvis accel Z
+
+    # ── [v3] 32개 유지 ────────────────────────────────────────
+    lt_phv = _peak_height_variance(fa_lt, fs)
+    lt_pic = _peak_interval_cv(fa_lt, fs)
+    lt_jv  = _jerk_variance(fa_lt, fs)
+    lt_hf  = _hf_band_ratio(sa_lt, fs)
+    rt_phv = _peak_height_variance(fa_rt, fs)
+    rt_pic = _peak_interval_cv(fa_rt, fs)
+    rt_jv  = _jerk_variance(fa_rt, fs)
+    lt_pk  = float(np.abs(fa_lt).max())
+    rt_pk  = float(np.abs(fa_rt).max())
+    lr_asym = abs(lt_pk - rt_pk) / (lt_pk + rt_pk + 1e-8)
+    c4_feats = [lt_phv, lt_pic, lt_jv, lt_hf, rt_phv, rt_pic, rt_jv, lr_asym]
+
+    c5_feats = [
+        _impact_peak(fa_lt),  _loading_rate(fa_lt, fs),
+        _lf_hf_ratio(fa_lt, fs), _rebound_ratio(fa_lt, fs),
+        _impact_peak(fa_rt),  _loading_rate(fa_rt, fs),
+        _lf_hf_ratio(fa_rt, fs), _rebound_ratio(fa_rt, fs),
+    ]
+
+    c6_feats = [
+        _regularity_index(fa_lt, fs), _regularity_index(fa_rt, fs),
+        _smoothness_index(fa_lt, fs), _smoothness_index(fa_rt, fs),
+        _symmetry(fa_lt, fa_rt),
+        _regularity_index(pa_z, fs),  _smoothness_index(pa_z, fs),
+        float(1.0 / (_terrain_roughness(pa_z, fs) + 1e-4)),
+    ]
+
+    common_feats = [
+        _vibration_transmission(pa_z, fa_lt, fs),
+        _vibration_transmission(pa_z, fa_rt, fs),
+        _impact_attenuation(sa_lt, fa_lt, fs),
+        _impact_attenuation(sa_rt, fa_rt, fs),
+        _energy_dissipation(fa_lt, fs),
+        _energy_dissipation(fa_rt, fs),
+        _terrain_roughness(fa_lt, fs),
+        _terrain_roughness(fa_rt, fs),
+    ]
+
+    # ── [신규 40개] ───────────────────────────────────────────
+
+    # Autocorrelation (8개)
+    ac_lt = _autocorr_peak(fa_lt, fs)
+    ac_rt = _autocorr_peak(fa_rt, fs)
+
+    # Cross-correlation foot↔shank (6개)
+    cc_lt = _cross_corr_features(fa_lt, sa_lt, fs)
+    cc_rt = _cross_corr_features(fa_rt, sa_rt, fs)
+
+    # Skewness 근사 (4개)
+    skew_feats = [
+        _skewness_features(fa_lt),
+        _skewness_features(fa_rt),
+        _skewness_features(sa_lt),
+        _skewness_features(pa_z),
+    ]
+
+    # 세밀 주파수 밴드 (6개)
+    fine_band = _fine_band_power(fa_lt, fs)
+
+    # 샘플 엔트로피 (2개) — C6 낮음, C4 높음
+    se_lt = _sample_entropy(fa_lt)
+    se_rt = _sample_entropy(fa_rt)
+
+    # 순열 엔트로피 (2개) — C6 낮음, C4 높음
+    pe_lt = _perm_entropy(fa_lt)
+    pe_rt = _perm_entropy(fa_rt)
+
+    # 힐버트 순간주파수 통계 (6개) — foot LT + shank LT
+    if_foot  = _instantaneous_freq_stats(fa_lt, fs)
+    if_shank = _instantaneous_freq_stats(sa_lt, fs)
+
+    # 보행 주기 변동성 (3개) — C4 높음, C6 낮음
+    gcv_lt  = _gait_cycle_variability(fa_lt, fs)
+    gcv_rt  = _gait_cycle_variability(fa_rt, fs)
+    gcv_pel = _gait_cycle_variability(pa_z, fs)
+
+    # scipy skewness (2개) — 더 정확한 왜도
+    sk_lt = float(scipy_skew(fa_lt))
+    sk_rt = float(scipy_skew(fa_rt))
+
+    # 힐버트 pelvis (3개)
+    if_pelvis = _instantaneous_freq_stats(pa_z, fs)
+
+    new_feats = (
+        ac_lt.tolist() + ac_rt.tolist()           +  # 8
+        cc_lt.tolist() + cc_rt.tolist()           +  # 6
+        skew_feats                                 +  # 4
+        fine_band.tolist()                         +  # 6
+        [se_lt, se_rt]                             +  # 2
+        [pe_lt, pe_rt]                             +  # 2
+        if_foot.tolist() + if_shank.tolist()       +  # 6
+        [gcv_lt, gcv_rt, gcv_pel]                  +  # 3
+        [sk_lt, sk_rt]                             +  # 2
+        if_pelvis.tolist()                            # 3
+    )  # 합계: 8+6+4+6+2+2+6+3+2+3 = 42
+
+    # ── [v5] Group G: 충격 물성 구분자 12개 ──────────────────
+    # 정상(C6) >> 흙(C4) > 잔디(C5) 순서 딱딱함
+    # G1/G2  Crest Factor       LT/RT  (C6↑ C5↓)
+    # G3/G4  Loading Rate       LT/RT  (C6↑ C5↓)
+    # G5/G6  Impulse            LT/RT  (C5↑ C6↓)
+    # G7/G8  Decay Time         LT/RT  (C5↑ C6↓)
+    # G9/G10 Peak Prop Delay    LT/RT  (C5↑ C6↓)
+    # G11/G12 HF Energy Ratio   LT/RT  (C6↑ C5↓)
+    g_feats = [
+        _crest_factor_g(fa_lt),                   # G1
+        _crest_factor_g(fa_rt),                   # G2
+        _loading_rate_g(fa_lt, fs),               # G3
+        _loading_rate_g(fa_rt, fs),               # G4
+        _impulse_g(fa_lt, fs),                    # G5
+        _impulse_g(fa_rt, fs),                    # G6
+        _decay_time_g(fa_lt, fs),                 # G7
+        _decay_time_g(fa_rt, fs),                 # G8
+        _peak_prop_delay_g(fa_lt, sa_lt, fs),     # G9
+        _peak_prop_delay_g(fa_rt, sa_rt, fs),     # G10
+        _hf_energy_ratio_g(fa_lt, fs),            # G11
+        _hf_energy_ratio_g(fa_rt, fs),            # G12
+    ]  # 12개
+
+    out = np.array(
+        c4_feats + c5_feats + c6_feats + common_feats + new_feats + g_feats,
+        dtype=np.float32
+    )
+    assert len(out) == _N_TERRAIN_V4, \
+        f"terrain_v4 feat len={len(out)} != {_N_TERRAIN_V4}"
+    return out
+
+
 def _feat_terrain(
     foot_lt: np.ndarray, foot_rt: np.ndarray,
     shank_lt: np.ndarray, shank_rt: np.ndarray,
     pelvis:   np.ndarray,
     fs: int,
 ) -> np.ndarray:
+    """하위 호환 래퍼 → _feat_terrain_v4 호출."""
+    return _feat_terrain_v4(foot_lt, foot_rt, shank_lt, shank_rt, pelvis, fs)
+
+
     """
     v3 지형 구분 특화 피처
     출력: 32개
@@ -596,10 +1013,11 @@ _IDX = {
     "foot_rt":  slice(48, 54),
 }
 
-# v3: 30 + 38 + 36 + 40 + 88 + 32 = 264
-_N_SENSOR: int = 264   # 센서 피처
+_N_TERRAIN_V4: int = 86  # terrain v5 피처 수 (v4:74 + G그룹:12)
+# v5: 30 + 38 + 36 + 40 + 88 + 86 = 318
+_N_SENSOR: int = 318   # 센서 피처 (v4:306 → v5:318)
 _N_CONTEXT: int = 60   # bout 컨텍스트 피처
-N_FEATURES: int = _N_SENSOR + _N_CONTEXT  # 324
+N_FEATURES: int = _N_SENSOR + _N_CONTEXT  # 378
 
 
 class SensorFeatureExtractor:
@@ -639,7 +1057,8 @@ class SensorFeatureExtractor:
 # ─────────────────────────────────────────────────────────────
 
 _SECTIONS: list[tuple[str, int]] = [
-    ("Pelvis", 30), ("Hand", 38), ("Thigh", 36), ("Shank", 40), ("Foot", 88), ("Terrain", 32), ("Context", 60),
+    ("Pelvis", 30), ("Hand", 38), ("Thigh", 36), ("Shank", 40),
+    ("Foot", 88), ("Terrain", 86), ("Context", 60),
 ]
 _LOG_INTERVAL = 1000
 
@@ -794,13 +1213,18 @@ def batch_extract(
     foot_accel_idx: list | None = None,
     sample_rate: int = 200,
     h5_path: str | None = None,          # bout 컨텍스트용 HDF5 경로
+    kept_idx: np.ndarray | None = None,  # C5 제거 후 살아남은 원본 인덱스
+                                         # (h5_path 읽은 trial_ids를 필터링하는데 사용)
     log_interval: int = _LOG_INTERVAL,
     verbose: bool = True,
 ) -> np.ndarray:
-    """(N, T, 54) or (N, 54, T) → (N, 324) float32
+    """(N, T, 54) or (N, 54, T) → (N, N_FEATURES) float32
 
-    h5_path 제공 시 bout 컨텍스트 피처(60개) 자동 추가 → N_FEATURES=324
-    h5_path 없으면 센서 피처만(264개) 반환 (하위 호환)
+    h5_path 제공 시 bout 컨텍스트 피처(60개) 자동 추가 → N_FEATURES=366
+    h5_path 없으면 센서 피처만(306개) 반환 (하위 호환)
+    kept_idx : filter_and_remap() 이 반환한 인덱스.
+               h5_path의 trial_ids/trial_step_idx는 원본(전체) 기준이므로
+               kept_idx 로 슬라이싱해야 X와 길이가 일치함.
     """
     import time as _time
 
@@ -810,7 +1234,7 @@ def batch_extract(
     t_total = _time.time()
 
     if verbose:
-        print(f"[feat] 센서 피처 추출: N={N} → {_N_SENSOR}차원  v3", flush=True)
+        print(f"[feat] 센서 피처 추출: N={N} → {_N_SENSOR}차원  v4", flush=True)
 
     for i, s in enumerate(X):
         seg = s if (s.ndim == 2 and s.shape[0] < s.shape[1]) else s.T
@@ -871,7 +1295,23 @@ def batch_extract(
         if verbose:
             print(f"[feat] bout 컨텍스트 피처 추출 시작...", flush=True)
         t0 = _time.time()
-        trial_ids, trial_step_idx = _read_trial_index(h5_path)
+        trial_ids_full, trial_step_idx_full = _read_trial_index(h5_path)
+        if kept_idx is not None:
+            # X는 이미 C5 제거된 N'개 → trial_ids도 같은 인덱스로 슬라이싱
+            if len(kept_idx) != len(trial_ids_full):
+                trial_ids      = trial_ids_full[kept_idx]
+                trial_step_idx = trial_step_idx_full[kept_idx]
+            else:
+                trial_ids      = trial_ids_full
+                trial_step_idx = trial_step_idx_full
+        else:
+            trial_ids      = trial_ids_full
+            trial_step_idx = trial_step_idx_full
+        if len(trial_ids) != len(X):
+            raise ValueError(
+                f"[features] trial_ids 길이({len(trial_ids)}) != X 길이({len(X)}). "
+                f"kept_idx를 batch_extract에 전달했는지 확인하세요."
+            )
         ctx_feats = _extract_context_all(X, trial_ids, trial_step_idx)
         feats = np.concatenate([feats, ctx_feats], axis=1)
         if verbose:

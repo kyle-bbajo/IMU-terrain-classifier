@@ -430,7 +430,8 @@ def M7_Hybrid(bc): return M7_HybridModel(bc)
 
 class M7_AttributeHybridModel(nn.Module):
     IS_HYBRID = True
-    C1, C2, C3, C4, C5, C6 = 0, 1, 2, 3, 4, 5
+    # C5(잔디) 제외 — C1=0, C2=1, C3=2, C4=3, C6=4
+    C1, C2, C3, C4, C6 = 0, 1, 2, 3, 4
 
     def __init__(self, bc):
         super().__init__()
@@ -449,10 +450,11 @@ class M7_AttributeHybridModel(nn.Module):
         self.slip_head  = nn.Linear(fusion_dim, 1)
         self.slope_head = nn.Linear(fusion_dim, 3)
         self.irreg_head = nn.Linear(fusion_dim, 1)
-        self.comp_head  = nn.Linear(fusion_dim, 1)
+        # comp_head 제거 (C5 잔디 제외)
         self.flat_head  = nn.Linear(fusion_dim, 1)
+        # aux dim: sl(1)+slo(3)+ir(1)+fl(1) = 6  (comp(1) 제거)
         self.clf = nn.Sequential(
-            nn.Linear(fusion_dim + 7, 256), nn.ReLU(inplace=True), nn.Dropout(dc),
+            nn.Linear(fusion_dim + 6, 256), nn.ReLU(inplace=True), nn.Dropout(dc),
             nn.Linear(256, 128),            nn.ReLU(inplace=True), nn.Dropout(dc),
             nn.Linear(128, CFG.num_classes),
         )
@@ -469,12 +471,13 @@ class M7_AttributeHybridModel(nn.Module):
         if self.training: bi = {k: augment(v, True) for k, v in bi.items()}
         h   = self._fuse(bi, feat)
         sl  = self.slip_head(h); slo = self.slope_head(h)
-        ir  = self.irreg_head(h); co  = self.comp_head(h); fl = self.flat_head(h)
-        aux = torch.cat([sl, slo, ir, co, fl], dim=-1)
+        ir  = self.irreg_head(h); fl  = self.flat_head(h)
+        # comp(C5 잔디) 제거 — aux dim=6: sl(1)+slo(3)+ir(1)+fl(1)
+        aux = torch.cat([sl, slo, ir, fl], dim=-1)
         fin = self.clf(torch.cat([h, aux], dim=-1))
         return {"final_logits": fin, "slip_logit": sl.squeeze(-1),
                 "slope_logits": slo, "irreg_logit": ir.squeeze(-1),
-                "comp_logit": co.squeeze(-1), "flat_logit": fl.squeeze(-1)}
+                "flat_logit": fl.squeeze(-1)}
 
     def extract(self, bi, feat): return self._fuse(bi, feat)
 
@@ -512,13 +515,13 @@ class M8_SurfaceAwareModel(nn.Module):
         fusion_dim     = cnn_dim + CFG.feat_dim
         self.bn_fuse   = nn.BatchNorm1d(fusion_dim)
 
-        # Surface Gate: C4/C5/C6 학습 가능한 logit bias
+        # Surface Gate: C4/C6 logit bias (C5 잔디 제외)
         self.surface_gate = nn.Sequential(
             nn.Linear(fusion_dim, 128), nn.LayerNorm(128),
             nn.GELU(), nn.Dropout(dc),
-            nn.Linear(128, 3),   # C4_bias, C5_bias, C6_bias
+            nn.Linear(128, 2),   # C4_bias, C6_bias  (C5 제거)
         )
-        # Flat Detector: C6(평지) 전용 신호
+        # Flat Detector: C6(평지, 새 인덱스=4) 전용 신호
         self.flat_detector = nn.Sequential(
             nn.Linear(fusion_dim, 64), nn.LayerNorm(64),
             nn.GELU(), nn.Dropout(dc),
@@ -544,14 +547,14 @@ class M8_SurfaceAwareModel(nn.Module):
         fused  = self.bn_fuse(torch.cat([self._cnn_encode(bi), self.feat_mlp(feat)], dim=1))
         base   = self.clf(fused)                           # (B, 6)
 
-        # Surface Gate: C4/C5/C6 bias — F.pad으로 inplace 없이
-        gate     = self.surface_gate(fused)                # (B, 3)
-        gate_pad = F.pad(0.5 * gate, (3, 0))              # (B, 6)
+        # Surface Gate: C4/C6 bias (C4=idx3, C6=idx4) — F.pad 앞 3개 패딩
+        gate     = self.surface_gate(fused)                # (B, 2)
+        gate_pad = F.pad(0.5 * gate, (3, 0))              # (B, 5): [0,0,0,C4,C6]
         logits   = base + gate_pad
 
-        # Flat Detector: C6 boost — F.pad으로 inplace 없이
+        # Flat Detector: C6(새 인덱스=4) boost — F.pad 앞 4개 패딩
         flat_val  = 0.4 * torch.sigmoid(self.flat_detector(fused))  # (B, 1)
-        flat_pad  = F.pad(flat_val, (5, 0))               # (B, 6)
+        flat_pad  = F.pad(flat_val, (4, 0))               # (B, 5): [0,0,0,0,C6]
         logits    = logits + flat_pad
 
         return logits

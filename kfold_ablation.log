@@ -1,0 +1,81 @@
+nohup: ignoring input
+============================================================
+  Config v9.1 — GPU 모드
+  Git: 873b9d3
+============================================================
+  Device:    cuda  (NVIDIA L4)
+  GPU:       22GB  |  AMP=BF16  cc=8.9
+  vCPU=8  RAM=30GiB  HDF5=3.7GB
+  Strategy:  M1=Preload (항상)  Branch=Preload  Workers=4
+  Subjects:  N=50  Classes=6  Seed=42
+  Rate=200Hz  TS=256pt  PCA=32ch
+  Labels:    base=0  semantics=terrain_condition
+  Mapping:   C1→0, C2→1, C3→2, C4→3, C5→4, C6→5
+  Batch=4096  Epochs=50  ES=7
+  LR=0.001→1e-06  WD=0.001
+  LabelSmooth=0.1  Mixup=0.2
+  Dropout: clf=0.5  feat=0.3
+  Aug: noise=0.03  scale=0.15  shift=15
+  HS: Type4 Shank-Gyroy + Foot-Accelx  fusion=125ms  prom=0.4σ
+  Foot Z-idx=[2, 8]  Shank Z-idx=[3, 9]
+  Compile=True
+  FocalLoss=ON γ=2.0
+  FFT Branch=ON (Foot)
+  BalancedSampler=ON
+  TTA=ON ×5
+============================================================
+[07:10:38] ========================================================================
+[07:10:38]   train_kfold_ablation.py — 3가지 조건 병렬 K-Fold
+[07:10:38]   N_FEATURES=378  models=['M7_Attr']
+[07:10:38]   kfold=5  조건=['A', 'B', 'C']  병렬=True
+[07:10:38]   GPU=1장
+[07:10:38] ========================================================================
+[07:10:38]   HDF5 로드... (dataset.h5)
+[07:10:38]   ✅ N=68938  T=256  C=54  v8-subj  file=3.7GB  (0.1s)
+[07:10:54]   데이터: N=68938  피험자=50명
+[07:10:54]     C1-Slippery: 8646개
+[07:10:54]     C2-Uphill: 16559개
+[07:10:54]     C3-Downhill: 13621개
+[07:10:54]     C4-Dirt: 11651개
+[07:10:54]     C5-Grass: 11582개
+[07:10:54]     C6-Flat: 6879개
+[07:10:54]   ★ 특징 캐시 히트 → /home/ubuntu/project/repo/cache/feat_v5_seed42/all_feat_v5.npy
+[07:10:54]   로드 완료  shape=(68938, 378)  (0.0s)
+[07:10:54]   HDF5 로드... (dataset.h5)
+[07:10:54]   ✅ N=68938  T=256  C=54  v8-subj  file=3.7GB  (0.0s)
+  Channel Groups (54 total -> 54 assigned):
+    Pelvis      :   6ch
+    Hand        :  12ch
+    Thigh       :  12ch
+    Shank       :  12ch
+    Foot        :  12ch
+[07:10:54] 
+  실행 조건 3개: ['A_전체', 'B_흙제외', 'C_잔디제외']
+[07:10:54] 
+  ★ 병렬 실행 시작 (3개 프로세스 동시 구동)
+
+[07:11:09] 
+================================================================
+[07:11:09]   [조건 A_전체]  GPU=shared  제거: 없음
+[07:11:09]   샘플: 68938  클래스(6): ['C1-Slippery', 'C2-Uphill', 'C3-Downhill', 'C4-Dirt', 'C5-Grass', 'C6-Flat']
+[07:11:09]   [A_전체] Fold 1/5  tr=55111  te=13827
+[07:11:09]   [A_전체][F1] M7_Attr 학습 시작
+[07:11:10]     Loss: AttributeMultiTaskLoss (label_smooth=0.0)
+[07:11:17]   [A_전체][F1][M7_Attr] ep01/50  loss=5.3074/0.1968  val=3.8761/0.3239  lr=5.0e-04  (6s)  RAM=9742MB  GPU=27/22565MB
+[07:11:21]   [A_전체][F1][M7_Attr] ep02/50  loss=3.9671/0.2627  val=3.3787/0.4697  lr=5.0e-04  (11s)  RAM=9742MB  GPU=27/22565MB
+[07:11:22] 
+================================================================
+[07:11:22]   [조건 B_흙제외]  GPU=shared  제거: ['C4-Dirt']
+[07:11:23]   샘플: 57287  클래스(5): ['C1-Slippery', 'C2-Uphill', 'C3-Downhill', 'C5-Grass', 'C6-Flat']
+[07:11:23]   [B_흙제외] Fold 1/5  tr=45360  te=11927
+[07:11:23]   [B_흙제외][F1] M7_Attr 학습 시작
+[07:11:23]   [B_흙제외] 속성 헤드 제거: ['slip_head'] → FocalLoss 사용
+[07:11:25]     Loss: FocalLoss(gamma=2.0, smooth=0.1)
+[07:11:35] 
+================================================================
+[07:11:35]   [조건 C_잔디제외]  GPU=shared  제거: ['C5-Grass']
+[07:11:35]   샘플: 57356  클래스(5): ['C1-Slippery', 'C2-Uphill', 'C3-Downhill', 'C4-Dirt', 'C6-Flat']
+[07:11:35]   [C_잔디제외] Fold 1/5  tr=45516  te=11840
+[07:11:35]   [C_잔디제외][F1] M7_Attr 학습 시작
+[07:11:35]   [C_잔디제외] 속성 헤드 제거: ['slip_head'] → FocalLoss 사용
+[07:11:36]     Loss: FocalLoss(gamma=2.0, smooth=0.1)

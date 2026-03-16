@@ -1,0 +1,221 @@
+nohup: ignoring input
+[04:17:39] ================================================================
+[04:17:39]   train_ablation.py — C4/C5/C6 구분 능력 비교 실험 (v5)
+[04:17:39]   N_FEATURES=378  hidden=512
+[04:17:39]   epochs=80  kfold=5  lr=0.0003
+[04:17:39]   실행 조건: {'A', 'B', 'C'}
+[04:17:39] ================================================================
+[04:17:39]   HDF5 로드... (dataset.h5)
+[04:17:39]   ✅ N=68938  T=256  C=54  v8-subj  file=3.7GB  (0.2s)
+[04:18:07]   데이터: N=68938  피험자=50명
+[04:18:07]     C1-미끄러운: 8646개
+[04:18:07]     C2-오르막: 16559개
+[04:18:07]     C3-내리막: 13621개
+[04:18:07]     C4-흙길: 11651개
+[04:18:07]     C5-잔디: 11582개
+[04:18:07]     C6-평지: 6879개
+[04:18:07]   특징 추출 시작 (N_FEATURES=378)...
+[feat] 센서 피처 추출: N=68938 → 318차원  v4
+[feat]   1000/68938  (  1.5%)      62 samp/s  elapsed=16.2s  eta=1100.2s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]   2000/68938  (  2.9%)      62 samp/s  elapsed=32.5s  eta=1088.3s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]   3000/68938  (  4.4%)      61 samp/s  elapsed=48.8s  eta=1073.1s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=28%
+[feat]   4000/68938  (  5.8%)      61 samp/s  elapsed=65.1s  eta=1057.4s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=28%
+[feat]   5000/68938  (  7.3%)      61 samp/s  elapsed=81.4s  eta=1041.0s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=28%
+[feat]   6000/68938  (  8.7%)      61 samp/s  elapsed=97.8s  eta=1025.5s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=28%
+[feat]   7000/68938  ( 10.2%)      62 samp/s  elapsed=113.8s  eta=1006.8s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=28%
+[feat]   8000/68938  ( 11.6%)      62 samp/s  elapsed=129.9s  eta=989.2s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=28%
+[feat]   9000/68938  ( 13.1%)      62 samp/s  elapsed=146.0s  eta=972.2s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  10000/68938  ( 14.5%)      62 samp/s  elapsed=162.1s  eta=955.6s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  11000/68938  ( 16.0%)      62 samp/s  elapsed=178.4s  eta=939.7s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  12000/68938  ( 17.4%)      62 samp/s  elapsed=194.5s  eta=923.1s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  13000/68938  ( 18.9%)      62 samp/s  elapsed=210.7s  eta=906.7s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  14000/68938  ( 20.3%)      62 samp/s  elapsed=226.8s  eta=890.1s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  15000/68938  ( 21.8%)      62 samp/s  elapsed=243.0s  eta=873.7s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  16000/68938  ( 23.2%)      62 samp/s  elapsed=259.1s  eta=857.2s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  17000/68938  ( 24.7%)      62 samp/s  elapsed=275.2s  eta=840.8s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  18000/68938  ( 26.1%)      62 samp/s  elapsed=291.3s  eta=824.2s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  19000/68938  ( 27.6%)      62 samp/s  elapsed=307.1s  eta=807.2s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  20000/68938  ( 29.0%)      62 samp/s  elapsed=322.9s  eta=790.1s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  21000/68938  ( 30.5%)      62 samp/s  elapsed=338.6s  eta=773.0s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  22000/68938  ( 31.9%)      62 samp/s  elapsed=354.4s  eta=756.1s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  23000/68938  ( 33.4%)      62 samp/s  elapsed=370.2s  eta=739.3s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  24000/68938  ( 34.8%)      62 samp/s  elapsed=385.9s  eta=722.6s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  25000/68938  ( 36.3%)      62 samp/s  elapsed=401.7s  eta=705.9s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  26000/68938  ( 37.7%)      62 samp/s  elapsed=417.4s  eta=689.3s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  27000/68938  ( 39.2%)      62 samp/s  elapsed=433.2s  eta=672.9s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  28000/68938  ( 40.6%)      62 samp/s  elapsed=449.1s  eta=656.6s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  29000/68938  ( 42.1%)      62 samp/s  elapsed=464.8s  eta=640.2s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  30000/68938  ( 43.5%)      62 samp/s  elapsed=480.6s  eta=623.8s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  31000/68938  ( 45.0%)      62 samp/s  elapsed=496.4s  eta=607.5s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  32000/68938  ( 46.4%)      62 samp/s  elapsed=512.7s  eta=591.9s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  33000/68938  ( 47.9%)      62 samp/s  elapsed=529.0s  eta=576.1s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  34000/68938  ( 49.3%)      62 samp/s  elapsed=545.3s  eta=560.3s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  35000/68938  ( 50.8%)      62 samp/s  elapsed=561.6s  eta=544.6s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  36000/68938  ( 52.2%)      62 samp/s  elapsed=577.8s  eta=528.7s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  37000/68938  ( 53.7%)      62 samp/s  elapsed=593.9s  eta=512.7s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  38000/68938  ( 55.1%)      62 samp/s  elapsed=610.1s  eta=496.8s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  39000/68938  ( 56.6%)      62 samp/s  elapsed=626.2s  eta=480.7s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  40000/68938  ( 58.0%)      62 samp/s  elapsed=642.2s  eta=464.6s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  41000/68938  ( 59.5%)      62 samp/s  elapsed=658.5s  eta=448.7s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  42000/68938  ( 60.9%)      62 samp/s  elapsed=674.7s  eta=432.7s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  43000/68938  ( 62.4%)      62 samp/s  elapsed=691.0s  eta=416.8s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  44000/68938  ( 63.8%)      62 samp/s  elapsed=707.2s  eta=400.8s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  45000/68938  ( 65.3%)      62 samp/s  elapsed=723.2s  eta=384.7s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  46000/68938  ( 66.7%)      62 samp/s  elapsed=739.3s  eta=368.6s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  47000/68938  ( 68.2%)      62 samp/s  elapsed=755.4s  eta=352.6s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  48000/68938  ( 69.6%)      62 samp/s  elapsed=771.7s  eta=336.6s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  49000/68938  ( 71.1%)      62 samp/s  elapsed=788.1s  eta=320.7s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  50000/68938  ( 72.5%)      62 samp/s  elapsed=804.4s  eta=304.7s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  51000/68938  ( 74.0%)      62 samp/s  elapsed=820.7s  eta=288.7s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  52000/68938  ( 75.4%)      62 samp/s  elapsed=837.0s  eta=272.6s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  53000/68938  ( 76.9%)      62 samp/s  elapsed=853.1s  eta=256.6s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  54000/68938  ( 78.3%)      62 samp/s  elapsed=869.4s  eta=240.5s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  55000/68938  ( 79.8%)      62 samp/s  elapsed=885.6s  eta=224.4s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  56000/68938  ( 81.2%)      62 samp/s  elapsed=901.8s  eta=208.3s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  57000/68938  ( 82.7%)      62 samp/s  elapsed=917.9s  eta=192.2s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  58000/68938  ( 84.1%)      62 samp/s  elapsed=934.2s  eta=176.2s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  59000/68938  ( 85.6%)      62 samp/s  elapsed=950.5s  eta=160.1s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  60000/68938  ( 87.0%)      62 samp/s  elapsed=966.5s  eta=144.0s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  61000/68938  ( 88.5%)      62 samp/s  elapsed=982.9s  eta=127.9s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  62000/68938  ( 89.9%)      62 samp/s  elapsed=999.2s  eta=111.8s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  63000/68938  ( 91.4%)      62 samp/s  elapsed=1015.3s  eta=95.7s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  64000/68938  ( 92.8%)      62 samp/s  elapsed=1031.3s  eta=79.6s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  65000/68938  ( 94.3%)      62 samp/s  elapsed=1047.5s  eta=63.5s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  66000/68938  ( 95.7%)      62 samp/s  elapsed=1063.8s  eta=47.4s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  67000/68938  ( 97.2%)      62 samp/s  elapsed=1079.9s  eta=31.2s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat]  68000/68938  ( 98.6%)      62 samp/s  elapsed=1095.9s  eta=15.1s  | Pelvis=4%  Hand=20%  Thigh=2%  Shank=22%  Foot=24%  Terrain=29%
+[feat] bout 컨텍스트 피처 추출 시작...
+[feat] 컨텍스트 완료 (35.9s)  최종 shape=(68938, 378)
+[feat] ✅ 완료: 68938샘플  1147.0s  (60 samp/s)  shape=(68938, 378)
+[feat]   Pelvis    30feat   39.22s    3.5%  |░░░░░░░░░░░░░░░░░░░░|
+[feat]   Hand      38feat  221.35s   20.0%  |███░░░░░░░░░░░░░░░░░|
+[feat]   Thigh     36feat   27.62s    2.5%  |░░░░░░░░░░░░░░░░░░░░|
+[feat]   Shank     40feat  240.83s   21.7%  |████░░░░░░░░░░░░░░░░|
+[feat]   Foot      88feat  263.69s   23.8%  |████░░░░░░░░░░░░░░░░|
+[feat]   Terrain   86feat  316.40s   28.5%  |█████░░░░░░░░░░░░░░░|
+[feat] 통계: mean=47574804.0000  std=1668549504.0000  nan=0  inf=0
+[04:37:14]   추출 완료  shape=(68938, 378)  (1147.1s)  저장: /home/ubuntu/project/repo/cache/feat_v5_seed42/all_feat_v5.npy
+[04:37:14] 
+================================================================
+[04:37:14]   조건: A_전체  (제거 클래스: 없음)
+[04:37:14]   샘플: 68938  클래스(6): ['C1-미끄러운', 'C2-오르막', 'C3-내리막', 'C4-흙길', 'C5-잔디', 'C6-평지']
+[04:37:14] 
+  ── Fold 1/5  tr=55111  te=13827
+[04:37:37]   [F1] acc=0.7712  macro_f1=0.7432  (best_f1=0.7432)
+[04:37:37] 
+  ── Fold 2/5  tr=54899  te=14039
+[04:38:05]   [F2] acc=0.7673  macro_f1=0.7494  (best_f1=0.7494)
+[04:38:05] 
+  ── Fold 3/5  tr=54935  te=14003
+[04:38:37]   [F3] acc=0.7598  macro_f1=0.7394  (best_f1=0.7394)
+[04:38:37] 
+  ── Fold 4/5  tr=55118  te=13820
+[04:39:11]   [F4] acc=0.7853  macro_f1=0.7597  (best_f1=0.7597)
+[04:39:12] 
+  ── Fold 5/5  tr=55689  te=13249
+[04:40:02]   [F5] acc=0.8009  macro_f1=0.7730  (best_f1=0.7730)
+[04:40:03] 
+  ★ [A_전체] 최종  Acc=0.7766  MacroF1=0.7531  (168.4s)
+[04:40:03] 
+              precision    recall  f1-score   support
+
+     C1-미끄러운     0.8376    0.8498    0.8437      8646
+      C2-오르막     0.9514    0.9508    0.9511     16559
+      C3-내리막     0.9254    0.9546    0.9398     13621
+       C4-흙길     0.5277    0.5480    0.5377     11651
+       C5-잔디     0.6056    0.5837    0.5944     11582
+       C6-평지     0.6819    0.6251    0.6523      6879
+
+    accuracy                         0.7766     68938
+   macro avg     0.7549    0.7520    0.7531     68938
+weighted avg     0.7754    0.7766    0.7758     68938
+
+[04:40:03]   [WARN] CM 저장 실패: No module named 'seaborn'
+[04:40:03] 
+================================================================
+[04:40:03]   조건: B_흙제외  (제거 클래스: ['C4-흙길'])
+[04:40:03]   샘플: 57287  클래스(5): ['C1-미끄러운', 'C2-오르막', 'C3-내리막', 'C5-잔디', 'C6-평지']
+[04:40:03] 
+  ── Fold 1/5  tr=45360  te=11927
+[04:40:28]   [F1] acc=0.8793  macro_f1=0.8510  (best_f1=0.8510)
+[04:40:28] 
+  ── Fold 2/5  tr=45997  te=11290
+[04:40:46]   [F2] acc=0.9052  macro_f1=0.8699  (best_f1=0.8699)
+[04:40:46] 
+  ── Fold 3/5  tr=45827  te=11460
+[04:41:14]   [F3] acc=0.9005  macro_f1=0.8855  (best_f1=0.8855)
+[04:41:14] 
+  ── Fold 4/5  tr=45984  te=11303
+[04:41:45]   [F4] acc=0.9006  macro_f1=0.8784  (best_f1=0.8784)
+[04:41:45] 
+  ── Fold 5/5  tr=45980  te=11307
+[04:42:26]   [F5] acc=0.9054  macro_f1=0.8780  (best_f1=0.8780)
+[04:42:26] 
+  ★ [B_흙제외] 최종  Acc=0.8980  MacroF1=0.8724  (143.2s)
+[04:42:26] 
+              precision    recall  f1-score   support
+
+     C1-미끄러운     0.8653    0.8809    0.8730      8646
+      C2-오르막     0.9781    0.9673    0.9727     16559
+      C3-내리막     0.9366    0.9736    0.9548     13621
+       C5-잔디     0.8541    0.8455    0.8498     11582
+       C6-평지     0.7336    0.6912    0.7118      6879
+
+    accuracy                         0.8980     57287
+   macro avg     0.8735    0.8717    0.8724     57287
+weighted avg     0.8968    0.8980    0.8972     57287
+
+[04:42:26]   [WARN] CM 저장 실패: No module named 'seaborn'
+[04:42:26] 
+================================================================
+[04:42:26]   조건: C_잔디제외  (제거 클래스: ['C5-잔디'])
+[04:42:27]   샘플: 57356  클래스(5): ['C1-미끄러운', 'C2-오르막', 'C3-내리막', 'C4-흙길', 'C6-평지']
+[04:42:27] 
+  ── Fold 1/5  tr=45516  te=11840
+[04:42:56]   [F1] acc=0.8721  macro_f1=0.8469  (best_f1=0.8469)
+[04:42:56] 
+  ── Fold 2/5  tr=45924  te=11432
+[04:43:35]   [F2] acc=0.8467  macro_f1=0.8080  (best_f1=0.8080)
+[04:43:35] 
+  ── Fold 3/5  tr=45878  te=11478
+[04:44:02]   [F3] acc=0.8778  macro_f1=0.8510  (best_f1=0.8510)
+[04:44:02] 
+  ── Fold 4/5  tr=45979  te=11377
+[04:44:29]   [F4] acc=0.8542  macro_f1=0.8248  (best_f1=0.8248)
+[04:44:29] 
+  ── Fold 5/5  tr=46127  te=11229
+[04:45:03]   [F5] acc=0.8974  macro_f1=0.8699  (best_f1=0.8699)
+[04:45:03] 
+  ★ [C_잔디제외] 최종  Acc=0.8696  MacroF1=0.8404  (156.5s)
+[04:45:03] 
+              precision    recall  f1-score   support
+
+     C1-미끄러운     0.8376    0.8499    0.8437      8646
+      C2-오르막     0.9756    0.9647    0.9701     16559
+      C3-내리막     0.9285    0.9545    0.9413     13621
+       C4-흙길     0.7984    0.7671    0.7824     11651
+       C6-평지     0.6581    0.6710    0.6645      6879
+
+    accuracy                         0.8696     57356
+   macro avg     0.8396    0.8414    0.8404     57356
+weighted avg     0.8695    0.8696    0.8694     57356
+
+[04:45:03]   [WARN] CM 저장 실패: No module named 'seaborn'
+[04:45:03] 
+================================================================
+[04:45:03]   📊 3가지 조건 비교 결과
+[04:45:03] ================================================================
+[04:45:03]   조건                    Acc    MacroF1      C4-흙      C5-잔디      C6-평지
+[04:45:03]   --------------------------------------------------------------
+[04:45:03]   A_전체              0.7766     0.7531     54.8%      58.4%      62.5%
+[04:45:03]   B_흙제외             0.8980     0.8724      0.0%      84.5%      69.1%
+[04:45:03]   C_잔디제외            0.8696     0.8404     76.7%       0.0%      67.1%
+[04:45:03]   --------------------------------------------------------------
+[04:45:03] 
+[04:45:03]   분석 포인트:
+[04:45:03]   • A vs B: C4 제거 시 C5(잔디) recall 변화 → C4가 잔디에 끼친 혼동
+[04:45:03]   • A vs C: C5 제거 시 C4(흙) recall 변화   → C5가 흙에 끼친 혼동
+[04:45:03] ================================================================
+[04:45:03] 
+★ 실험 완료  총 소요: 469.2s
+[04:45:03]   결과 저장: /home/ubuntu/project/repo/out_ablation
