@@ -367,8 +367,8 @@ class ConfigState:
     use_fft_branch: bool = True
     fft_source_group: str = "Foot"
     use_balanced_sampler: bool = True
-    use_tta: bool = True
-    tta_rounds: int = 5
+    use_tta: bool = False
+    tta_rounds: int = 1
     grad_clip_norm: float = 1.0
     grad_accum_steps: int = 1
     use_compile: bool = field(default_factory=lambda: bool(

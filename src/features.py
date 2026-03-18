@@ -275,8 +275,10 @@ def _feat_pelvis(seg: np.ndarray, fs: int) -> np.ndarray:
     tilt_range = float(gyro[1].max() - gyro[1].min())
     out.append(tilt_range)                           # 1 slope용
 
-    assert len(out) == 30, f"Pelvis feat len={len(out)}"
-    return np.array(out, dtype=np.float32)
+    out_arr = np.array(out, dtype=np.float32)
+    out_arr = np.sign(out_arr) * np.log1p(np.abs(out_arr))
+    assert len(out_arr) == 30, f"Pelvis feat len={len(out_arr)}"
+    return out_arr
 
 
 def _feat_one_side_hand(accel: np.ndarray, gyro: np.ndarray, fs: int) -> np.ndarray:
@@ -291,8 +293,10 @@ def _feat_one_side_hand(accel: np.ndarray, gyro: np.ndarray, fs: int) -> np.ndar
     out.append(float(fs_stats[3]))
     for s in gyro:
         out.append(float(np.sqrt((s**2).mean())))
-    assert len(out) == 17, f"Hand one side len={len(out)}"
-    return np.array(out, dtype=np.float32)
+    out_arr = np.array(out, dtype=np.float32)
+    out_arr = np.sign(out_arr) * np.log1p(np.abs(out_arr))
+    assert len(out_arr) == 17, f"Hand one side len={len(out_arr)}"
+    return out_arr
 
 
 def _feat_hand(lt_seg: np.ndarray, rt_seg: np.ndarray, fs: int) -> np.ndarray:
@@ -325,8 +329,10 @@ def _feat_one_side_thigh(accel: np.ndarray, gyro: np.ndarray, fs: int) -> np.nda
     freqs = np.fft.rfftfreq(accel.shape[1], d=1.0 / fs)
     mag = np.abs(np.fft.rfft(accel[2]))
     out.append(float(freqs[np.argmax(mag)]))
-    assert len(out) == 16, f"Thigh one side len={len(out)}"
-    return np.array(out, dtype=np.float32)
+    out_arr = np.array(out, dtype=np.float32)
+    out_arr = np.sign(out_arr) * np.log1p(np.abs(out_arr))
+    assert len(out_arr) == 16, f"Thigh one side len={len(out_arr)}"
+    return out_arr
 
 
 def _feat_thigh(lt_seg: np.ndarray, rt_seg: np.ndarray, fs: int) -> np.ndarray:
@@ -354,8 +360,10 @@ def _feat_one_side_shank(accel: np.ndarray, gyro: np.ndarray, fs: int) -> np.nda
     for s in gyro:
         ts = _time_stats(s)
         out += [float(ts[0]), float(ts[1]), float(ts[2])]
-    assert len(out) == 18, f"Shank one side len={len(out)}"
-    return np.array(out, dtype=np.float32)
+    out_arr = np.array(out, dtype=np.float32)
+    out_arr = np.sign(out_arr) * np.log1p(np.abs(out_arr))
+    assert len(out_arr) == 18, f"Shank one side len={len(out_arr)}"
+    return out_arr
 
 
 def _feat_shank(lt_seg: np.ndarray, rt_seg: np.ndarray, fs: int) -> np.ndarray:
@@ -425,8 +433,10 @@ def _feat_one_side_foot(accel: np.ndarray, gyro: np.ndarray, fs: int) -> np.ndar
     out.append(_gait_cadence(accel[2], fs))         # 1 보행 케이던스
     out.append(_contact_time_proxy(accel[2], fs))   # 1 C5 높음
 
-    assert len(out) == 42, f"Foot one side len={len(out)}"
-    return np.array(out, dtype=np.float32)
+    out_arr = np.array(out, dtype=np.float32)
+    out_arr = np.sign(out_arr) * np.log1p(np.abs(out_arr))
+    assert len(out_arr) == 42, f"Foot one side len={len(out_arr)}"
+    return out_arr
 
 
 def _feat_foot(lt_seg: np.ndarray, rt_seg: np.ndarray, fs: int) -> np.ndarray:
@@ -767,6 +777,155 @@ def _hf_energy_ratio_g(s: np.ndarray, fs: int, cutoff: float = 10.0) -> float:
     return float(mag[freqs >= cutoff].sum() / total)
 
 
+
+# ─────────────────────────────────────────────────────────────
+# [v6] C4/C5 구분 특화 — ML축 + Gyro 기반
+# ─────────────────────────────────────────────────────────────
+
+def _ml_accel_variance(s: np.ndarray) -> float:
+    """ML(좌우) 가속도 분산 — C4(흙길) 높음: 옆으로 미끄러짐"""
+    return float(np.var(s))
+
+def _gyro_swing_speed(s: np.ndarray) -> float:
+    """Gyro 피크 평균 — C5(잔디) 낮음: 발이 푹 꺼져 스윙 느림"""
+    peaks, props = find_peaks(np.abs(s), height=np.abs(s).mean() * 0.3, distance=20)
+    if len(peaks) == 0:
+        return 0.0
+    return float(np.mean(np.abs(s[peaks])))
+
+def _gyro_interval_cv(s: np.ndarray) -> float:
+    """Gyro 피크 간격 변동성 — C4 높음(불규칙), C5/C6 낮음"""
+    peaks, _ = find_peaks(np.abs(s), height=np.abs(s).mean() * 0.3, distance=20)
+    if len(peaks) < 3:
+        return 0.0
+    ivs = np.diff(peaks).astype(float)
+    return float(ivs.std() / (ivs.mean() + 1e-8))
+
+def _ml_lr_asymmetry(lt_ml: np.ndarray, rt_ml: np.ndarray) -> float:
+    """LT/RT ML 가속도 비대칭 — C4 높음: 한쪽으로 쏠림"""
+    lt_v = float(np.var(lt_ml))
+    rt_v = float(np.var(rt_ml))
+    return abs(lt_v - rt_v) / (lt_v + rt_v + 1e-8)
+
+def _ap_gyro_correlation(ap_accel: np.ndarray, gyro_ml: np.ndarray) -> float:
+    """AP 가속도 - ML Gyro 상관 — C5 높음: 착지와 회전이 동기화"""
+    lm = ap_accel - ap_accel.mean()
+    rm = gyro_ml  - gyro_ml.mean()
+    denom = (np.sqrt((lm**2).sum()) * np.sqrt((rm**2).sum())) + 1e-8
+    return float((lm * rm).sum() / denom)
+
+def _gyro_energy_ratio(gyro_ml: np.ndarray, gyro_z: np.ndarray) -> float:
+    """ML/Z gyro 에너지 비율 — C4 높음: 옆으로 틀림"""
+    ml_e = float((gyro_ml**2).mean()) + 1e-8
+    z_e  = float((gyro_z **2).mean()) + 1e-8
+    return ml_e / z_e
+
+
+# ─────────────────────────────────────────────────────────────
+# [v6] C4/C5/C6 구분 핵심 — 비율형 (스케일 안전)
+# ─────────────────────────────────────────────────────────────
+
+def _stiffness_proxy(s: np.ndarray, fs: int) -> float:
+    """loading_rate / impulse — 딱딱함 지수 (C6↑ C5↓)
+    비율형이라 스케일 무관"""
+    lr = float(np.diff(np.abs(s)).max() * fs) if len(s) > 1 else 0.0
+    imp = float(np.abs(s).sum() / fs) + 1e-8
+    return float(np.clip(lr / imp, 0, 100))
+
+def _rebound_energy_ratio(s: np.ndarray, fs: int) -> float:
+    """충격 후 반발 에너지 비율 (C5↑=잔디 반발, C6↓=빠른 감쇠)
+    피크 이후 구간 에너지 / 전체 에너지"""
+    sa = np.abs(s)
+    pi = int(sa.argmax())
+    total = float((sa**2).sum()) + 1e-8
+    after = float((sa[pi:]**2).sum())
+    return float(np.clip(after / total, 0, 1))
+
+def _micro_vibration_ratio(s: np.ndarray, fs: int) -> float:
+    """40Hz 이상 고주파 비율 (C4↑=흙 미세진동, C5↓=잔디 흡수)"""
+    mag   = np.abs(np.fft.rfft(s - s.mean())) ** 2
+    freqs = np.fft.rfftfreq(len(s), d=1.0 / fs)
+    total = mag.sum() + 1e-8
+    return float(np.clip(mag[freqs >= 40].sum() / total, 0, 1))
+
+def _peak_count_ratio(s: np.ndarray, fs: int) -> float:
+    """피크 수 / 신호 길이(초) — C4 높음(울퉁불퉁), C6 낮음(규칙적)"""
+    peaks, _ = find_peaks(np.abs(s), height=np.abs(s).mean() * 0.3,
+                           distance=int(fs * 0.05))
+    duration = len(s) / fs + 1e-8
+    return float(np.clip(len(peaks) / duration, 0, 50))
+
+def _impact_symmetry(s: np.ndarray) -> float:
+    """충격 대칭성 — 앞쪽/뒤쪽 에너지 비율 (C6 대칭, C4 비대칭)
+    0=완전비대칭, 1=완전대칭"""
+    half = len(s) // 2
+    e1 = float((s[:half]**2).sum()) + 1e-8
+    e2 = float((s[half:]**2).sum()) + 1e-8
+    return float(np.clip(min(e1, e2) / max(e1, e2), 0, 1))
+
+def _z_peak_cv(s: np.ndarray, fs: int) -> float:
+    """Z축 피크 높이 변동계수 — C4↑(불규칙), C5/C6↓(규칙적)
+    std/mean 비율이라 스케일 무관"""
+    peaks, props = find_peaks(np.abs(s), height=np.abs(s).mean() * 0.3,
+                               distance=int(fs * 0.1))
+    if len(props["peak_heights"]) < 3:
+        return 0.0
+    h = props["peak_heights"]
+    return float(np.clip(h.std() / (h.mean() + 1e-8), 0, 5))
+
+
+# ─────────────────────────────────────────────────────────────
+# [v6] C4/C5/C6 구분 핵심 — 비율형 (스케일 안전)
+# ─────────────────────────────────────────────────────────────
+
+def _stiffness_proxy(s: np.ndarray, fs: int) -> float:
+    """loading_rate / impulse — 딱딱함 지수 (C6↑ C5↓)
+    비율형이라 스케일 무관"""
+    lr = float(np.diff(np.abs(s)).max() * fs) if len(s) > 1 else 0.0
+    imp = float(np.abs(s).sum() / fs) + 1e-8
+    return float(np.clip(lr / imp, 0, 100))
+
+def _rebound_energy_ratio(s: np.ndarray, fs: int) -> float:
+    """충격 후 반발 에너지 비율 (C5↑=잔디 반발, C6↓=빠른 감쇠)
+    피크 이후 구간 에너지 / 전체 에너지"""
+    sa = np.abs(s)
+    pi = int(sa.argmax())
+    total = float((sa**2).sum()) + 1e-8
+    after = float((sa[pi:]**2).sum())
+    return float(np.clip(after / total, 0, 1))
+
+def _micro_vibration_ratio(s: np.ndarray, fs: int) -> float:
+    """40Hz 이상 고주파 비율 (C4↑=흙 미세진동, C5↓=잔디 흡수)"""
+    mag   = np.abs(np.fft.rfft(s - s.mean())) ** 2
+    freqs = np.fft.rfftfreq(len(s), d=1.0 / fs)
+    total = mag.sum() + 1e-8
+    return float(np.clip(mag[freqs >= 40].sum() / total, 0, 1))
+
+def _peak_count_ratio(s: np.ndarray, fs: int) -> float:
+    """피크 수 / 신호 길이(초) — C4 높음(울퉁불퉁), C6 낮음(규칙적)"""
+    peaks, _ = find_peaks(np.abs(s), height=np.abs(s).mean() * 0.3,
+                           distance=int(fs * 0.05))
+    duration = len(s) / fs + 1e-8
+    return float(np.clip(len(peaks) / duration, 0, 50))
+
+def _impact_symmetry(s: np.ndarray) -> float:
+    """충격 대칭성 — 앞쪽/뒤쪽 에너지 비율 (C6 대칭, C4 비대칭)
+    0=완전비대칭, 1=완전대칭"""
+    half = len(s) // 2
+    e1 = float((s[:half]**2).sum()) + 1e-8
+    e2 = float((s[half:]**2).sum()) + 1e-8
+    return float(np.clip(min(e1, e2) / max(e1, e2), 0, 1))
+
+def _z_peak_cv(s: np.ndarray, fs: int) -> float:
+    """Z축 피크 높이 변동계수 — C4↑(불규칙), C5/C6↓(규칙적)
+    std/mean 비율이라 스케일 무관"""
+    peaks, props = find_peaks(np.abs(s), height=np.abs(s).mean() * 0.3,
+                               distance=int(fs * 0.1))
+    if len(props["peak_heights"]) < 3:
+        return 0.0
+    h = props["peak_heights"]
+    return float(np.clip(h.std() / (h.mean() + 1e-8), 0, 5))
+
 def _feat_terrain_v4(
     foot_lt: np.ndarray, foot_rt: np.ndarray,
     shank_lt: np.ndarray, shank_rt: np.ndarray,
@@ -916,10 +1075,29 @@ def _feat_terrain_v4(
         _hf_energy_ratio_g(fa_rt, fs),            # G12
     ]  # 12개
 
+    # [v6] C4/C5/C6 핵심 구분 피처 12개 (비율형 - 스케일 안전)
+    # LT/RT 각 6개
+    v6_feats = [
+        _stiffness_proxy(fa_lt, fs),        # C6↑ C5↓ LT
+        _stiffness_proxy(fa_rt, fs),        # C6↑ C5↓ RT
+        _rebound_energy_ratio(fa_lt, fs),   # C5↑ C6↓ LT
+        _rebound_energy_ratio(fa_rt, fs),   # C5↑ C6↓ RT
+        _micro_vibration_ratio(fa_lt, fs),  # C4↑ C5↓ LT
+        _micro_vibration_ratio(fa_rt, fs),  # C4↑ C5↓ RT
+        _peak_count_ratio(fa_lt, fs),       # C4↑ C6↓ LT
+        _peak_count_ratio(fa_rt, fs),       # C4↑ C6↓ RT
+        _impact_symmetry(fa_lt),            # C6↑ C4↓ LT
+        _impact_symmetry(fa_rt),            # C6↑ C4↓ RT
+        _z_peak_cv(fa_lt, fs),              # C4↑ C6↓ LT
+        _z_peak_cv(fa_rt, fs),              # C4↑ C6↓ RT
+    ]  # 12개
+
     out = np.array(
-        c4_feats + c5_feats + c6_feats + common_feats + new_feats + g_feats,
+        c4_feats + c5_feats + c6_feats + common_feats + new_feats + g_feats + v6_feats,
         dtype=np.float32
     )
+    # 부호 보존 log1p 압축 — 구분력 유지하면서 스케일 정규화
+    out = np.sign(out) * np.log1p(np.abs(out))
     assert len(out) == _N_TERRAIN_V4, \
         f"terrain_v4 feat len={len(out)} != {_N_TERRAIN_V4}"
     return out
@@ -1013,11 +1191,11 @@ _IDX = {
     "foot_rt":  slice(48, 54),
 }
 
-_N_TERRAIN_V4: int = 86  # terrain v5 피처 수 (v4:74 + G그룹:12)
+_N_TERRAIN_V4: int = 98  # terrain v6 피처 수 (v5:86 + 비율형:12)
 # v5: 30 + 38 + 36 + 40 + 88 + 86 = 318
-_N_SENSOR: int = 318   # 센서 피처 (v4:306 → v5:318)
+_N_SENSOR: int = 330   # 센서 피처 (v5:318 → v6:330)
 _N_CONTEXT: int = 60   # bout 컨텍스트 피처
-N_FEATURES: int = _N_SENSOR + _N_CONTEXT  # 378
+N_FEATURES: int = _N_SENSOR + _N_CONTEXT  # 390
 
 
 class SensorFeatureExtractor:

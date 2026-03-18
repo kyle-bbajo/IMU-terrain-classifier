@@ -470,11 +470,13 @@ class M7_AttributeHybridModel(nn.Module):
     def forward(self, bi, feat):
         if self.training: bi = {k: augment(v, True) for k, v in bi.items()}
         h   = self._fuse(bi, feat)
-        sl  = self.slip_head(h); slo = self.slope_head(h)
-        ir  = self.irreg_head(h); fl  = self.flat_head(h)
-        # comp(C5 잔디) 제거 — aux dim=6: sl(1)+slo(3)+ir(1)+fl(1)
+        parts = []
+        sl  = self.slip_head(h).detach()  if hasattr(self, "slip_head")  else torch.zeros(h.size(0), 1, device=h.device)
+        slo = self.slope_head(h).detach() if hasattr(self, "slope_head") else torch.zeros(h.size(0), 3, device=h.device)
+        ir  = self.irreg_head(h).detach() if hasattr(self, "irreg_head") else torch.zeros(h.size(0), 1, device=h.device)
+        fl  = self.flat_head(h).detach()  if hasattr(self, "flat_head")  else torch.zeros(h.size(0), 1, device=h.device)
         aux = torch.cat([sl, slo, ir, fl], dim=-1)
-        fin = self.clf(torch.cat([h, aux], dim=-1))
+        fin = self.clf(torch.cat([h, aux.detach()], dim=-1))
         return {"final_logits": fin, "slip_logit": sl.squeeze(-1),
                 "slope_logits": slo, "irreg_logit": ir.squeeze(-1),
                 "flat_logit": fl.squeeze(-1)}

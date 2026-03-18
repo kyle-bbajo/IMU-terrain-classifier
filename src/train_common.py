@@ -625,8 +625,9 @@ def _run(model, loader, crit, opt=None, scaler=None, branch=False, use_mixup=Fal
                 out = model(*inp) if isinstance(inp, tuple) else model(inp)
                 if isinstance(out, dict):
                     logits = out["final_logits"]
-                    loss   = crit(out, yb) if lam >= 1.0 else (
-                        lam * crit(out, ya) + (1 - lam) * crit(out, yb_mix))
+                    _crit_inp = out if isinstance(crit, AttributeMultiTaskLoss) else logits
+                    loss   = crit(_crit_inp, yb) if lam >= 1.0 else (
+                        lam * crit(_crit_inp, ya) + (1 - lam) * crit(_crit_inp, yb_mix))
                 else:
                     logits = out
                     loss   = (mixup_criterion(crit, logits, ya, yb_mix, lam)
@@ -691,9 +692,9 @@ def _build_attr_targets(y):
 
 
 class AttributeMultiTaskLoss(nn.Module):
-    def __init__(self, gamma=2.0, label_smooth=0.1):
+    def __init__(self, gamma=2.0, label_smooth=0.1, class_weight=None):
         super().__init__()
-        self.ce_final = nn.CrossEntropyLoss(label_smoothing=label_smooth)
+        self.ce_final = nn.CrossEntropyLoss(label_smoothing=label_smooth, weight=class_weight)
         self.ce_slope = nn.CrossEntropyLoss()
         self.ws = dict(final=1., slip=.5, slope=.5, irreg=.4, comp=.4, flat=1.2)
 
@@ -726,18 +727,33 @@ class FocalLoss(nn.Module):
         return ((1 - pt) ** self.gamma * ce_loss).mean()
 
 
-def _make_criterion(model=None):
+def _make_criterion(model=None, num_classes=None, hard_indices=None):
+    """hard_indices: 어려운 클래스의 새 인덱스 리스트 (remap 이후 기준)"""
+    n = num_classes or config.NUM_CLASSES
+    w = torch.ones(n, dtype=torch.float32)
+    if hard_indices:
+        for idx in hard_indices:
+            if 0 <= idx < n:
+                w[idx] = 1.3
+    w = w.to("cuda" if torch.cuda.is_available() else "cpu")
+    has_w = (w != 1.0).any().item()
     if model is not None and getattr(model, "IS_HYBRID", False) and hasattr(model, "slip_head"):
-        log("    Loss: AttributeMultiTaskLoss (label_smooth=0.0)")
-        return AttributeMultiTaskLoss(gamma=config.FOCAL_GAMMA, label_smooth=0.0)
+        lbl = f"AttributeMultiTaskLoss (label_smooth=0.0{', hard_w=1.5' if has_w else ''})"
+        log(f"    Loss: {lbl}")
+        return AttributeMultiTaskLoss(gamma=config.FOCAL_GAMMA, label_smooth=0.0, class_weight=w if has_w else None)
     if config.USE_FOCAL_LOSS:
-        log(f"    Loss: FocalLoss(gamma={config.FOCAL_GAMMA}, smooth={config.LABEL_SMOOTH})")
-        return FocalLoss(gamma=config.FOCAL_GAMMA, label_smoothing=config.LABEL_SMOOTH)
-    return nn.CrossEntropyLoss(label_smoothing=config.LABEL_SMOOTH)
+        log(f"    Loss: FocalLoss(gamma={config.FOCAL_GAMMA}, smooth={config.LABEL_SMOOTH}{', hard_w=1.5' if has_w else ''})")
+        return FocalLoss(gamma=config.FOCAL_GAMMA, label_smoothing=config.LABEL_SMOOTH, weight=w if has_w else None)
+    return nn.CrossEntropyLoss(label_smoothing=config.LABEL_SMOOTH, weight=w if has_w else None)
 
 
-def train_model(model, tr_dl, te_dl, branch=False, tag="", use_mixup=True):
-    crit = _make_criterion(model)
+def train_model(model, tr_dl, te_dl, branch=False, tag="", use_mixup=True, hard_indices=None):
+    # 실제 모델 출력 클래스 수 감지 (B/C 조건 대응)
+    try:
+        _nc = model.clf[-1].out_features
+    except Exception:
+        _nc = config.NUM_CLASSES
+    crit = _make_criterion(model, num_classes=_nc, hard_indices=hard_indices)
     # M7_Attr: 보조 헤드가 많아 LR 낮춤
     base_lr = config.LR * 0.5 if (hasattr(model, "slip_head")) else config.LR
     opt  = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=config.WEIGHT_DECAY)
@@ -833,7 +849,7 @@ def make_loader(ds, shuffle, branch=False):
             classes, counts = np.unique(y_arr, return_counts=True)
             class_weights   = 1.0 / counts.astype(np.float64)
             # C4/C5/C6 (index 3,4,5) 추가 부스트 × 2.0
-            boost = np.array([2.0 if int(c) in (3,4,5) else 1.0 for c in classes])
+            boost = np.array([2.0 if int(c) in (3,4) else 1.5 if int(c)==5 else 1.0 for c in classes])
             class_weights   = class_weights * boost
             sample_weights  = class_weights[np.searchsorted(classes, y_arr)]
             sampler         = WeightedRandomSampler(sample_weights, len(y_arr), replacement=True)

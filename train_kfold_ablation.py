@@ -235,11 +235,14 @@ def run_condition(task: dict) -> dict:
                     balanced = CFG2.use_balanced_sampler,
                 )
 
+                # C4(원본3), C5(원본4) 의 remap 후 인덱스
+                hard_idx = [remap[i] for i in [3, 4] if i in remap]
                 preds, labels, _ = train_model(
                     model, tr_dl, te_dl,
                     branch=True,
                     tag=f"[{cond_name}][F{fi}][{mname}]",
                     use_mixup=True,
+                    hard_indices=hard_idx,
                 )
 
                 probas, _ = get_probas(model, te_dl, device)
